@@ -1,0 +1,187 @@
+experiment_name: phoenix_retrieval_uncertainty_segmental_trainbalanced
+seed: 1234
+device: auto
+
+data:
+  data_dir: /media/cvpr/haomian/data/SOKE_FLOW/phoenix_upper_smplx
+  word_data_dir: /media/cvpr/haomian/data/SOKE_FLOW/phoenix_upper_smplx_word_ctc
+  train_split: train
+  val_split: val
+  min_frames: 40
+  max_frames: 400
+  length_multiple: 4
+  random_crop: false
+  limit_train: 0
+  limit_val: 0
+
+cache:
+  fk_cache_dir: /media/cvpr/haomian/data/SOKE_FLOW/phoenix_upper_smplx/meta/niaf_fk_rot6d_h2s_fixed
+  fk_batch_size: 128
+
+text:
+  model_path: deps/flan-t5-base
+  device: cpu
+  max_tokens: 64
+  local_files_only: true
+  cache: true
+  condition_field: text
+
+adapter:
+  checkpoint: experiments/flow/adapter/phoenix_soft_arranger_adapter_ctc_all_text_noneg_k64_b128x4_v2_online/checkpoints/epoch_0400.pt
+  vae_checkpoint: experiments/flow/VAE/phoenix_rot6d_vae_jerk_b16x4_online_retry1/checkpoints/best.pt
+  word_data_dir: /media/cvpr/haomian/data/SOKE_FLOW/phoenix_upper_smplx_word_ctc
+  word_split: train.balanced
+  condition_field: text
+  text_model_path: deps/flan-t5-base
+  max_text_tokens: 64
+  lazy_word_motions: true
+  shuffle_word_candidates: false
+  num_negative_candidates: 0
+  candidate_seed: 1234
+
+scaffold:
+  source: adapter_pred
+  cache_dir: /media/cvpr/haomian/data/SOKE_FLOW/phoenix_upper_smplx/meta/niaf_adapter_scaffold_confidence_trainbalanced_epoch0400
+  cache_only: true
+  prefer_cache: true
+  require_retrieval_features: true
+
+retrieval:
+  require_train_only_bank: true
+
+model:
+  type: retrieval_uncertainty_segmental_field
+  code_dim: 64
+  articulator_code_strides:
+    body: [8, 16, 32]
+    lhand: [4, 8, 16]
+    rhand: [4, 8, 16]
+    face: [8, 16, 32]
+  context_hidden_dim: 256
+  context_time_fourier_bands: 6
+  segment_rollout_layers: 2
+  segment_window_multiplier: 2.0
+  minimum_segment_frames: 8
+  maximum_segment_frames: 32
+  segment_text_window_radius: 0.20
+  segment_boundary_stride: 8
+  hidden_dim: 256
+  depth: 4
+  time_fourier_bands: 10
+  omega0_first: 20.0
+  omega0_hidden: 1.0
+  residual_scale_init: 0.15
+  residual_scale_learnable: true
+  body_gate_bias: -2.0
+  hand_gate_bias: -0.5
+  face_gate_bias: -2.0
+  calibrator_hidden_dim: 128
+  calibrator_text_dim: 64
+  calibrator_time_fourier_bands: 4
+  trust_initial: 0.5
+  correction_need_initial: 0.5
+  knot_density_initial: 0.5
+  correction_need_floor: 0.35
+  allocation_scale_bias: 2.0
+  evidence_density_bias: 1.0
+  density_floor: 0.05
+  dropout: 0.0
+
+confidence:
+  expression_weight: 0.1
+  error_temperatures:
+    body: 0.30
+    lhand: 0.45
+    rhand: 0.45
+    face: 0.35
+
+adaptation:
+  correction_need_temperatures:
+    body: 0.20
+    lhand: 0.22
+    rhand: 0.22
+    face: 0.25
+  density_transition_weight: 0.5
+  scale_target_strength: 2.5
+
+duration:
+  hidden_dim: 256
+  initial_frames: 80
+  min_frames: 16
+  max_frames: 400
+  length_multiple: 4
+  huber_beta: 0.15
+
+loss:
+  hand_weight: 8.0
+  lambda_rot6d: 1.0
+  lambda_geo: 0.05
+  lambda_joint: 10.0
+  lambda_hand: 20.0
+  lambda_hand_relative: 10.0
+  lambda_expr: 1.0
+  lambda_vel: 1.0
+  lambda_vel_hand: 3.0
+  lambda_acc: 0.20
+  lambda_path: 0.5
+
+field_loss:
+  lambda_endpoint: 1.0
+  lambda_correction: 1.0
+  lambda_residual_vel: 0.50
+  lambda_residual_acc: 0.20
+  lambda_residual_jerk: 0.05
+  lambda_trust: 0.50
+  lambda_correction_need: 0.75
+  lambda_knot_density: 0.25
+  lambda_scale_prior: 0.10
+  lambda_gate_target: 0.20
+  lambda_preserve_gate: 0.01
+  lambda_gate: 0.0
+  lambda_code_smooth: 0.005
+  lambda_segment_pose: 0.50
+  lambda_segment_vel: 1.00
+  lambda_segment_acc: 0.25
+  lambda_duration: 0.25
+  lambda_fk_vel: 0.75
+  lambda_fk_acc: 0.20
+  lambda_fk_jerk: 0.05
+  lambda_fk_vel_reg: 0.0
+  lambda_fk_acc_reg: 0.0
+  lambda_fk_jerk_reg: 0.0
+  fk_temporal_include_hand_parts: true
+
+selection:
+  weights:
+    pred_loss_endpoint: 1.0
+    pred_loss_hand_relative: 30.0
+    pred_loss_fk_vel: 2.0
+    pred_loss_fk_acc: 1.0
+    pred_loss_fk_jerk: 0.5
+    adaptive_loss_segment_vel: 0.5
+    adaptive_loss_segment_acc: 0.25
+
+train:
+  epochs: 50
+  batch_size: 2
+  num_workers: 0
+  pin_memory: true
+  drop_last: false
+  lr: 0.0002
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  max_train_batches: 0
+  val_every: 2
+  save_every: 1
+
+eval:
+  max_batches: 0
+
+metrics:
+  model_dir: deps/smpl_models
+  gender: NEUTRAL
+  betas_mode: h2s_fixed
+  fk_batch_size: 128
+
+output:
+  out_dir: experiments/NIAF/retrieval_confidence_field/phoenix_retrieval_uncertainty_segmental_trainbalanced

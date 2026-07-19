@@ -1,0 +1,152 @@
+experiment_name: phoenix_continuous_trajectory_full
+seed: 1234
+device: auto
+
+data:
+  data_dir: /media/cvpr/haomian/data/SOKE_FLOW/phoenix_upper_smplx
+  word_data_dir: /media/cvpr/haomian/data/SOKE_FLOW/phoenix_upper_smplx_word_ctc
+  train_split: train
+  val_split: val
+  min_frames: 40
+  max_frames: 400
+  length_multiple: 4
+  random_crop: false
+  limit_train: 0
+  limit_val: 0
+
+cache:
+  fk_cache_dir: /media/cvpr/haomian/data/SOKE_FLOW/phoenix_upper_smplx/meta/niaf_fk_rot6d_h2s_fixed
+  fk_batch_size: 64
+
+text:
+  model_path: deps/flan-t5-base
+  device: cpu
+  max_tokens: 64
+  local_files_only: true
+  cache: true
+  condition_field: text
+
+adapter:
+  checkpoint: experiments/flow/adapter/phoenix_soft_arranger_adapter_ctc_all_text_noneg_k64_b128x4_v2_online/checkpoints/epoch_0400.pt
+  vae_checkpoint: experiments/flow/VAE/phoenix_rot6d_vae_jerk_b16x4_online_retry1/checkpoints/best.pt
+  word_data_dir: /media/cvpr/haomian/data/SOKE_FLOW/phoenix_upper_smplx_word_ctc
+  word_split: train.balanced
+  condition_field: text
+  text_model_path: deps/flan-t5-base
+  max_text_tokens: 64
+  lazy_word_motions: true
+  shuffle_word_candidates: false
+  num_negative_candidates: 0
+  candidate_seed: 1234
+
+scaffold:
+  source: adapter_pred
+  cache_dir: /media/cvpr/haomian/data/SOKE_FLOW/phoenix_upper_smplx/meta/niaf_adapter_scaffold_confidence_trainbalanced_epoch0400
+  cache_only: true
+  prefer_cache: true
+  require_retrieval_features: true
+
+retrieval:
+  require_train_only_bank: true
+
+model:
+  type: continuous_trajectory_field
+  context_hidden_dim: 256
+  context_layers: 3
+  field_hidden_dim: 256
+  field_depth: 4
+  max_local_fields: 32
+  frames_per_local_field: 16
+  minimum_local_width: 0.04
+  maximum_local_width: 0.40
+  quantile_temperature: 0.015
+  omega0_first: 20.0
+  omega0_hidden: 1.0
+  residual_amplitude: 0.10
+  residual_amplitude_learnable: true
+  dropout: 0.0
+
+duration:
+  initial_seconds: 4.0
+  min_seconds: 0.8
+  max_seconds: 20.0
+  min_frames: 40
+  max_frames: 400
+  length_multiple: 4
+  huber_beta: 0.15
+
+loss:
+  hand_weight: 8.0
+  lambda_rot6d: 1.0
+  lambda_geo: 0.05
+  lambda_joint: 10.0
+  lambda_hand: 20.0
+  lambda_hand_relative: 10.0
+  lambda_expr: 1.0
+  lambda_vel: 0.0
+  lambda_vel_hand: 0.0
+  lambda_acc: 0.0
+  lambda_path: 0.5
+
+objective:
+  lambda_endpoint: 1.0
+  lambda_prior: 0.25
+  lambda_residual: 0.50
+  lambda_duration: 0.25
+  lambda_local_modulation: 0.00001
+  lambda_local_width: 0.0
+
+temporal_loss:
+  lambda_fk_vel: 0.75
+  lambda_fk_acc: 0.20
+  lambda_fk_jerk: 0.05
+  fk_temporal_include_hand_parts: true
+
+analytic_dynamics:
+  start_epoch: 5
+  jerk_start_epoch: 10
+  jerk_ramp_epochs: 10
+  query_count: 6
+  smooth_kernel: 7
+  smooth_sigma: 1.5
+  duration_teacher_forcing: true
+  randomize_queries: true
+  jerk_target_ratio: 0.75
+  lambda_analytic_fk_vel: 0.05
+  lambda_analytic_fk_acc: 0.005
+  lambda_analytic_fk_jerk: 0.0001
+  lambda_analytic_fk_jerk_reg: 0.0001
+
+selection:
+  weights:
+    pred_loss_endpoint: 1.0
+    pred_loss_hand_relative: 30.0
+    pred_loss_fk_vel: 2.0
+    pred_loss_fk_acc: 1.0
+    pred_loss_fk_jerk: 0.5
+
+train:
+  epochs: 100
+  batch_size: 4
+  accumulation_steps: 16
+  num_workers: 0
+  pin_memory: true
+  drop_last: false
+  lr: 0.0002
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  max_train_batches: 0
+  val_every: 2
+  save_every: 1
+
+eval:
+  max_batches: 0
+
+metrics:
+  model_dir: deps/smpl_models
+  gender: NEUTRAL
+  betas_mode: h2s_fixed
+  fk_batch_size: 64
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/phoenix_continuous_trajectory_full

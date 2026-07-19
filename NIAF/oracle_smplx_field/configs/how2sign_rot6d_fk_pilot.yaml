@@ -1,0 +1,48 @@
+experiment_name: how2sign_oracle_smplx_rot6d_field_stage0
+seed: 1234
+device: cuda
+
+data:
+  data_dir: /media/cvpr/haomian/data/SOKE_FLOW/how2sign_soke_upper_smplx
+  split: val
+  max_sequences: 3
+  min_frames: 40
+  max_frames: 160
+  length_multiple: 4
+
+model:
+  hidden: 256
+  depth: 3
+  omega0_first: 20.0
+  omega0_hidden: 1.0
+  residual_scale_init: 0.1
+  residual_scale_learnable: true
+
+fit:
+  field_range: "-1_1"
+  steps: 1000
+  batch_points: 128
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+
+loss:
+  hand_weight: 3.0
+
+grid:
+  models: [linear_rot6d, slerp, direct_siren, residual_siren]
+  time_modes: [uniform]
+  fit_modes: [fit_all, even_odd]
+  loss_schedules: [S1]
+  max_runs: 0
+
+metrics:
+  model_dir: deps/smpl_models
+  gender: NEUTRAL
+  smplx_batch_size: 128
+  betas_mode: h2s_fixed
+
+output:
+  out_dir: experiments/NIAF/oracle_smplx_field/how2sign_stage0
+  save_npz: true
+  flush_every_run: true

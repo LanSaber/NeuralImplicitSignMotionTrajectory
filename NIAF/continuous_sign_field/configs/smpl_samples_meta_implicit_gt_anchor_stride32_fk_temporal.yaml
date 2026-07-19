@@ -1,0 +1,105 @@
+experiment_name: smpl_samples_meta_implicit_gt_anchor_stride32_fk_temporal
+seed: 1234
+device: auto
+
+data:
+  data_dir: /media/cvpr/haomian/data/SOKE_FLOW/smpl_samples_soke_upper_smplx
+  train_split: train
+  val_split: val
+  min_frames: 4
+  max_frames: 256
+  length_multiple: 1
+  random_crop: false
+  limit_train: 0
+  limit_val: 0
+
+cache:
+  fk_cache_dir: /media/cvpr/haomian/data/SOKE_FLOW/smpl_samples_soke_upper_smplx/meta/niaf_fk_rot6d_h2s_fixed
+  fk_batch_size: 128
+
+text:
+  model_path: deps/flan-t5-base
+  device: cpu
+  max_tokens: 16
+  local_files_only: true
+  cache: true
+  condition_field: text
+
+adapter:
+  note: unused_for_oracle_smpl_samples_fitting
+
+scaffold:
+  source: gt_anchors
+  interpolation: slerp
+  anchor_stride: 32
+
+meta:
+  code_dim: 128
+  inner_steps: 3
+  inner_lr: 0.01
+  first_order: true
+  support_mode: stride
+  support_stride: 8
+
+model:
+  type: meta_implicit_residual_field
+  code_dim: 128
+  context_hidden_dim: 256
+  hidden_dim: 256
+  depth: 4
+  time_fourier_bands: 10
+  omega0_first: 20.0
+  omega0_hidden: 1.0
+  residual_scale_init: 0.1
+  residual_scale_learnable: true
+  dropout: 0.0
+
+meta_loss:
+  hand_weight: 5.0
+  inner_lambda_residual: 1.0
+  inner_lambda_pose: 0.25
+  inner_residual_loss: l1
+  query_residual_loss: l1
+  lambda_query_endpoint: 1.0
+  lambda_query_residual: 1.0
+  lambda_prior_query_residual: 0.25
+  lambda_support_consistency: 0.25
+  lambda_residual_vel: 0.5
+  lambda_residual_acc: 0.25
+  lambda_fk_vel: 2.0
+  lambda_fk_acc: 5.0
+  lambda_fk_jerk: 10.0
+  fk_temporal_include_hand_parts: true
+
+loss:
+  hand_weight: 5.0
+  lambda_rot6d: 1.0
+  lambda_geo: 0.05
+  lambda_joint: 10.0
+  lambda_hand: 20.0
+  lambda_expr: 1.0
+
+train:
+  epochs: 100
+  batch_size: 2
+  num_workers: 0
+  pin_memory: true
+  drop_last: false
+  lr: 0.0002
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  max_train_batches: 0
+  val_every: 10
+  save_every: 10
+
+eval:
+  max_batches: 0
+
+metrics:
+  model_dir: deps/smpl_models
+  gender: NEUTRAL
+  betas_mode: h2s_fixed
+  fk_batch_size: 128
+
+output:
+  out_dir: experiments/NIAF/continuous_sign_field/smpl_samples_meta_implicit_gt_anchor_stride32_fk_temporal

@@ -1,0 +1,66 @@
+experiment_name: how2sign_oracle_latent_field_pilot
+seed: 1234
+device: cuda
+rotation_rep: rot6d
+
+data:
+  data_dir: /media/cvpr/haomian/data/SOKE_FLOW/how2sign_soke_upper_smplx
+  split: val
+  max_sequences: 100
+  min_latent_len: 8
+  max_latent_len: 100
+  min_frames: 40
+  max_frames: 400
+  length_multiple: 4
+  rotation_rep: rot6d
+
+vae:
+  checkpoint: experiments/flow/VAE/how2sign_rot6d_vae_jerk_b128x4/checkpoints/best.pt
+  latent_stats_config: experiments/flow/how2sign_latent_adapter_residual_signasl_all_b128x4_online_retry2/config.json
+
+model:
+  hidden: 256
+  depth: 3
+  omega0: 30.0
+  omega: 1.0
+
+fit:
+  field_range: "-1_1"
+  steps: 5000
+  warmup_steps: 500
+  batch_points: 64
+  lr: 5.0e-4
+  weight_decay: 0.0
+  grad_clip: 1.0
+
+loss:
+  dec_start: 3000
+  dec_every: 20
+  allow_decoded_loss_in_holdout: false
+
+grid:
+  models: [A1, A2, A3, A4, A5, A6, A7, linear, cubic, bspline, dct]
+  time_modes: [uniform, latent_arclength, pose_arclength]
+  losses: [L1, L2, L3, L4, L5]
+  fit_modes: [fit_all, even_odd, sparse_stride_4]
+  max_runs: 0
+
+metrics:
+  compute_dtw: false
+  alignment_modes: [default]
+  parts: [body, lhand, rhand, wholebody]
+  metric_device: cpu
+  model_dir: deps/smpl_models
+  gender: NEUTRAL
+  smplx_batch_size: 128
+  betas_mode: h2s_fixed
+
+output:
+  out_dir: experiments/NIAF/oracle_latent_field/how2sign_pilot
+  dense_query_factors: [2, 4]
+  peak_top_k: 5
+  save_plots: false
+  save_latent_npz: false
+  save_fitted_params: false
+  save_npz: false
+  flush_every_run: true
