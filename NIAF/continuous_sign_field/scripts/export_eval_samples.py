@@ -62,7 +62,15 @@ def write_jsonl(path, rows):
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def select_manifest(cfg, split, out_dir, num_samples, seed, manifest=None):
+def select_manifest(
+    cfg,
+    split,
+    out_dir,
+    num_samples,
+    seed,
+    manifest=None,
+    selection_mode="random",
+):
     if manifest is not None:
         selected = read_jsonl(manifest)
         out_manifest = out_dir / Path(manifest).name
@@ -74,10 +82,20 @@ def select_manifest(cfg, split, out_dir, num_samples, seed, manifest=None):
         source_manifest = Path(cfg["data"]["data_dir"]) / "meta" / f"manifest_{split}.jsonl"
         rows = read_jsonl(source_manifest)
         count = min(int(num_samples), len(rows)) if int(num_samples) > 0 else len(rows)
-        rng = random.Random(int(seed))
-        indices = rng.sample(range(len(rows)), count)
+        if selection_mode == "first":
+            indices = list(range(count))
+        elif selection_mode == "random":
+            rng = random.Random(int(seed))
+            indices = rng.sample(range(len(rows)), count)
+        else:
+            raise ValueError(f"Unsupported manifest selection mode {selection_mode!r}")
         selected = [rows[idx] for idx in indices]
-        out_manifest = out_dir / f"manifest_{split}_random{count}_seed{seed}.jsonl"
+        suffix = (
+            f"first{count}"
+            if selection_mode == "first"
+            else f"random{count}_seed{seed}"
+        )
+        out_manifest = out_dir / f"manifest_{split}_{suffix}.jsonl"
         write_jsonl(out_manifest, selected)
 
     frame_counts = [int(row.get("num_frames", 0)) for row in selected if int(row.get("num_frames", 0)) > 0]

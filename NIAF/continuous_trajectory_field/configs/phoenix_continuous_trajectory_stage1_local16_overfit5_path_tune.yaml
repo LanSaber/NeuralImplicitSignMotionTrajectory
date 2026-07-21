@@ -1,0 +1,23 @@
+_base_: phoenix_continuous_trajectory_stage1_local16_overfit5.yaml
+
+experiment_name: phoenix_continuous_trajectory_stage1_local16_overfit5_path_tune
+
+# Retry the five-sequence gate after the canonical q64 run showed useful local
+# corrections but shortened hand paths. Keep the architecture fixed and change
+# only the hand/path objective and local-branch optimization schedule.
+loss:
+  lambda_hand: 15.0
+  lambda_hand_relative: 15.0
+  lambda_path: 10.0
+
+train:
+  epochs: 200
+  local_warmup_epochs: 20
+  warmup_global_lr: 0.0
+  warmup_local_lr: 0.0002
+  joint_global_lr: 0.00001
+  joint_local_lr: 0.0002
+  val_every: 10
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/phoenix_continuous_trajectory_stage1_local16_overfit5_path_tune

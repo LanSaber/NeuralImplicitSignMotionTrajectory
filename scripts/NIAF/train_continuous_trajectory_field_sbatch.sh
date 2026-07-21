@@ -40,6 +40,8 @@ LIMIT_VAL="${LIMIT_VAL:-}"
 MAX_TRAIN_BATCHES="${MAX_TRAIN_BATCHES:-}"
 MAX_VAL_BATCHES="${MAX_VAL_BATCHES:-}"
 RESUME="${RESUME:-}"
+WARM_START="${WARM_START:-}"
+RESET_LOCAL_BRANCH="${RESET_LOCAL_BRANCH:-0}"
 OUT_DIR="${OUT_DIR:-}"
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
@@ -52,7 +54,6 @@ export PYTHONNOUSERSITE=1
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
-export HOME="${HOME_VALUE:-/media/cvpr/haomian}"
 export HF_HOME="${HF_HOME:-/media/cvpr/haomian/.cache/huggingface}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
@@ -68,7 +69,21 @@ if [[ -n "$WANDB_API_KEY_FILE" ]]; then
     echo "ERROR: WANDB_API_KEY_FILE does not exist: $WANDB_API_KEY_FILE" >&2
     exit 1
   fi
-  WANDB_API_KEY="$(head -n 1 "$WANDB_API_KEY_FILE" | tr -d '\r\n')"
+  WANDB_KEY_LINE="$(sed -n '/[^[:space:]]/ {s/\r$//; p; q;}' "$WANDB_API_KEY_FILE")"
+  WANDB_KEY_LINE="${WANDB_KEY_LINE#export }"
+  if [[ "$WANDB_KEY_LINE" == WANDB_API_KEY=* ]]; then
+    WANDB_API_KEY="${WANDB_KEY_LINE#WANDB_API_KEY=}"
+  else
+    WANDB_API_KEY="$WANDB_KEY_LINE"
+  fi
+  if [[ "$WANDB_API_KEY" == \"*\" || "$WANDB_API_KEY" == \'*\' ]]; then
+    WANDB_API_KEY="${WANDB_API_KEY:1:${#WANDB_API_KEY}-2}"
+  fi
+  unset WANDB_KEY_LINE
+  if [[ -z "$WANDB_API_KEY" ]]; then
+    echo "ERROR: WANDB_API_KEY_FILE did not contain a key" >&2
+    exit 1
+  fi
 fi
 if [[ -z "$WANDB_API_KEY" && -f "$PROJECT_DIR/scripts/flow/train_overfit_unconditional_sbatch.sh" ]]; then
   WANDB_API_KEY="$(sed -n 's/^WANDB_API_KEY="${WANDB_API_KEY:-\(.*\)}"$/\1/p' "$PROJECT_DIR/scripts/flow/train_overfit_unconditional_sbatch.sh" | head -n 1)"
@@ -113,6 +128,8 @@ if [[ -n "$LIMIT_VAL" ]]; then TRAIN_CMD+=(--limit_val "$LIMIT_VAL"); fi
 if [[ -n "$MAX_TRAIN_BATCHES" ]]; then TRAIN_CMD+=(--max_train_batches "$MAX_TRAIN_BATCHES"); fi
 if [[ -n "$MAX_VAL_BATCHES" ]]; then TRAIN_CMD+=(--max_val_batches "$MAX_VAL_BATCHES"); fi
 if [[ -n "$RESUME" ]]; then TRAIN_CMD+=(--resume "$RESUME"); fi
+if [[ -n "$WARM_START" ]]; then TRAIN_CMD+=(--warm_start "$WARM_START"); fi
+if [[ "$RESET_LOCAL_BRANCH" == "1" ]]; then TRAIN_CMD+=(--reset_local_branch); fi
 if [[ -n "$OUT_DIR" ]]; then TRAIN_CMD+=(--out_dir "$OUT_DIR"); fi
 if [[ "$WANDB" == "1" ]]; then
   TRAIN_CMD+=(--wandb --wandb_project "$WANDB_PROJECT" --wandb_run_name "$WANDB_RUN_NAME")

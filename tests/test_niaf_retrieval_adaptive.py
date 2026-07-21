@@ -187,6 +187,38 @@ def test_train_only_retrieval_manifest_is_enforced():
     assert summary["lexicon_keys"] == 2
 
 
+def test_explicit_external_retrieval_manifest_is_enforced():
+    with tempfile.TemporaryDirectory() as temporary:
+        word_dir = Path(temporary)
+        manifest = word_dir / "meta" / "manifest_all.jsonl"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(
+            '{"lexicon_key": "HELLO"}\n{"lexicon_key": "THANK-YOU"}\n',
+            encoding="utf-8",
+        )
+        prior_builder = SimpleNamespace(
+            manifest_path=manifest,
+            entries=[1, 2],
+            entries_by_key={"HELLO": [1], "THANK-YOU": [2]},
+        )
+        provider = SimpleNamespace(
+            adapter_prior=SimpleNamespace(prior_builder=prior_builder),
+        )
+        summary = validate_train_only_retrieval_bank(
+            {
+                "adapter": {"word_data_dir": str(word_dir)},
+                "retrieval": {
+                    "require_train_only_bank": False,
+                    "expected_word_split": "all",
+                },
+            },
+            provider,
+        )
+        assert summary["manifest"] == str(manifest)
+        assert summary["entries"] == 2
+        assert summary["lexicon_keys"] == 2
+
+
 def test_cache_only_split_audit_uses_cache_summary():
     word_dir = "/media/cvpr/haomian/data/SOKE_FLOW/phoenix_upper_smplx_word_ctc"
     with tempfile.TemporaryDirectory() as temporary:

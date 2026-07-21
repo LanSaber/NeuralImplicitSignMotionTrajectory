@@ -19,13 +19,13 @@ PYTHON_BIN="${PYTHON_BIN:-$PYTHON_ENV/bin/python}"
 CFG="${CFG:-NIAF/continuous_sign_field/configs/phoenix_local_amortized_adapter_text_pilot500_rawgt.yaml}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 DEVICE="${DEVICE:-auto}"
+LIMIT="${LIMIT:-0}"
 
 export PATH="$PYTHON_ENV/bin:$PATH"
 export PYTHONNOUSERSITE=1
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
-export HOME="${HOME_VALUE:-/media/cvpr/haomian}"
 export HF_HOME="${HF_HOME:-/media/cvpr/haomian/.cache/huggingface}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
@@ -38,4 +38,5 @@ srun "$PYTHON_BIN" -m NIAF.continuous_sign_field.scripts.cache_adapter_scaffolds
   --config "$CFG" \
   --splits train val \
   --batch_size "$BATCH_SIZE" \
+  --limit "$LIMIT" \
   --device "$DEVICE"

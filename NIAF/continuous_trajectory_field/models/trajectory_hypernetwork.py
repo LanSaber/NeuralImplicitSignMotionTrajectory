@@ -113,6 +113,9 @@ class TrajectoryHypernetwork(nn.Module):
         minimum_local_width: float = 0.06,
         maximum_local_width: float = 0.50,
         quantile_temperature: float = 0.02,
+        local_center_mode: str = "retrieval_guided",
+        use_retrieval_guidance: bool = True,
+        time_dependent_local_gates: bool = False,
         initial_duration_seconds: float = 4.0,
         minimum_duration_seconds: float = 0.8,
         maximum_duration_seconds: float = 20.0,
@@ -131,6 +134,13 @@ class TrajectoryHypernetwork(nn.Module):
         self.minimum_local_width = float(minimum_local_width)
         self.maximum_local_width = float(maximum_local_width)
         self.quantile_temperature = float(quantile_temperature)
+        self.local_center_mode = str(local_center_mode).lower()
+        if self.local_center_mode not in {"uniform", "learned", "retrieval_guided"}:
+            raise ValueError(
+                "local_center_mode must be uniform, learned, or retrieval_guided"
+            )
+        self.use_retrieval_guidance = bool(use_retrieval_guidance)
+        self.time_dependent_local_gates = bool(time_dependent_local_gates)
 
         frame_input_dim = self.pose_dim * 3 + self.retrieval_dim + 1
         self.frame_input = nn.Sequential(
@@ -187,20 +197,40 @@ class TrajectoryHypernetwork(nn.Module):
             self.context_hidden_dim,
             modulation_dim + self.residual_dim + 1,
         )
+        self.local_gate_head = (
+            nn.Linear(self.context_hidden_dim, 4)
+            if self.time_dependent_local_gates
+            else None
+        )
         self._reset_output_heads()
         if self.max_local_fields == 0:
             self.density_head.requires_grad_(False)
             self.local_context.requires_grad_(False)
             self.local_head.requires_grad_(False)
+            if self.local_gate_head is not None:
+                self.local_gate_head.requires_grad_(False)
 
     def _reset_output_heads(self):
-        for layer in (self.prior_head, self.residual_head, self.local_head):
+        for layer in (self.prior_head, self.residual_head):
             nn.init.normal_(layer.weight, mean=0.0, std=1e-4)
             nn.init.zeros_(layer.bias)
         nn.init.zeros_(self.gate_head.weight)
         nn.init.constant_(self.gate_head.bias, -0.5)
+        self.reset_local_branch()
+
+    def reset_local_branch(self):
+        """Reset only parameters that are inactive in a global-only checkpoint."""
+
+        for module in self.local_context.modules():
+            if hasattr(module, "reset_parameters"):
+                module.reset_parameters()
+        nn.init.normal_(self.local_head.weight, mean=0.0, std=1e-4)
+        nn.init.zeros_(self.local_head.bias)
         nn.init.zeros_(self.density_head.weight)
         nn.init.zeros_(self.density_head.bias)
+        if self.local_gate_head is not None:
+            nn.init.zeros_(self.local_gate_head.weight)
+            nn.init.zeros_(self.local_gate_head.bias)
 
     def _split_modulation(self, values: torch.Tensor, output_dim: int):
         modulation_size = self.field_depth * self.field_hidden_dim
@@ -241,6 +271,18 @@ class TrajectoryHypernetwork(nn.Module):
         weights = torch.softmax(logits, dim=-1)
         centers = (weights * context_tau[:, None, :]).sum(dim=-1)
         return centers * local_mask.to(centers.dtype)
+
+    @staticmethod
+    def _uniform_local_centers(local_mask: torch.Tensor, dtype: torch.dtype):
+        local_count = local_mask.shape[1]
+        if local_count == 0:
+            return torch.zeros(
+                local_mask.shape[0], 0, device=local_mask.device, dtype=dtype
+            )
+        index = torch.arange(local_count, device=local_mask.device, dtype=dtype)
+        active_count = local_mask.sum(dim=1).clamp_min(1).to(dtype)
+        centers = -1.0 + 2.0 * (index.unsqueeze(0) + 0.5) / active_count.unsqueeze(1)
+        return centers.clamp(-1.0, 1.0) * local_mask.to(dtype)
 
     def forward(
         self,
@@ -312,7 +354,12 @@ class TrajectoryHypernetwork(nn.Module):
         local_count = self.max_local_fields
         if local_count:
             density = F.softplus(self.density_head(frame_hidden).squeeze(-1)) + 0.05
-            if self.retrieval_dim:
+            retrieval_guided = (
+                self.local_center_mode == "retrieval_guided"
+                and self.use_retrieval_guidance
+                and self.retrieval_dim
+            )
+            if retrieval_guided:
                 confidence = retrieval_evidence[..., 0].clamp(0.0, 1.0)
                 density = density * (1.0 + (1.0 - confidence))
             density = density * context_mask.to(dtype)
@@ -320,7 +367,12 @@ class TrajectoryHypernetwork(nn.Module):
             active_count = active_count.clamp(1, local_count)
             local_index = torch.arange(local_count, device=adapter_context.device)
             local_mask = local_index.unsqueeze(0) < active_count.unsqueeze(1)
-            centers = self._local_centers(density, context_tau, context_mask, local_mask)
+            if self.local_center_mode == "uniform":
+                centers = self._uniform_local_centers(local_mask, dtype)
+            else:
+                centers = self._local_centers(
+                    density, context_tau, context_mask, local_mask
+                )
             base_width = (2.5 / active_count.to(dtype)).clamp(
                 self.minimum_local_width, self.maximum_local_width
             )
@@ -339,6 +391,11 @@ class TrajectoryHypernetwork(nn.Module):
                 torch.cat([local_frame, local_text, local_global, local_retrieval], dim=-1)
             )
             local_values = self.local_head(local_context)
+            local_part_gates = (
+                torch.sigmoid(self.local_gate_head(local_context))
+                if self.local_gate_head is not None
+                else None
+            )
             modulation_size = self.field_depth * self.field_hidden_dim
             local_scale_flat, local_shift_flat, local_output_bias, width_logits = torch.split(
                 local_values,
@@ -367,6 +424,8 @@ class TrajectoryHypernetwork(nn.Module):
             local_output_bias = local_output_bias * mask_float[:, :, None]
             local_widths = local_widths * mask_float + (~local_mask).to(dtype)
             local_uncertainty = local_uncertainty * mask_float
+            if local_part_gates is not None:
+                local_part_gates = local_part_gates * mask_float[:, :, None]
         else:
             batch = adapter_context.shape[0]
             density = adapter_context.new_zeros(context_mask.shape)
@@ -379,6 +438,11 @@ class TrajectoryHypernetwork(nn.Module):
             local_widths = adapter_context.new_zeros(batch, 0)
             local_mask = torch.zeros(batch, 0, dtype=torch.bool, device=adapter_context.device)
             local_uncertainty = adapter_context.new_zeros(batch, 0)
+            local_part_gates = (
+                adapter_context.new_zeros(batch, 0, 4)
+                if self.local_gate_head is not None
+                else None
+            )
 
         return TrajectoryInstance(
             duration_seconds=duration,
@@ -399,4 +463,5 @@ class TrajectoryHypernetwork(nn.Module):
             local_uncertainty=local_uncertainty,
             context_density=density,
             context_tau=context_tau,
+            local_part_gates=local_part_gates,
         )

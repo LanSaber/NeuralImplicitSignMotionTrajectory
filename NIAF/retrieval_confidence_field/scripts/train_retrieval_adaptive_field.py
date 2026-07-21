@@ -270,12 +270,18 @@ def build_retrieval_adaptive_model(cfg, text_dim):
 
 
 def validate_train_only_retrieval_bank(cfg, provider):
-    if not bool(cfg.get("retrieval", {}).get("require_train_only_bank", True)):
-        return None
+    retrieval_cfg = cfg.get("retrieval", {})
+    require_train_only = bool(retrieval_cfg.get("require_train_only_bank", True))
+    expected_split = retrieval_cfg.get("expected_word_split")
+    if expected_split is None:
+        if not require_train_only:
+            return None
+        expected_split = "train.balanced"
+    expected_split = str(expected_split)
     expected = (
         Path(cfg["adapter"]["word_data_dir"])
         / "meta"
-        / "manifest_train.balanced.jsonl"
+        / f"manifest_{expected_split}.jsonl"
     ).resolve()
     prior_builder = provider.adapter_prior.prior_builder if provider.adapter_prior is not None else None
     if prior_builder is not None:
@@ -290,9 +296,10 @@ def validate_train_only_retrieval_bank(cfg, provider):
         entries = None
         lexicon_keys = None
     if actual != expected:
+        mode = "training-only" if require_train_only else "configured"
         raise ValueError(
-            "Strict retrieval mode expected the PHOENIX training-only balanced word bank at "
-            f"{expected}, but loaded {actual}. Set adapter.word_split=train.balanced."
+            f"Strict retrieval mode expected the {mode} word bank at {expected}, "
+            f"but loaded {actual}. Set adapter.word_split={expected_split}."
         )
 
     cache_summary = None
@@ -305,15 +312,26 @@ def validate_train_only_retrieval_bank(cfg, provider):
                 "confidence scaffold cache job before training."
             )
         cache_summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        if str(cache_summary.get("word_split")) != "train.balanced":
+        if str(cache_summary.get("word_split")) != expected_split:
             raise ValueError(
                 f"Scaffold cache was built with word_split={cache_summary.get('word_split')!r}, "
-                "not train.balanced."
+                f"not {expected_split}."
             )
         cached_manifest = cache_summary.get("word_manifest")
         if cached_manifest and Path(cached_manifest).resolve() != expected:
             raise ValueError(
                 f"Scaffold cache was built from {cached_manifest}, not {expected}."
+            )
+        cached_checkpoint = cache_summary.get("adapter_checkpoint")
+        configured_checkpoint = cfg.get("adapter", {}).get("checkpoint")
+        if (
+            cached_checkpoint
+            and configured_checkpoint
+            and Path(cached_checkpoint).resolve() != Path(configured_checkpoint).resolve()
+        ):
+            raise ValueError(
+                f"Scaffold cache was built with adapter {cached_checkpoint}, "
+                f"not {configured_checkpoint}."
             )
         if not bool(cache_summary.get("require_retrieval_features", False)):
             raise ValueError("Scaffold cache does not declare retrieval confidence features.")

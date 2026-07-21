@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
@@ -29,6 +30,7 @@ from flow.text_encoder import FrozenT5TextEncoder
 from NIAF.continuous_sign_field.config import load_config
 from NIAF.continuous_sign_field.data import (
     ContinuousSignDataset,
+    LengthBucketDistributedSampler,
     collate_continuous_sign,
     denormalize_motion,
 )
@@ -91,7 +93,15 @@ def conditioning_texts(batch, field):
     return batch["text"]
 
 
-def make_loader(cfg, split, limit, shuffle, distributed=False, world_size=1):
+def make_loader(
+    cfg,
+    split,
+    limit,
+    shuffle,
+    distributed=False,
+    world_size=1,
+    num_workers=None,
+):
     data_cfg = cfg["data"]
     dataset = ContinuousSignDataset(
         cfg,
@@ -101,16 +111,54 @@ def make_loader(cfg, split, limit, shuffle, distributed=False, world_size=1):
         require_fk_cache=True,
     )
     train_cfg = cfg.get("train", {})
-    sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=False) if distributed else None
+    batch_size_key = "batch_size" if shuffle else "eval_batch_size"
+    batch_size = int(
+        train_cfg.get(batch_size_key, train_cfg.get("batch_size", 2))
+    )
+    drop_last = bool(shuffle and train_cfg.get("drop_last", False))
+    if bool(train_cfg.get("length_bucketed_batches", False)):
+        replicas = int(world_size) if distributed else 1
+        rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+        sampler = LengthBucketDistributedSampler(
+            dataset.estimated_lengths,
+            batch_size=batch_size,
+            num_replicas=replicas,
+            rank=rank,
+            shuffle=shuffle,
+            seed=int(cfg.get("seed", 1234)),
+            drop_last=drop_last,
+            pad_to_full_batch=bool(shuffle and not drop_last),
+        )
+    else:
+        sampler = (
+            DistributedSampler(dataset, shuffle=shuffle, drop_last=False)
+            if distributed
+            else None
+        )
+    if num_workers is None:
+        num_workers = int(train_cfg.get("num_workers", 0))
+    else:
+        num_workers = int(num_workers)
+    if num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
+    loader_kwargs = {}
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(
+            train_cfg.get("persistent_workers", True)
+        )
+        loader_kwargs["prefetch_factor"] = int(
+            train_cfg.get("prefetch_factor", 2)
+        )
     loader = DataLoader(
         dataset,
-        batch_size=int(train_cfg.get("batch_size", 2)),
+        batch_size=batch_size,
         shuffle=bool(shuffle) and sampler is None,
         sampler=sampler,
-        num_workers=int(train_cfg.get("num_workers", 0)),
+        num_workers=num_workers,
         pin_memory=bool(train_cfg.get("pin_memory", True)),
         collate_fn=collate_continuous_sign,
-        drop_last=bool(shuffle and train_cfg.get("drop_last", False)),
+        drop_last=drop_last,
+        **loader_kwargs,
     )
     return dataset, loader, sampler
 

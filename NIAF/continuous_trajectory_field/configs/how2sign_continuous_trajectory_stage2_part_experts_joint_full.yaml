@@ -1,0 +1,81 @@
+_base_: phoenix_continuous_trajectory_stage2_part_experts_full.yaml
+
+experiment_name: how2sign_continuous_trajectory_stage2_part_experts_joint_full
+
+data:
+  data_dir: /media/cvpr/haomian/data/SOKE_FLOW/how2sign_soke_upper_smplx
+  word_data_dir: /media/cvpr/haomian/data/SOKE_FLOW/how2sign_soke_upper_smplx_word_signasl
+  train_split: train
+  val_split: val
+  min_frames: 40
+  max_frames: 400
+  length_multiple: 4
+  random_crop: false
+  limit_train: 0
+  limit_val: 0
+
+cache:
+  fk_cache_dir: /media/cvpr/haomian/data/SOKE_FLOW/how2sign_soke_upper_smplx/meta/niaf_fk_rot6d_h2s_fixed_v1
+  fk_batch_size: 64
+
+text:
+  condition_field: text
+
+adapter:
+  checkpoint: experiments/flow/adapter/how2sign_soft_arranger_signasl_all_b256x4_online_r3_gloo/checkpoints/best.pt
+  vae_checkpoint: experiments/flow/VAE/how2sign_rot6d_vae_jerk_b128x4/checkpoints/best.pt
+  word_data_dir: /media/cvpr/haomian/data/SOKE_FLOW/how2sign_soke_upper_smplx_word_signasl
+  word_split: all
+  condition_field: text
+  text_model_path: deps/flan-t5-base
+  max_text_tokens: 64
+  lazy_word_motions: true
+  num_negative_candidates: 16
+  candidate_seed: 1234
+
+scaffold:
+  source: adapter_pred
+  cache_dir: /media/cvpr/haomian/data/SOKE_FLOW/how2sign_soke_upper_smplx/meta/niaf_adapter_scaffold_signasl_all_soft_arranger_r3_best_epoch0030
+  cache_only: true
+  prefer_cache: true
+  require_retrieval_features: true
+
+# SignASL is an external word-sign dictionary rather than a sentence split of
+# How2Sign. Audit its exact "all" manifest without applying the PHOENIX-only
+# train.balanced requirement.
+retrieval:
+  require_train_only_bank: false
+  expected_word_split: all
+
+# How2Sign contains clips up to 41.8 seconds. Motion tensors remain bounded at
+# 400 samples, while this head preserves the physical duration used by losses.
+duration:
+  initial_seconds: 5.0
+  min_seconds: 0.8
+  max_seconds: 45.0
+  min_frames: 40
+  max_frames: 400
+  length_multiple: 4
+
+# This run has no dataset-matched global checkpoint. Optimize both branches
+# from epoch 1, using the global-field learning rate for the fresh shared field.
+train:
+  epochs: 50
+  batch_size: 32
+  accumulation_steps: 2
+  local_warmup_epochs: 0
+  joint_global_lr: 0.0002
+  joint_local_lr: 0.0001
+  reset_local_branch_on_warm_start: false
+  val_every: 5
+  save_every: 1
+
+# Delay high-order physical regularization until the fresh global/local fields
+# have first learned the coarse trajectory fit.
+analytic_dynamics:
+  start_epoch: 5
+  jerk_start_epoch: 10
+  jerk_ramp_epochs: 10
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/how2sign_continuous_trajectory_stage2_part_experts_joint_full

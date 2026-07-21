@@ -26,6 +26,12 @@ ROTATION_DIM = 246
 ROTATION_COUNT = 41
 TANGENT_ROTATION_DIM = 123
 RESIDUAL_DIM = 133
+LOCAL_PART_SLICES = {
+    "body": slice(0, 30),
+    "left_hand": slice(30, 75),
+    "right_hand": slice(75, 120),
+    "face": slice(120, 133),
+}
 
 
 def _articulator_gate_vector(gates: torch.Tensor):
@@ -60,6 +66,14 @@ class ContinuousTrajectoryField(nn.Module):
         minimum_local_width: float = 0.06,
         maximum_local_width: float = 0.50,
         quantile_temperature: float = 0.02,
+        local_center_mode: str = "retrieval_guided",
+        use_retrieval_guidance: bool = True,
+        local_window_epsilon: float = 1e-4,
+        part_specific_local_experts: bool = False,
+        time_dependent_local_gates: bool = False,
+        local_body_omega0_first: float = 15.0,
+        local_hand_omega0_first: float = 30.0,
+        local_face_omega0_first: float = 20.0,
         omega0_first: float = 20.0,
         omega0_hidden: float = 1.0,
         residual_amplitude: float = 0.10,
@@ -74,6 +88,8 @@ class ContinuousTrajectoryField(nn.Module):
             raise ValueError(f"Continuous SMPL-X field expects pose_dim={COMPACT6D_DIM}")
         self.pose_dim = int(pose_dim)
         self.residual_dim = RESIDUAL_DIM
+        self.local_window_epsilon = max(float(local_window_epsilon), 1e-12)
+        self.part_specific_local_experts = bool(part_specific_local_experts)
         self.hypernetwork = TrajectoryHypernetwork(
             text_dim=text_dim,
             pose_dim=pose_dim,
@@ -88,6 +104,9 @@ class ContinuousTrajectoryField(nn.Module):
             minimum_local_width=minimum_local_width,
             maximum_local_width=maximum_local_width,
             quantile_temperature=quantile_temperature,
+            local_center_mode=local_center_mode,
+            use_retrieval_guidance=use_retrieval_guidance,
+            time_dependent_local_gates=time_dependent_local_gates,
             initial_duration_seconds=initial_duration_seconds,
             minimum_duration_seconds=minimum_duration_seconds,
             maximum_duration_seconds=maximum_duration_seconds,
@@ -111,6 +130,29 @@ class ContinuousTrajectoryField(nn.Module):
             omega0_hidden=omega0_hidden,
             output_init="zero",
         )
+        if self.part_specific_local_experts:
+            part_omega = {
+                "body": float(local_body_omega0_first),
+                "left_hand": float(local_hand_omega0_first),
+                "right_hand": float(local_hand_omega0_first),
+                "face": float(local_face_omega0_first),
+            }
+            self.part_local_fields = nn.ModuleDict(
+                {
+                    name: GroupModulatedSiren(
+                        input_dim=1,
+                        output_dim=part_slice.stop - part_slice.start,
+                        hidden_dim=field_hidden_dim,
+                        depth=field_depth,
+                        omega0_first=part_omega[name],
+                        omega0_hidden=omega0_hidden,
+                        output_init="zero",
+                    )
+                    for name, part_slice in LOCAL_PART_SLICES.items()
+                }
+            )
+        else:
+            self.part_local_fields = None
         amplitude = torch.tensor(float(residual_amplitude), dtype=torch.float32)
         if residual_amplitude_learnable:
             self.residual_amplitude = nn.Parameter(amplitude)
@@ -119,6 +161,18 @@ class ContinuousTrajectoryField(nn.Module):
 
     def predict_duration(self, text_tokens, text_mask=None):
         return self.hypernetwork.predict_duration(text_tokens, text_mask=text_mask)
+
+    def reset_local_branch(self):
+        """Reset hypernetwork local heads and optional part-specific decoders."""
+
+        self.hypernetwork.reset_local_branch()
+        if self.part_local_fields is None:
+            return
+        for field in self.part_local_fields.values():
+            for layer in field.layers:
+                layer.reset_parameters()
+            nn.init.uniform_(field.output.weight, -1e-3, 1e-3)
+            nn.init.zeros_(field.output.bias)
 
     def predict_lengths(
         self,
@@ -181,8 +235,11 @@ class ContinuousTrajectoryField(nn.Module):
         batch, queries = tau.shape
         local_count = trajectory.num_local_fields
         if local_count == 0:
-            return tau.new_zeros(batch, queries, self.residual_dim), tau.new_zeros(
-                batch, queries, 0
+            return (
+                tau.new_zeros(batch, queries, self.residual_dim),
+                tau.new_zeros(batch, queries, 0),
+                tau.new_zeros(batch, queries),
+                tau.new_zeros(batch, queries, 4),
             )
         width = trajectory.local_widths.clamp_min(1e-4)
         local_tau = (
@@ -195,23 +252,62 @@ class ContinuousTrajectoryField(nn.Module):
         )
         flat_shift = trajectory.local_shift.reshape_as(flat_scale)
         flat_bias = trajectory.local_output_bias.reshape(batch * local_count, -1)
-        local_values = self.residual_field(
-            flat_coordinates,
-            flat_scale,
-            flat_shift,
-            flat_bias,
-        ).reshape(batch, local_count, queries, self.residual_dim)
-        logits = -0.5 * local_tau.square()
-        logits = logits.masked_fill(~trajectory.local_mask[:, :, None], -torch.inf)
-        all_inactive = ~trajectory.local_mask.any(dim=1)
-        if bool(all_inactive.any()):
-            logits = logits.clone()
-            logits[all_inactive] = 0.0
-        weights = torch.softmax(logits, dim=1)
-        weights = weights * trajectory.local_mask[:, :, None].to(weights.dtype)
-        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        if self.part_local_fields is None:
+            modulated_local_values = self.residual_field(
+                flat_coordinates,
+                flat_scale,
+                flat_shift,
+                flat_bias,
+            ).reshape(batch, local_count, queries, self.residual_dim)
+            # A reset local head must contribute approximately zero even when the
+            # shared residual SIREN was warm-started from a trained global model.
+            base_local_values = self.residual_field(
+                flat_coordinates,
+                torch.zeros_like(flat_scale),
+                torch.zeros_like(flat_shift),
+                None,
+            ).reshape(batch, local_count, queries, self.residual_dim)
+            local_values = modulated_local_values - base_local_values
+        else:
+            part_values = []
+            for name, part_slice in LOCAL_PART_SLICES.items():
+                field = self.part_local_fields[name]
+                output_dim = part_slice.stop - part_slice.start
+                part_bias = flat_bias[:, part_slice]
+                modulated = field(
+                    flat_coordinates,
+                    flat_scale,
+                    flat_shift,
+                    part_bias,
+                ).reshape(batch, local_count, queries, output_dim)
+                base = field(
+                    flat_coordinates,
+                    torch.zeros_like(flat_scale),
+                    torch.zeros_like(flat_shift),
+                    None,
+                ).reshape(batch, local_count, queries, output_dim)
+                part_values.append(modulated - base)
+            local_values = torch.cat(part_values, dim=-1)
+        if trajectory.local_part_gates is not None:
+            local_values = local_values * _articulator_gate_vector(
+                trajectory.local_part_gates
+            )[:, :, None, :]
+        raw_weights = torch.exp(-0.5 * local_tau.square())
+        raw_weights = raw_weights * trajectory.local_mask[:, :, None].to(
+            raw_weights.dtype
+        )
+        weight_sum = raw_weights.sum(dim=1, keepdim=True)
+        # Keeping epsilon in the denominator gives the local mixture absolute
+        # support: it fades to zero when a query is far from every local center.
+        weights = raw_weights / (weight_sum + self.local_window_epsilon)
+        coverage = weights.sum(dim=1)
         output = (local_values * weights.unsqueeze(-1)).sum(dim=1)
-        return output, weights.transpose(1, 2)
+        query_part_gates = (
+            torch.einsum("bmq,bmp->bqp", weights, trajectory.local_part_gates)
+            if trajectory.local_part_gates is not None
+            else tau.new_zeros(batch, queries, 4)
+        )
+        return output, weights.transpose(1, 2), coverage, query_part_gates
 
     def query_trajectory(
         self,
@@ -220,6 +316,8 @@ class ContinuousTrajectoryField(nn.Module):
         time_domain: str = "normalized",
         query_mask: torch.Tensor | None = None,
         return_details: bool = False,
+        include_global_residual: bool = True,
+        include_local_residual: bool = True,
     ):
         tau = self.normalize_query_times(trajectory, query_times, time_domain)
         coordinates = tau.unsqueeze(-1)
@@ -235,14 +333,23 @@ class ContinuousTrajectoryField(nn.Module):
             trajectory.residual_shift,
             trajectory.residual_output_bias,
         )
-        local_residual, local_weights = self._local_residual(trajectory, tau)
-        residual_axis = global_residual + local_residual
+        (
+            local_residual,
+            local_weights,
+            local_coverage,
+            local_part_gates,
+        ) = self._local_residual(trajectory, tau)
         gates = _articulator_gate_vector(trajectory.articulator_gates)
-        residual_axis = (
-            self.residual_amplitude.to(dtype=residual_axis.dtype)
-            * residual_axis
-            * gates[:, None, :]
-        )
+        amplitude = self.residual_amplitude.to(dtype=global_residual.dtype)
+        global_axis = amplitude * global_residual * gates[:, None, :]
+        local_axis = amplitude * local_residual
+        if trajectory.local_part_gates is None:
+            local_axis = local_axis * gates[:, None, :]
+        if not include_global_residual:
+            global_axis = torch.zeros_like(global_axis)
+        if not include_local_residual:
+            local_axis = torch.zeros_like(local_axis)
+        residual_axis = global_axis + local_axis
 
         prior_rotation = prior_raw[..., :ROTATION_DIM].reshape(
             *prior_raw.shape[:-1], ROTATION_COUNT, 6
@@ -270,14 +377,25 @@ class ContinuousTrajectoryField(nn.Module):
             prediction = prediction * mask_float
             prior_raw = prior_raw * mask_float
             residual_axis = residual_axis * mask_float
+            global_axis = global_axis * mask_float
+            local_axis = local_axis * mask_float
+            local_weights = local_weights * mask_float
+            local_coverage = local_coverage * query_mask.to(
+                device=local_coverage.device, dtype=local_coverage.dtype
+            )
+            local_part_gates = local_part_gates * mask_float[..., :1]
         if not return_details:
             return prediction
         return {
             "prediction": prediction,
             "prior": prior_raw,
             "correction_axis": residual_axis,
+            "global_correction_axis": global_axis,
+            "local_correction_axis": local_axis,
             "tau": tau,
             "local_weights": local_weights,
+            "local_coverage": local_coverage,
+            "local_part_gates": local_part_gates,
             "trajectory": trajectory,
         }
 
@@ -322,6 +440,24 @@ def build_continuous_trajectory_field(cfg, text_dim: int):
         minimum_local_width=float(model_cfg.get("minimum_local_width", 0.06)),
         maximum_local_width=float(model_cfg.get("maximum_local_width", 0.50)),
         quantile_temperature=float(model_cfg.get("quantile_temperature", 0.02)),
+        local_center_mode=str(model_cfg.get("local_center_mode", "retrieval_guided")),
+        use_retrieval_guidance=bool(model_cfg.get("use_retrieval_guidance", True)),
+        local_window_epsilon=float(model_cfg.get("local_window_epsilon", 1e-4)),
+        part_specific_local_experts=bool(
+            model_cfg.get("part_specific_local_experts", False)
+        ),
+        time_dependent_local_gates=bool(
+            model_cfg.get("time_dependent_local_gates", False)
+        ),
+        local_body_omega0_first=float(
+            model_cfg.get("local_body_omega0_first", 15.0)
+        ),
+        local_hand_omega0_first=float(
+            model_cfg.get("local_hand_omega0_first", 30.0)
+        ),
+        local_face_omega0_first=float(
+            model_cfg.get("local_face_omega0_first", 20.0)
+        ),
         omega0_first=float(model_cfg.get("omega0_first", 20.0)),
         omega0_hidden=float(model_cfg.get("omega0_hidden", 1.0)),
         residual_amplitude=float(model_cfg.get("residual_amplitude", 0.10)),

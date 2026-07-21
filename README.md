@@ -5,10 +5,11 @@ trajectory work originally developed inside SOKE. The extraction is
 non-destructive: the source repository remains in place, while the NIAF code,
 experiment archive, evaluations, and visualizations are copied here.
 
-## Current Pipeline
+## Current Pipeline: SignTrajField
 
-The primary PHOENIX model produces a continuous trajectory instance rather than
-a fixed frame tensor:
+The primary PHOENIX pipeline is called **SignTrajField**: a retrieval-guided
+neural implicit sign trajectory field. It produces a continuous trajectory
+instance rather than a fixed frame tensor:
 
 1. Sentence text is encoded with the local FLAN-T5 model.
 2. A frozen SoftArranger adapter supplies retrieval and motion-plan context.
@@ -21,6 +22,33 @@ a fixed frame tensor:
 
 The detailed design is in
 [`docs/NIAF/continuous_trajectory_field/implementation_plan.md`](docs/NIAF/continuous_trajectory_field/implementation_plan.md).
+The evidence-based next-step proposal is in
+[`docs/NIAF/continuous_trajectory_field/improvement_roadmap.md`](docs/NIAF/continuous_trajectory_field/improvement_roadmap.md).
+The standalone PHOENIX training procedure is in
+[`docs/NIAF/continuous_trajectory_field/training_guide.md`](docs/NIAF/continuous_trajectory_field/training_guide.md).
+The reproducible PHOENIX evaluation protocol is in
+[`docs/NIAF/continuous_trajectory_field/evaluation_guide.md`](docs/NIAF/continuous_trajectory_field/evaluation_guide.md).
+The checkpoint-to-video comparison procedure is in
+[`docs/NIAF/continuous_trajectory_field/visualization_guide.md`](docs/NIAF/continuous_trajectory_field/visualization_guide.md).
+The canonical identity and status-routing record for currently running or
+queued experiments is
+[`docs/NIAF/continuous_trajectory_field/active_training_runs.md`](docs/NIAF/continuous_trajectory_field/active_training_runs.md).
+Read that registry before interpreting an unqualified request for "the current
+training"; it explicitly names the default run and distinguishes concurrent
+experiments.
+
+## Documentation
+
+The documentation tree is intentionally scoped to the active pipeline:
+
+- `docs/NIAF/continuous_trajectory_field/` contains the current design,
+  improvement record, and training/evaluation/visualization operator guides;
+- `docs/NIAF/RetrievalConfidence/` documents the retained discrete baseline and
+  retrieval evidence reused by the trajectory field; and
+- `docs/flow/` documents only the frozen SoftArranger and dataset dependencies.
+
+Historical oracle-fitting, GUAVA completion, meta-implicit, residual-flow, and
+latent-flow experiment notes are not part of this project documentation.
 
 ## Repository Layout
 
@@ -30,10 +58,10 @@ flow/                 Shared adapter, dataset, SMPL-X, evaluation, and render co
 mGPT/                 Joint metrics and rendering support used by evaluation
 scripts/NIAF/         Slurm launchers for NIAF experiments
 scripts/flow/         Launchers for frozen flow dependencies
-docs/NIAF/            Designs, experiment summaries, and visualization guides
+docs/                 Current trajectory, retrieval-baseline, and dependency docs
 tests/                 Focused NIAF and GUAVA tests
 experiments/NIAF/     Migrated checkpoints, evaluations, NPZ exports, plots, and videos
-experiments/flow/     Exact frozen adapter/VAE dependencies used by NIAF
+experiments/flow/     Frozen NIAF dependencies and the CSL-Daily adapter archive
 deps/                 Local FLAN-T5 and SMPL-X assets
 logs/sbatch/          Migrated NIAF-related Slurm logs
 ```
@@ -66,13 +94,10 @@ Run focused tests after installing the optional `pytest` dependency:
 "$PYTHON_ENV/bin/python" -m pytest -q tests/test_niaf_continuous_trajectory_field.py
 ```
 
-Launch the current full PHOENIX configuration:
-
-```bash
-CFG=NIAF/continuous_trajectory_field/configs/phoenix_continuous_trajectory_full_smooth_q32_jreg1e2_w10_b32x8.yaml \
-RUN_TAG=phoenix_continuous_trajectory_full_smooth_q32_jreg1e2_w10_b32x8 \
-sbatch scripts/NIAF/train_continuous_trajectory_field_sbatch.sh
-```
+To smoke-test, start, resume, or monitor a Stage-2 training without colliding
+with an existing output directory, first resolve the intended run in the
+[`active training registry`](docs/NIAF/continuous_trajectory_field/active_training_runs.md), then follow the
+[`SignTrajField training guide`](docs/NIAF/continuous_trajectory_field/training_guide.md).
 
 Inspect export and evaluation options:
 

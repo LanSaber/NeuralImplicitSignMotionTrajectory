@@ -43,6 +43,12 @@ def parse_args():
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--num_samples", type=int, default=5)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--selection_mode",
+        default="random",
+        choices=("random", "first"),
+        help="Choose random manifest rows or the first rows used by limit_train.",
+    )
     parser.add_argument("--out_dir", type=Path, required=True)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
@@ -220,6 +226,7 @@ def main():
         args.num_samples,
         args.seed,
         manifest=args.manifest,
+        selection_mode=args.selection_mode,
     )
     cfg.setdefault("data", {})[f"{args.split}_manifest_path"] = str(selected_manifest)
     cfg.setdefault("data", {})[f"limit_{args.split}"] = 0
@@ -276,6 +283,22 @@ def main():
         )
         main_fps = fps_values[0]
         main_sample = sampled[main_fps]
+        branch_samples = {}
+        if bool(cfg.get("eval", {}).get("residual_branch_ablation", False)):
+            branch_samples["global_only"] = model.query_trajectory(
+                inference["trajectory"],
+                main_sample["tau"],
+                time_domain="normalized",
+                query_mask=main_sample["mask"],
+                include_local_residual=False,
+            )
+            branch_samples["local_only"] = model.query_trajectory(
+                inference["trajectory"],
+                main_sample["tau"],
+                time_domain="normalized",
+                query_mask=main_sample["mask"],
+                include_global_residual=False,
+            )
 
         for local_index in range(len(batch["name"])):
             suffix = f"{sample_counter:04d}"
@@ -332,6 +355,13 @@ def main():
                 ),
             }
             extra.update(_trajectory_numpy(inference["trajectory"], local_index))
+            for branch_name, branch_prediction in branch_samples.items():
+                branch_rot6d, branch_axis, branch_smplx = rot6d_to_axis_and_smplx(
+                    branch_prediction[local_index, :output_length]
+                )
+                extra[f"{branch_name}_rot6d"] = branch_rot6d.astype(np.float32)
+                extra[f"{branch_name}_motion"] = branch_axis.astype(np.float32)
+                extra[f"{branch_name}_smplx"] = branch_smplx.astype(np.float32)
             for fps, fps_sample in sampled.items():
                 fps_length = int(fps_sample["lengths"][local_index].item())
                 fps_prediction = fps_sample["outputs"]["prediction"][

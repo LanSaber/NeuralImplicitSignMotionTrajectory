@@ -2,7 +2,11 @@
 
 Date: 2026-07-19
 
-Status: implemented; staged training has not yet been launched
+Status: implemented; full PHOENIX training snapshots and epoch-72 test
+evaluations are available
+
+Recommended next steps are documented in
+[`improvement_roadmap.md`](improvement_roadmap.md).
 
 ## 1. Goal
 

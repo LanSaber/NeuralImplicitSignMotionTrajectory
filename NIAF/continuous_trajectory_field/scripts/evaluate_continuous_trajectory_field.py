@@ -46,8 +46,11 @@ def parse_args():
     parser.add_argument(
         "--scaffold_mode",
         default="config",
-        choices=("config", "cache", "online"),
-        help="Use config behavior, require cached scaffolds, or build them online.",
+        choices=("config", "cache", "fallback", "online"),
+        help=(
+            "Use config behavior, require cached scaffolds, prefer cache with "
+            "online fallback, or build every scaffold online."
+        ),
     )
     parser.add_argument("--device", default=None)
     parser.add_argument("--text_device", default=None)
@@ -78,7 +81,7 @@ def main():
     args = parse_args()
     cfg = load_config(args.config)
     if args.batch_size is not None:
-        cfg.setdefault("train", {})["batch_size"] = int(args.batch_size)
+        cfg.setdefault("train", {})["eval_batch_size"] = int(args.batch_size)
     if args.device is not None:
         cfg["device"] = args.device
     if args.text_device is not None:
@@ -88,6 +91,9 @@ def main():
     if args.scaffold_mode == "online":
         scaffold_cfg["cache_only"] = False
         scaffold_cfg["prefer_cache"] = False
+    elif args.scaffold_mode == "fallback":
+        scaffold_cfg["cache_only"] = False
+        scaffold_cfg["prefer_cache"] = True
     elif args.scaffold_mode == "cache":
         scaffold_cfg["cache_only"] = True
         scaffold_cfg["prefer_cache"] = True
@@ -113,12 +119,17 @@ def main():
             shuffle=False,
             distributed=dist_info["enabled"],
             world_size=dist_info["world_size"],
+            # The provider below may initialize CUDA and transformer worker
+            # threads before this loader is first iterated. Avoid a late fork,
+            # which can leave every worker blocked on an inherited lock.
+            num_workers=int(cfg.get("eval", {}).get("num_workers", 0)),
         )
         rank_zero_print(
             dist_info,
             f"Evaluating split={args.split} examples={len(eval_dataset)} "
             f"world_size={dist_info['world_size']} "
-            f"batch_per_rank={cfg.get('train', {}).get('batch_size', 1)}",
+            f"batch_per_rank={cfg.get('train', {}).get('eval_batch_size', 1)} "
+            f"workers={cfg.get('eval', {}).get('num_workers', 0)}",
         )
 
         text_encoder = build_text_encoder(cfg, text_device)
@@ -147,7 +158,9 @@ def main():
             show_progress=dist_info["is_main"],
         )
         metrics = distributed_mean_scalars(metrics, device, dist_info)
-        score, constraint_violation, feasible = selection_diagnostics(metrics, cfg)
+        score, constraint_violation, feasible, selection_details = selection_diagnostics(
+            metrics, cfg, return_details=True
+        )
         result = {
             "checkpoint": str(args.checkpoint.resolve()),
             "checkpoint_epoch": checkpoint_epoch,
@@ -155,7 +168,9 @@ def main():
             "split": str(args.split),
             "dataset_examples": len(eval_dataset),
             "world_size": int(dist_info["world_size"]),
-            "batch_size_per_rank": int(cfg.get("train", {}).get("batch_size", 1)),
+            "batch_size_per_rank": int(
+                cfg.get("train", {}).get("eval_batch_size", 1)
+            ),
             "max_batches_per_rank": max(int(args.max_batches), 0),
             "scaffold_mode": str(args.scaffold_mode),
             "scaffold": provider.config_summary,
@@ -163,6 +178,7 @@ def main():
             "selection_score": float(score),
             "selection_constraint_violation": float(constraint_violation),
             "selection_feasible": bool(feasible),
+            "selection_details": selection_details,
             "metrics": metrics,
         }
         if dist_info["is_main"]:

@@ -1,0 +1,79 @@
+_base_: phoenix_continuous_trajectory_full_smooth_q32_jreg1e2_w10_b32x8.yaml
+
+experiment_name: phoenix_continuous_trajectory_stage1_local16_overfit5
+
+data:
+  val_split: train
+  limit_train: 5
+  limit_val: 5
+
+model:
+  max_local_fields: 16
+  frames_per_local_field: 24
+  minimum_local_width: 0.05
+  maximum_local_width: 0.30
+  quantile_temperature: 0.02
+  local_center_mode: retrieval_guided
+  use_retrieval_guidance: true
+  local_window_epsilon: 0.0001
+
+objective:
+  lambda_local_modulation: 0.00001
+  lambda_local_width: 0.0
+
+analytic_dynamics:
+  query_count: 64
+
+validation_dynamics:
+  query_count: 64
+
+eval:
+  residual_branch_ablation: true
+
+selection:
+  keep_validation_checkpoints: true
+  weights:
+    pred_loss_endpoint:
+      weight: 1.0
+      relative_to: scaffold_loss_endpoint
+    pred_loss_hand_relative:
+      weight: 10.0
+      relative_to: scaffold_loss_hand_relative
+    pred_loss_path:
+      weight: 0.5
+      relative_to: scaffold_loss_path
+  constraint_penalty: 100.0
+  constraints:
+    pred_loss_endpoint:
+      relative_to: scaffold_loss_endpoint
+      max: 0.0
+      scale: 1.0
+    pred_loss_hand_relative:
+      relative_to: scaffold_loss_hand_relative
+      max: 0.0
+      scale: 0.1
+    pred_loss_path:
+      relative_to: scaffold_loss_path
+      max: 0.10
+      scale: 0.10
+    pred_dense_analytic_fk_jerk_ratio:
+      min: 0.60
+      max: 0.95
+      scale: 0.10
+
+train:
+  epochs: 200
+  batch_size: 1
+  accumulation_steps: 5
+  lr: 0.0001
+  local_warmup_epochs: 5
+  warmup_global_lr: 0.0
+  warmup_local_lr: 0.0002
+  joint_global_lr: 0.00002
+  joint_local_lr: 0.0001
+  reset_local_branch_on_warm_start: true
+  val_every: 10
+  save_every: 1
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/phoenix_continuous_trajectory_stage1_local16_overfit5_q64

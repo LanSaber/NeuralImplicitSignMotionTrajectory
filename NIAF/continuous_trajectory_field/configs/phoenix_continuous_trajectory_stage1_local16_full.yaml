@@ -1,0 +1,16 @@
+_base_: phoenix_continuous_trajectory_stage1_local16_pilot500.yaml
+
+experiment_name: phoenix_continuous_trajectory_stage1_local16_full
+
+data:
+  limit_train: 0
+  limit_val: 0
+
+train:
+  epochs: 50
+  accumulation_steps: 32
+  local_warmup_epochs: 3
+  val_every: 5
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/phoenix_continuous_trajectory_stage1_local16_full

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from flow.dataset import UpperSMPLXFlowDataset
 from flow.smplx_features import COMPACT6D_DIM
@@ -12,6 +12,124 @@ from flow.smplx_features import resample_array
 
 
 PART_KEYS = ("body", "lhand", "rhand", "wholebody")
+
+
+class LengthBucketDistributedSampler(Sampler[int]):
+    """Build equal-rank batches from neighboring sequence lengths.
+
+    Full global batches contain adjacent examples in the length-sorted dataset.
+    Their order and the assignment of equal-length examples are shuffled each
+    epoch.  A final partial batch is kept partial and padded only to a multiple
+    of the number of ranks, matching DistributedSampler's coverage semantics.
+    """
+
+    def __init__(
+        self,
+        lengths,
+        batch_size,
+        num_replicas=1,
+        rank=0,
+        shuffle=True,
+        seed=0,
+        drop_last=False,
+        pad_to_full_batch=False,
+    ):
+        self.lengths = tuple(int(value) for value in lengths)
+        self.batch_size = int(batch_size)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self.pad_to_full_batch = bool(pad_to_full_batch)
+        self.epoch = 0
+
+        if not self.lengths:
+            raise ValueError("LengthBucketDistributedSampler requires data.")
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if self.num_replicas <= 0:
+            raise ValueError("num_replicas must be positive.")
+        if not 0 <= self.rank < self.num_replicas:
+            raise ValueError(
+                f"rank must be in [0, {self.num_replicas}), got {self.rank}."
+            )
+
+        global_batch_size = self.batch_size * self.num_replicas
+        if self.drop_last:
+            self.total_size = (
+                len(self.lengths) // global_batch_size
+            ) * global_batch_size
+        elif self.pad_to_full_batch:
+            self.total_size = (
+                (len(self.lengths) + global_batch_size - 1)
+                // global_batch_size
+            ) * global_batch_size
+        else:
+            self.total_size = (
+                (len(self.lengths) + self.num_replicas - 1)
+                // self.num_replicas
+            ) * self.num_replicas
+        self.num_samples = self.total_size // self.num_replicas
+
+    def __len__(self):
+        return self.num_samples
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+
+        indices = list(range(len(self.lengths)))
+        if self.shuffle:
+            tie_order = torch.randperm(len(indices), generator=generator).tolist()
+            indices = [indices[index] for index in tie_order]
+        indices.sort(key=self.lengths.__getitem__)
+        global_batch_size = self.batch_size * self.num_replicas
+
+        if self.total_size < len(indices):
+            indices = indices[: self.total_size]
+        elif self.total_size > len(indices):
+            padding = self.total_size - len(indices)
+            source = indices[-min(len(indices), global_batch_size) :]
+            longest_copies = min(padding, self.num_replicas - 1)
+            padded = [indices[-1]] * longest_copies
+            remaining = padding - longest_copies
+            repeats = (remaining + len(source) - 1) // len(source)
+            padded.extend((source * repeats)[:remaining])
+            indices.extend(padded)
+
+        full_batches = []
+        final_batch = None
+        for offset in range(0, len(indices), global_batch_size):
+            batch = indices[offset : offset + global_batch_size]
+            if len(batch) == global_batch_size:
+                full_batches.append(batch)
+            else:
+                final_batch = batch
+
+        if self.shuffle and full_batches:
+            order = torch.randperm(len(full_batches), generator=generator).tolist()
+            full_batches = [full_batches[index] for index in order]
+
+        batches = full_batches + ([final_batch] if final_batch else [])
+        rank_indices = []
+        for batch in batches:
+            if self.shuffle:
+                order = torch.randperm(len(batch), generator=generator).tolist()
+                batch = [batch[index] for index in order]
+            batch.sort(key=self.lengths.__getitem__, reverse=True)
+            local_batch = batch[self.rank :: self.num_replicas]
+            rank_indices.extend(local_batch)
+
+        if len(rank_indices) != self.num_samples:
+            raise RuntimeError(
+                "Length-bucket sampler produced an unequal rank length: "
+                f"expected={self.num_samples}, actual={len(rank_indices)}"
+            )
+        return iter(rank_indices)
 
 
 def build_upper_smplx_dataset(cfg, split, limit=None, random_crop=None):
@@ -55,6 +173,22 @@ class ContinuousSignDataset(Dataset):
         self.require_fk_cache = bool(require_fk_cache)
         self.mean = self.base.mean.astype(np.float32)
         self.std = self.base.std.astype(np.float32)
+        self.estimated_lengths = tuple(
+            self.base._target_length(self._manifest_length(item))
+            for item in self.base.items
+        )
+
+    @staticmethod
+    def _manifest_length(item):
+        length = int(item.get("num_frames", 0) or 0)
+        if length <= 0:
+            fps = max(float(item.get("fps", 20.0)), 1.0)
+            length = int(round(float(item.get("duration", 0.0)) * fps))
+        if length <= 0:
+            raise ValueError(
+                f"Manifest item {item.get('name', '<unknown>')!r} has no usable length."
+            )
+        return length
 
     def __len__(self):
         return len(self.base)

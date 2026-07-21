@@ -1,0 +1,43 @@
+_base_: phoenix_continuous_trajectory_stage1_local16_full.yaml
+
+experiment_name: phoenix_continuous_trajectory_stage2_part_experts_full
+
+model:
+  part_specific_local_experts: true
+  time_dependent_local_gates: true
+  local_body_omega0_first: 15.0
+  local_hand_omega0_first: 30.0
+  local_face_omega0_first: 20.0
+
+# The five-sequence constraints remain useful diagnostics, but should not make
+# a full-data exploratory run fail when validation-set behavior differs.
+selection:
+  require_feasible: false
+
+train:
+  batch_size: 32
+  eval_batch_size: 8
+  accumulation_steps: 2
+  length_bucketed_batches: true
+  # Bound both axes of the analytic trajectory loss: it scales with sample
+  # count as well as padded sequence length.
+  max_samples_per_memory_batch: 32
+  max_frames_per_memory_batch: 4096
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+  log_every_batches: 1
+
+eval:
+  # Dense validation evaluates nested JVPs through SMPL-X up to third order.
+  # Keep loader throughput at eight samples but stream them one at a time to
+  # the GPU, releasing cached allocations after each logical loader batch.
+  # A synchronous loader also avoids forking workers after CUDA/transformer
+  # initialization, which can deadlock before validation's first batch.
+  num_workers: 0
+  max_samples_per_memory_batch: 1
+  max_frames_per_memory_batch: 512
+  empty_cache_between_batches: true
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/phoenix_continuous_trajectory_stage2_part_experts_full

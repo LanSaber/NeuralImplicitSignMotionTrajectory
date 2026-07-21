@@ -1,4 +1,5 @@
 import inspect
+from unittest.mock import patch
 
 import torch
 
@@ -14,8 +15,17 @@ from NIAF.continuous_trajectory_field.models import (
     build_continuous_trajectory_field,
 )
 from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field import (
+    configure_wandb_metrics,
+    evaluate,
+    load_warm_start_state,
+    memory_microbatch_size,
     selection_diagnostics,
     selection_score,
+    validation_microbatch_size,
+    wandb_train_batch_payload,
+    wandb_train_epoch_payload,
+    wandb_validation_payload,
+    wandb_validation_pending_payload,
 )
 
 
@@ -139,7 +149,122 @@ def test_local_centers_widths_masks_and_partition():
     query = torch.linspace(-1.0, 1.0, 13).repeat(2, 1)
     outputs = model.query_trajectory(trajectory, query, return_details=True)
     assert outputs["local_weights"].shape == (2, 13, 4)
-    assert torch.allclose(outputs["local_weights"].sum(dim=-1), torch.ones(2, 13))
+    weight_sum = outputs["local_weights"].sum(dim=-1)
+    assert torch.all(weight_sum >= 0.0)
+    assert torch.all(weight_sum <= 1.0)
+    assert torch.allclose(weight_sum, outputs["local_coverage"])
+
+
+def test_local_windows_have_absolute_support_and_fade_outside_centers():
+    model = _model(max_local_fields=4).eval()
+    trajectory = _instance(model).detach().clone()
+    trajectory.local_centers.zero_()
+    trajectory.local_widths.fill_(0.05)
+    query = torch.tensor([[-1.0, 0.0, 1.0], [-1.0, 0.0, 1.0]])
+    outputs = model.query_trajectory(trajectory, query, return_details=True)
+    assert torch.all(outputs["local_coverage"][:, (0, 2)] < 1e-6)
+    assert torch.all(outputs["local_coverage"][:, 1] > 0.99)
+    assert torch.allclose(
+        outputs["local_correction_axis"][:, (0, 2)],
+        torch.zeros_like(outputs["local_correction_axis"][:, (0, 2)]),
+        atol=1e-7,
+    )
+
+
+def test_reset_local_branch_starts_as_small_delta_from_shared_field():
+    model = _model(max_local_fields=4).eval()
+    model.hypernetwork.reset_local_branch()
+    trajectory = _instance(model)
+    query = torch.linspace(-1.0, 1.0, 11).repeat(2, 1)
+    outputs = model.query_trajectory(trajectory, query, return_details=True)
+    assert torch.sqrt(outputs["local_correction_axis"].square().mean()) < 1e-3
+
+
+def test_global_and_local_residual_branches_can_be_ablated_independently():
+    model = _model(max_local_fields=4).eval()
+    trajectory = _instance(model)
+    query = torch.linspace(-1.0, 1.0, 11).repeat(2, 1)
+    full = model.query_trajectory(trajectory, query, return_details=True)
+    global_only = model.query_trajectory(
+        trajectory,
+        query,
+        return_details=True,
+        include_local_residual=False,
+    )
+    local_only = model.query_trajectory(
+        trajectory,
+        query,
+        return_details=True,
+        include_global_residual=False,
+    )
+    assert torch.count_nonzero(global_only["local_correction_axis"]) == 0
+    assert torch.count_nonzero(local_only["global_correction_axis"]) == 0
+    assert torch.allclose(
+        full["correction_axis"],
+        global_only["correction_axis"] + local_only["correction_axis"],
+    )
+
+
+def test_part_specific_local_experts_and_time_gates_are_serializable_and_trainable():
+    torch.manual_seed(103)
+    model = ContinuousTrajectoryField(
+        text_dim=24,
+        context_hidden_dim=32,
+        context_layers=1,
+        field_hidden_dim=32,
+        field_depth=2,
+        max_local_fields=4,
+        frames_per_local_field=4,
+        minimum_local_width=0.1,
+        maximum_local_width=0.6,
+        part_specific_local_experts=True,
+        time_dependent_local_gates=True,
+        dropout=0.0,
+    )
+    trajectory = _instance(model)
+    assert trajectory.local_part_gates.shape == (2, 4, 4)
+    assert torch.all(trajectory.local_part_gates[trajectory.local_mask] > 0.0)
+    assert torch.count_nonzero(trajectory.local_part_gates[~trajectory.local_mask]) == 0
+    restored = TrajectoryInstance.from_tensor_dict(trajectory.detach().tensor_dict())
+    assert torch.allclose(restored.local_part_gates, trajectory.local_part_gates)
+
+    query = torch.linspace(-1.0, 1.0, 11).repeat(2, 1)
+    outputs = model.query_trajectory(trajectory, query, return_details=True)
+    assert outputs["local_part_gates"].shape == (2, 11, 4)
+    outputs["prediction"].square().mean().backward()
+    assert model.hypernetwork.local_gate_head.weight.grad is not None
+    for field in model.part_local_fields.values():
+        assert field.output.weight.grad is not None
+
+
+def test_stage2_warm_start_accepts_only_new_part_expert_parameters():
+    common = {
+        "text_dim": 24,
+        "context_hidden_dim": 32,
+        "context_layers": 1,
+        "field_hidden_dim": 32,
+        "field_depth": 2,
+        "max_local_fields": 4,
+        "frames_per_local_field": 4,
+        "dropout": 0.0,
+    }
+    stage1 = ContinuousTrajectoryField(**common)
+    stage2 = ContinuousTrajectoryField(
+        **common,
+        part_specific_local_experts=True,
+        time_dependent_local_gates=True,
+    )
+    incompatible = load_warm_start_state(stage2, stage1.state_dict())
+    assert incompatible.unexpected_keys == []
+    assert incompatible.missing_keys
+    assert all(
+        name.startswith(("part_local_fields.", "hypernetwork.local_gate_head."))
+        for name in incompatible.missing_keys
+    )
+    assert torch.allclose(
+        stage2.residual_field.output.weight,
+        stage1.residual_field.output.weight,
+    )
 
 
 def test_global_only_field_has_empty_local_state():
@@ -242,6 +367,66 @@ def test_builder_and_inference_signature_keep_gt_out_of_model_contract():
     }
 
 
+def test_memory_microbatch_is_bounded_by_samples_and_padded_frames():
+    cfg = {
+        "train": {
+            "max_samples_per_memory_batch": 32,
+            "max_frames_per_memory_batch": 4096,
+        }
+    }
+    short_batch = {"name": [str(index) for index in range(64)], "motion": torch.zeros(64, 40, 1)}
+    long_batch = {"name": [str(index) for index in range(32)], "motion": torch.zeros(32, 376, 1)}
+
+    assert memory_microbatch_size(short_batch, cfg) == 32
+    assert memory_microbatch_size(long_batch, cfg) == 10
+
+
+def test_validation_microbatch_defaults_to_one_sample():
+    batch = {
+        "name": [str(index) for index in range(8)],
+        "motion": torch.zeros(8, 40, 1),
+    }
+
+    assert validation_microbatch_size(batch, {"train": {}}) == 1
+
+
+def test_evaluate_streams_a_logical_batch_as_validation_microbatches():
+    batch = {
+        "name": [str(index) for index in range(4)],
+        "motion": torch.zeros(4, 40, 1),
+    }
+    calls = []
+
+    class Model:
+        def eval(self):
+            return self
+
+    def fake_evaluate_microbatch(*args, **kwargs):
+        microbatch = args[4]
+        calls.append(len(microbatch["name"]))
+        return {"pred_loss_total": 2.0}
+
+    with patch(
+        "NIAF.continuous_trajectory_field.scripts."
+        "train_continuous_trajectory_field.evaluate_microbatch",
+        side_effect=fake_evaluate_microbatch,
+    ):
+        metrics = evaluate(
+            Model(),
+            None,
+            None,
+            None,
+            [batch],
+            None,
+            {"eval": {"max_samples_per_memory_batch": 1}},
+            torch.device("cpu"),
+            show_progress=False,
+        )
+
+    assert calls == [1, 1, 1, 1]
+    assert metrics["pred_loss_total"] == 2.0
+
+
 def test_selection_constraints_are_normalized_and_report_feasibility():
     cfg = {
         "selection": {
@@ -271,3 +456,127 @@ def test_selection_constraints_are_normalized_and_report_feasibility():
     assert abs(violation - 1.0) < 1e-8
     assert abs(score - 102.7) < 1e-8
     assert not feasible
+
+
+def test_selection_supports_scaffold_relative_metrics_and_rejection_reasons():
+    cfg = {
+        "selection": {
+            "weights": {
+                "pred_loss_endpoint": {
+                    "weight": 1.0,
+                    "relative_to": "scaffold_loss_endpoint",
+                }
+            },
+            "constraint_penalty": 10.0,
+            "constraints": {
+                "pred_loss_endpoint": {
+                    "relative_to": "scaffold_loss_endpoint",
+                    "max": 0.0,
+                    "scale": 1.0,
+                }
+            },
+        }
+    }
+    feasible_metrics = {
+        "pred_loss_endpoint": 10.0,
+        "scaffold_loss_endpoint": 11.0,
+    }
+    score, violation, feasible, details = selection_diagnostics(
+        feasible_metrics, cfg, return_details=True
+    )
+    assert score == -1.0
+    assert violation == 0.0
+    assert feasible
+    assert details["rejection_reasons"] == []
+
+    rejected_metrics = {
+        "pred_loss_endpoint": 12.0,
+        "scaffold_loss_endpoint": 11.0,
+    }
+    score, violation, feasible, details = selection_diagnostics(
+        rejected_metrics, cfg, return_details=True
+    )
+    assert score == 11.0
+    assert violation == 1.0
+    assert not feasible
+    assert len(details["rejection_reasons"]) == 1
+
+
+def test_wandb_payloads_keep_train_and_validation_namespaces_separate():
+    row = {
+        "epoch": 5,
+        "global_step": 555,
+        "elapsed_sec": 123.0,
+        "lr_global": 2e-5,
+        "lr_local": 1e-4,
+        "train_loss_total": 9.0,
+        "train_loss_path": 0.4,
+        "val_pred_loss_total": 10.0,
+        "val_scaffold_loss_total": 11.0,
+        "validation_pending": 0.0,
+        "selection_score": -0.5,
+        "selection_feasible": 1.0,
+        "selection_rejection_reasons": "",
+    }
+
+    train = wandb_train_epoch_payload(row)
+    assert train["train/epoch/loss_total"] == 9.0
+    assert train["train/epoch/loss_path"] == 0.4
+    assert train["optimizer/global_lr"] == 2e-5
+    assert train["optimizer/local_lr"] == 1e-4
+    assert not any(name.startswith("validation/") for name in train)
+
+    validation = wandb_validation_payload(row)
+    assert validation["validation/pred_loss_total"] == 10.0
+    assert validation["validation/scaffold_loss_total"] == 11.0
+    assert validation["validation/selection/score"] == -0.5
+    assert validation["validation/pending"] == 0.0
+    assert not any(name.startswith("train/") for name in validation)
+
+    pending = wandb_validation_pending_payload(epoch=5, global_step=555)
+    assert pending == {
+        "validation/epoch_step": 5,
+        "validation/global_step": 555,
+        "validation/pending": 1.0,
+    }
+
+
+def test_wandb_batch_payload_uses_optimizer_step_and_selected_metrics():
+    payload = wandb_train_batch_payload(
+        {
+            "loss_total": 9.5,
+            "loss_path": 0.3,
+            "residual_rms": 0.1,
+            "unbounded_debug_metric": 123.0,
+        },
+        epoch=5,
+        optimizer_step=445,
+        logical_batch=2,
+        logical_batches=222,
+    )
+    assert payload["train/optimizer_step"] == 445
+    assert payload["train/batch/epoch"] == 5
+    assert payload["train/batch/logical_batch"] == 2
+    assert payload["train/batch/loss_total"] == 9.5
+    assert payload["train/batch/loss_path"] == 0.3
+    assert "train/batch/unbounded_debug_metric" not in payload
+
+
+def test_wandb_metric_definitions_use_independent_custom_steps():
+    class Run:
+        def __init__(self):
+            self.calls = []
+
+        def define_metric(self, name, **kwargs):
+            self.calls.append((name, kwargs))
+
+    run = Run()
+    configure_wandb_metrics(run)
+    definitions = dict(run.calls)
+    assert definitions["train/batch/*"] == {
+        "step_metric": "train/optimizer_step"
+    }
+    assert definitions["train/epoch/*"] == {"step_metric": "train/epoch_step"}
+    assert definitions["validation/*"] == {
+        "step_metric": "validation/epoch_step"
+    }

@@ -34,7 +34,6 @@ export PYTHONNOUSERSITE=1
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
-export HOME="${HOME_VALUE:-/media/cvpr/haomian}"
 export HF_HOME="${HF_HOME:-/media/cvpr/haomian/.cache/huggingface}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
@@ -47,6 +46,24 @@ export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
   echo "ERROR: Python executable not found: $PYTHON_BIN" >&2
+  exit 1
+fi
+
+if [[ -d "$CHECKPOINT" ]]; then
+  CHECKPOINT_DIR="$CHECKPOINT"
+  CHECKPOINT=""
+  for CANDIDATE in best.pt best_infeasible.pt last.pt; do
+    if [[ -f "$CHECKPOINT_DIR/$CANDIDATE" ]]; then
+      CHECKPOINT="$CHECKPOINT_DIR/$CANDIDATE"
+      break
+    fi
+  done
+  if [[ -z "$CHECKPOINT" ]]; then
+    echo "ERROR: no selected or final checkpoint found under $CHECKPOINT_DIR" >&2
+    exit 1
+  fi
+elif [[ ! -f "$CHECKPOINT" ]]; then
+  echo "ERROR: checkpoint does not exist: $CHECKPOINT" >&2
   exit 1
 fi
 

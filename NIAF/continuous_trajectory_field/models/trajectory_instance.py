@@ -33,6 +33,7 @@ class TrajectoryInstance:
     local_uncertainty: torch.Tensor
     context_density: Optional[torch.Tensor] = None
     context_tau: Optional[torch.Tensor] = None
+    local_part_gates: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         self.validate()
@@ -88,6 +89,12 @@ class TrajectoryInstance:
         for name in ("local_centers", "local_widths", "local_mask", "local_uncertainty"):
             if getattr(self, name).shape != (batch, local_count):
                 raise ValueError(f"{name} must have shape [B,M]")
+        if self.local_part_gates is not None and self.local_part_gates.shape != (
+            batch,
+            local_count,
+            4,
+        ):
+            raise ValueError("local_part_gates must have shape [B,M,4]")
         if self.local_mask.dtype != torch.bool:
             raise ValueError("local_mask must be boolean")
         if torch.is_floating_point(self.duration_seconds):

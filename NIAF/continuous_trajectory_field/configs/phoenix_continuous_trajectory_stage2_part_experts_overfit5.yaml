@@ -1,0 +1,15 @@
+_base_: phoenix_continuous_trajectory_stage1_local16_overfit5.yaml
+
+experiment_name: phoenix_continuous_trajectory_stage2_part_experts_overfit5
+
+model:
+  part_specific_local_experts: true
+  time_dependent_local_gates: true
+  local_body_omega0_first: 15.0
+  local_hand_omega0_first: 30.0
+  local_face_omega0_first: 20.0
+
+# Keep the Stage 1 objective and optimizer schedule fixed so this run isolates
+# the structured local decoders and time-dependent part gates.
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/phoenix_continuous_trajectory_stage2_part_experts_overfit5

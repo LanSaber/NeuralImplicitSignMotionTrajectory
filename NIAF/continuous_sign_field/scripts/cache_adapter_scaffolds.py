@@ -21,6 +21,12 @@ def parse_args():
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--splits", nargs="+", default=["train", "val"])
     parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional per-split sample limit for smoke tests; zero caches the full split.",
+    )
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -72,7 +78,13 @@ def main():
     device = resolve_device(args.device)
 
     datasets = {
-        split: ContinuousSignDataset(cfg, split=split, limit=0, random_crop=False, require_fk_cache=False)
+        split: ContinuousSignDataset(
+            cfg,
+            split=split,
+            limit=max(int(args.limit), 0),
+            random_crop=False,
+            require_fk_cache=False,
+        )
         for split in args.splits
     }
     provider = ScaffoldProvider(cfg, datasets[args.splits[0]], device)
@@ -91,6 +103,7 @@ def main():
         "word_split": word_split,
         "word_manifest": str(word_manifest.resolve()),
         "require_retrieval_features": require_retrieval_features,
+        "limit_per_split": max(int(args.limit), 0),
         "retrieval_feature_names": list(RETRIEVAL_FEATURE_NAMES),
         "splits": {},
     }

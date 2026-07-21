@@ -1,0 +1,22 @@
+_base_: phoenix_continuous_trajectory_stage1_local16_overfit5.yaml
+
+experiment_name: phoenix_continuous_trajectory_stage1_local16_pilot500
+
+data:
+  val_split: val
+  limit_train: 500
+  limit_val: 100
+
+train:
+  epochs: 30
+  batch_size: 1
+  accumulation_steps: 16
+  local_warmup_epochs: 3
+  val_every: 2
+  save_every: 1
+
+selection:
+  require_feasible: true
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/phoenix_continuous_trajectory_stage1_local16_pilot500
