@@ -95,8 +95,9 @@ def parse_args():
         default="default",
         choices=["default", "pa"],
         help=(
-            "default matches t2m.py align_idx=0. pa matches t2m.py align_idx=None, "
-            "i.e. similarity Procrustes alignment inside each frame cost."
+            "default matches t2m.py align_idx=0. pa uses partwise similarity "
+            "Procrustes alignment inside each frame cost, fitting and scoring "
+            "the same keypoint set."
         ),
     )
     return parser.parse_args()
@@ -303,13 +304,6 @@ def batched_procrustes_mpjpe(pred_align, gt_align, pred_eval=None, gt_eval=None,
 
 
 def frame_distance_matrix_pa(pred_parts, gt_parts, part):
-    if part == "body":
-        return batched_procrustes_mpjpe(
-            pred_parts["full_joints"],
-            gt_parts["full_joints"],
-            pred_eval=pred_parts["body"],
-            gt_eval=gt_parts["body"],
-        )
     return batched_procrustes_mpjpe(pred_parts[part], gt_parts[part])
 
 
@@ -497,7 +491,7 @@ def main():
         "frame_metric": "mpjpe",
         "alignment_mode": args.alignment_mode,
         "metric_preset": (
-            "mgpt_t2m_pa_align_idx_none"
+            "t2m_partwise_pa_same_subset"
             if args.alignment_mode == "pa"
             else "mgpt_t2m_default_align_idx_0"
         ),
@@ -515,11 +509,12 @@ def main():
             "align_idx=0 gives translated DTW-MPJPE: body is pelvis-translation "
             "aligned before selecting upper_body, each hand is wrist-translation "
             "aligned, and wholebody is aligned by its first concatenated joint, "
-            "Neck. In pa mode, align_idx=None gives DTW-PA-MPJPE: the predicted "
-            "frame is similarity Procrustes-aligned to the GT frame before MPJPE. "
-            "For PA body, the full SMPL-X joint set is aligned before measuring "
-            "upper_body, matching t2m.py's wanted-index order. dtw_mean is the raw "
-            "DTW value; ndtw is dtw divided by optimal path length."
+            "Neck. In pa mode, each predicted part is similarity "
+            "Procrustes-aligned to the corresponding GT part before MPJPE, using "
+            "the same keypoint set for fitting and scoring. Body uses the 12 "
+            "upper-body keypoints, each hand uses its 21-keypoint layout, and "
+            "wholebody uses all 54 concatenated keypoints. dtw_mean is the raw DTW "
+            "value; ndtw is dtw divided by optimal path length."
         ),
         "num_pairs": len(pairs),
         "skipped_prior": skipped_prior,

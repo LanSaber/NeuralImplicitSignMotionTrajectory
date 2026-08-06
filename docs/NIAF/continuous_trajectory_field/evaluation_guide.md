@@ -300,9 +300,11 @@ It retains relative orientation and scale.
 ### 7.2 PA-DTW-MPJPE
 
 PA mode performs a per-frame similarity Procrustes alignment before computing
-MPJPE. It removes translation, global rotation, and scale. For hands, it is
-therefore a stronger diagnostic of internal articulation shape than default
-translated DTW.
+MPJPE. The transform for every part is fitted on the same keypoints that are
+scored: 12 upper-body keypoints for body, 21 keypoints for each hand, and the
+54 concatenated body-and-hand keypoints for whole body. It removes translation,
+global rotation, and scale. For hands, it is therefore a stronger diagnostic of
+internal articulation shape than default translated DTW.
 
 ### 7.3 Raw and normalized scores
 
@@ -372,6 +374,10 @@ Before accepting a result, verify:
 8. aligned, default-DTW, and PA-DTW output paths are unique to the checkpoint.
 
 ## 9. Current checkpoint reference result
+
+The dated multi-dataset results for the last-checkpoint snapshots evaluated on
+2026-07-24 are recorded in
+[`test_results_2026-07-24.md`](test_results_2026-07-24.md).
 
 The following values are a reproducibility snapshot, not permanent project
 baselines:

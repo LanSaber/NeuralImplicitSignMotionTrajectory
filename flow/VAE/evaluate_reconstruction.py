@@ -224,7 +224,7 @@ def main():
         "frame_metric": "mpjpe",
         "alignment_mode": args.alignment_mode,
         "metric_preset": (
-            "mgpt_t2m_pa_align_idx_none"
+            "t2m_partwise_pa_same_subset"
             if args.alignment_mode == "pa"
             else "mgpt_t2m_default_align_idx_0"
         ),
@@ -239,8 +239,9 @@ def main():
         },
         "definition": (
             "VAE reconstruction is decoded in memory and evaluated with the same "
-            "mGPT/metrics/t2m.py-style DTW-MPJPE implementation used for saved "
-            "flow samples. No reconstruction NPZ files are written."
+            "DTW-MPJPE implementation used for saved flow samples. PA mode fits "
+            "and scores the same keypoint subset for each part. No reconstruction "
+            "NPZ files are written."
         ),
         "checkpoint": str(args.checkpoint),
         "checkpoint_epoch": int(ckpt.get("epoch", -1)),

@@ -63,6 +63,14 @@ train:
   epochs: 50
   batch_size: 32
   accumulation_steps: 2
+  # Third-order analytic FK JVPs activate at epoch 10 and exhaust the GB10's
+  # unified memory at 32 samples. This changes only the in-memory split; the
+  # logical and optimizer batch sizes remain 32 and 64 per GPU, respectively.
+  max_samples_per_memory_batch: 16
+  # Avoid persistent multiprocessing workers waiting indefinitely on the
+  # shared FK/scaffold filesystem during long multi-node resumes.
+  num_workers: 0
+  persistent_workers: false
   local_warmup_epochs: 0
   joint_global_lr: 0.0002
   joint_local_lr: 0.0001

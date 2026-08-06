@@ -1,0 +1,83 @@
+_base_: phoenix_continuous_trajectory_stage2_part_experts_full.yaml
+
+experiment_name: csl_daily_continuous_trajectory_stage2_part_experts_joint_full
+
+data:
+  data_dir: /media/cvpr/haomian/data/SOKE_FLOW/csl_daily_upper_smplx
+  word_data_dir: /media/cvpr/haomian/data/SOKE_FLOW/csl_daily_upper_smplx_word_ctc
+  train_split: train
+  val_split: val
+  min_frames: 40
+  max_frames: 400
+  length_multiple: 4
+  random_crop: false
+  limit_train: 0
+  limit_val: 0
+
+cache:
+  fk_cache_dir: /media/cvpr/haomian/data/SOKE_FLOW/csl_daily_upper_smplx/meta/niaf_fk_rot6d_h2s_fixed_v1
+  fk_batch_size: 64
+
+# The sentence manifests have no label_word field. The adapter's label_word
+# training condition therefore fell back to this sentence text in its trainer.
+text:
+  condition_field: text
+
+adapter:
+  checkpoint: experiments/flow/adapter/csl_daily_soft_arranger_lw_2xb256/checkpoints/best.pt
+  vae_checkpoint: experiments/flow/VAE/csl_daily_rot6d_vae_jerk_b16x4_online/checkpoints/best.pt
+  word_data_dir: /media/cvpr/haomian/data/SOKE_FLOW/csl_daily_upper_smplx_word_ctc
+  # The checkpoint was trained with "all", but retrieval for downstream
+  # validation is restricted to segments derived from training sentences.
+  word_split: train
+  condition_field: label_word
+  text_model_path: deps/flan-t5-base
+  max_text_tokens: 64
+  lazy_word_motions: true
+  shuffle_word_candidates: false
+  num_negative_candidates: 16
+  candidate_seed: 1234
+
+scaffold:
+  source: adapter_pred
+  cache_dir: /media/cvpr/haomian/data/SOKE_FLOW/csl_daily_upper_smplx/meta/niaf_adapter_scaffold_train_csl_sa_lw_2xb256_best_epoch0090
+  cache_only: true
+  prefer_cache: true
+  require_retrieval_features: true
+
+retrieval:
+  require_train_only_bank: true
+  expected_word_split: train
+
+duration:
+  initial_seconds: 4.5
+  min_seconds: 0.8
+  max_seconds: 20.0
+  min_frames: 40
+  max_frames: 400
+  length_multiple: 4
+
+# There is no CSL-Daily SignTrajField checkpoint. Train the fresh global and
+# local Stage-2 branches together from the first epoch.
+train:
+  epochs: 50
+  batch_size: 32
+  accumulation_steps: 2
+  # Avoid persistent multiprocessing workers waiting indefinitely on the
+  # shared FK/scaffold filesystem during long multi-node resumes.
+  num_workers: 0
+  persistent_workers: false
+  local_warmup_epochs: 0
+  joint_global_lr: 0.0002
+  joint_local_lr: 0.0001
+  reset_local_branch_on_warm_start: false
+  val_every: 5
+  save_every: 1
+
+analytic_dynamics:
+  start_epoch: 5
+  jerk_start_epoch: 10
+  jerk_ramp_epochs: 10
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_continuous_trajectory_stage2_part_experts_joint_full

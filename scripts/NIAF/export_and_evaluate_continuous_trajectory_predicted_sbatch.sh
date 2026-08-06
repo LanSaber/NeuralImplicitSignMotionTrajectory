@@ -18,14 +18,23 @@ PYTHON_ENV="${PYTHON_ENV:-/media/cvpr/haomian/python_envs/SOKE}"
 PYTHON_BIN="${PYTHON_BIN:-$PYTHON_ENV/bin/python}"
 CFG="${CFG:?Set CFG to the continuous trajectory configuration}"
 CHECKPOINT="${CHECKPOINT:?Set CHECKPOINT to a checkpoint or checkpoint directory}"
-OUT_DIR="${OUT_DIR:?Set OUT_DIR to the predicted-length export directory}"
+OUT_DIR="${OUT_DIR:?Set OUT_DIR to the trajectory export directory}"
 SPLIT="${SPLIT:-test}"
 NUM_SAMPLES="${NUM_SAMPLES:-0}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 CONTEXT_FPS="${CONTEXT_FPS:-20}"
 SAMPLE_FPS="${SAMPLE_FPS:-20}"
+LENGTH_MODE="${LENGTH_MODE:-predicted}"
 DEVICE="${DEVICE:-cuda}"
 TEXT_DEVICE="${TEXT_DEVICE:-cpu}"
+
+case "$LENGTH_MODE" in
+  predicted|ground_truth_sampling|ground_truth) ;;
+  *)
+    echo "ERROR: LENGTH_MODE must be predicted, ground_truth_sampling, or ground_truth; got $LENGTH_MODE" >&2
+    exit 1
+    ;;
+esac
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
   echo "ERROR: Python executable not found: $PYTHON_BIN" >&2
@@ -64,7 +73,7 @@ cd "$PROJECT_DIR"
 
 echo "Job ID: ${SLURM_JOB_ID:-local}"
 echo "Checkpoint: $CHECKPOINT"
-echo "Split: $SPLIT num_samples=$NUM_SAMPLES length_mode=predicted"
+echo "Split: $SPLIT num_samples=$NUM_SAMPLES length_mode=$LENGTH_MODE"
 echo "Context/sample FPS: $CONTEXT_FPS/$SAMPLE_FPS"
 echo "Output: $OUT_DIR"
 
@@ -79,7 +88,7 @@ srun --kill-on-bad-exit=1 "$PYTHON_BIN" \
   --batch_size "$BATCH_SIZE" \
   --device "$DEVICE" \
   --text_device "$TEXT_DEVICE" \
-  --length_mode predicted \
+  --length_mode "$LENGTH_MODE" \
   --context_fps "$CONTEXT_FPS" \
   --sample_fps "$SAMPLE_FPS"
 
