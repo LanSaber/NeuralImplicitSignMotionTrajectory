@@ -4,6 +4,11 @@ Date: 2026-07-21
 
 Status: current PHOENIX evaluation protocol for the continuous trajectory field
 
+> V1 remains reproducible with this guide. SignTrajField-v2 adds explicit
+> text-only and prior-enabled protocols, checkpoint contract 2, and different
+> NPZ coarse-field names. See
+> [`dual_mode_pipeline.md`](dual_mode_pipeline.md#8-evaluate-both-modes).
+
 ## 1. Pipeline name and scope
 
 The recommended name for the current pipeline is **SignTrajField**:

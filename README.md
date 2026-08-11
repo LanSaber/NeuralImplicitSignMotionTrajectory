@@ -20,6 +20,12 @@ instance rather than a fixed frame tensor:
 5. Sampling the same trajectory instance at any time grid produces motion for
    rendering, FK, or quantitative evaluation.
 
+**SignTrajField-v2 DualMode** is now implemented beside v1. Its text path is
+complete on its own, while the same checkpoint can optionally fuse the frozen
+word prior through time/part gates. V2 uses a separate checkpoint contract and
+is trained from scratch. See the
+[`dual-mode pipeline guide`](docs/NIAF/continuous_trajectory_field/dual_mode_pipeline.md).
+
 The detailed design is in
 [`docs/NIAF/continuous_trajectory_field/implementation_plan.md`](docs/NIAF/continuous_trajectory_field/implementation_plan.md).
 The evidence-based next-step proposal is in
@@ -91,7 +97,9 @@ Run focused tests after installing the optional `pytest` dependency:
 
 ```bash
 "$PYTHON_ENV/bin/python" -m pip install pytest
-"$PYTHON_ENV/bin/python" -m pytest -q tests/test_niaf_continuous_trajectory_field.py
+"$PYTHON_ENV/bin/python" -m pytest -q \
+  tests/test_niaf_continuous_trajectory_field.py \
+  tests/test_niaf_dual_mode_trajectory_field.py
 ```
 
 To smoke-test, start, resume, or monitor a Stage-2 training without colliding

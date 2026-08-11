@@ -1,0 +1,20 @@
+_base_: phoenix_signtrajfield_v2_pilot500.yaml
+
+experiment_name: phoenix_signtrajfield_v2_full
+
+data:
+  limit_train: 0
+  limit_val: 0
+
+selection:
+  # The full run still records the 2% prior-regression gate, but does not fail
+  # the process solely because an exploratory run has no feasible checkpoint.
+  require_feasible: false
+
+train:
+  epochs: 50
+  val_every: 5
+  save_every: 1
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/phoenix_signtrajfield_v2_full

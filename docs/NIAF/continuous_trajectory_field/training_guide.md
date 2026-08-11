@@ -4,6 +4,11 @@ Date: 2026-07-21
 
 Status: standalone operator guide for the current full-PHOENIX Stage-2 pipeline
 
+> This guide records the v1 Stage-2 run and its warm-start/resume procedure.
+> For the new text-complete pipeline with an optional word prior, use
+> [`dual_mode_pipeline.md`](dual_mode_pipeline.md). V2 is trained from scratch
+> and must not use the v1 warm-start commands below.
+
 ## 1. Purpose
 
 This document is sufficient for an agent with no previous project context to:

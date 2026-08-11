@@ -1,0 +1,54 @@
+_base_: phoenix_continuous_trajectory_stage2_part_experts_overfit5.yaml
+
+experiment_name: phoenix_signtrajfield_v2_overfit5
+
+# SignTrajField-v2 is a fresh checkpoint contract. Do not warm-start this
+# configuration from any continuous_trajectory_field (v1) checkpoint.
+model:
+  type: dual_mode_continuous_trajectory_field
+  max_local_fields: 16
+  frames_per_local_field: 24
+  local_center_mode: uniform
+  use_retrieval_guidance: false
+  part_specific_local_experts: true
+  time_dependent_local_gates: true
+
+conditioning:
+  temporal_slot_count: 16
+  temporal_slot_layers: 2
+  temporal_slot_heads: 8
+  context_fps: 20.0
+  # Drop the complete word prior independently for every training sample.
+  word_prior_dropout_probability: 0.5
+
+objective:
+  lambda_prior: 0.0
+  lambda_coarse: 0.25
+  lambda_residual: 0.50
+
+selection:
+  # Rank checkpoints only with text-only metrics. The trainer separately
+  # rejects a checkpoint when its prior-enabled composite is >2% worse.
+  weights:
+    pred_loss_endpoint: 1.0
+    pred_loss_hand_relative: 10.0
+    pred_loss_path: 0.5
+  constraints: null
+  word_prior_max_relative_degradation: 0.02
+  require_feasible: true
+  keep_validation_checkpoints: true
+
+train:
+  epochs: 200
+  batch_size: 5
+  accumulation_steps: 1
+  local_warmup_epochs: 0
+  lr: 0.0001
+  joint_global_lr: 0.0001
+  joint_local_lr: 0.0001
+  val_every: 10
+  save_every: 1
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/phoenix_signtrajfield_v2_overfit5
+

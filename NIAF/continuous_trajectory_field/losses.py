@@ -57,6 +57,27 @@ def prior_and_residual_losses(
     }
 
 
+def coarse_and_residual_losses(
+    outputs,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    hand_weight: float = 5.0,
+):
+    """Supervise v2's learned coarse motion directly against ground truth."""
+
+    coarse = outputs["coarse"]
+    correction = outputs["correction_axis"]
+    target_correction = target_tangent_correction(coarse.detach(), target, mask)
+    return {
+        "loss_coarse": masked_feature_l1(
+            coarse, target, mask, hand_weight=hand_weight
+        ),
+        "loss_residual": masked_tangent_l1(
+            correction, target_correction, mask, hand_weight=hand_weight
+        ),
+    }
+
+
 def _weighted_joint_l1(
     prediction: torch.Tensor,
     target: torch.Tensor,

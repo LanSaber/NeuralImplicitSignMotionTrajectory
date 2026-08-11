@@ -503,7 +503,41 @@ not launch pilot-500 or the full split from this checkpoint. The next experiment
 should directly address path preservation before adding Stage 3 phase warping
 or scaling the training set.
 
-## 9. Result Sources
+## 9. Optional Word-Prior Follow-up: SignTrajField-v2
+
+On 2026-08-06, the next architecture branch was implemented as
+**SignTrajField-v2 DualMode**. It keeps the hypernetwork and continuous field but
+makes the word prior an optional gated residual over a text-complete temporal
+plan. The detailed contract and run commands are in
+[`dual_mode_pipeline.md`](dual_mode_pipeline.md).
+
+Implementation status:
+
+- [x] Preserve v1 unchanged and introduce checkpoint contract v2.
+- [x] Build 16 temporal slots from text with two eight-head cross-attention layers.
+- [x] Predict duration from text only.
+- [x] Encode an optional word prior onto the same slot grid.
+- [x] Fuse it through time-dependent body/left-hand/right-hand/face gates.
+- [x] Apply 50% per-sample whole-prior dropout during joint training.
+- [x] Supervise the learned coarse trajectory against GT instead of the scaffold.
+- [x] Use uniform local allocation so text-only inference has no retrieval dependency.
+- [x] Evaluate both modes separately and rank by text-only quality.
+- [x] Reject checkpoints whose prior-enabled composite is more than 2% worse.
+- [x] Add explicit off/on evaluation and export paths plus PHOENIX configs.
+- [x] Pass the v1 and v2 unit suites together.
+- [x] Run the real-data one-batch smoke test.
+- [x] Run a real-sample validation smoke in both inference modes.
+- [x] Run the five-sequence overfit gate. Default nDTW improved over the paired
+  scaffold, but PA hands and the path/jerk diagnostics failed continuation.
+- [ ] Run pilot-500 only after the five-sequence gate passes. Currently blocked.
+- [ ] Run full PHOENIX only after the pilot gate passes.
+
+The exact five-sequence results and output paths are recorded in
+[`dual_mode_pipeline.md`](dual_mode_pipeline.md). They show strong default DTW
+improvement but do not yet justify scaling because PA-hand and path/jerk gates
+remain unsatisfied.
+
+## 10. Result Sources
 
 The numeric observations in this document come from:
 

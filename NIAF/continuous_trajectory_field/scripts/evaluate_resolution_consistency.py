@@ -26,6 +26,10 @@ from NIAF.continuous_trajectory_field.scripts.export_continuous_trajectory impor
     prepare_inference_batch,
     sampled_lengths,
 )
+from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field import (
+    is_dual_mode,
+    validate_checkpoint_contract,
+)
 
 
 def parse_args():
@@ -43,6 +47,11 @@ def parse_args():
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--text_device", default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--context_fps", type=float, default=20.0)
+    parser.add_argument(
+        "--word_prior",
+        default="auto",
+        choices=("auto", "off", "on"),
+    )
     parser.add_argument("--sample_fps", type=float, nargs="+", default=[20.0, 40.0, 80.0])
     parser.add_argument("--common_queries", type=int, default=31)
     parser.add_argument("--tolerance", type=float, default=1e-5)
@@ -95,9 +104,20 @@ def main():
         collate_fn=collate_continuous_sign,
     )
     text_encoder = build_text_encoder(cfg, text_device)
-    provider = ScaffoldProvider(cfg, dataset, device)
+    dual_mode = is_dual_mode(cfg)
+    if not dual_mode and args.word_prior != "auto":
+        raise ValueError("--word_prior is available only for dual-mode v2")
+    resolved_word_prior_mode = (
+        "off" if dual_mode and args.word_prior == "auto" else args.word_prior
+    )
+    provider = (
+        ScaffoldProvider(cfg, dataset, device)
+        if not dual_mode or resolved_word_prior_mode == "on"
+        else None
+    )
     model = build_continuous_trajectory_field(cfg, text_dim=text_encoder.text_dim).to(device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    validate_checkpoint_contract(checkpoint, cfg, source=str(args.checkpoint))
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
 
@@ -115,6 +135,7 @@ def main():
             device,
             context_fps=args.context_fps,
             length_mode="predicted",
+            word_prior_mode=resolved_word_prior_mode,
         )
         trajectory = inference["trajectory"]
         before_digest = trajectory_digest(trajectory)

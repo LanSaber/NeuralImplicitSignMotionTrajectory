@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
 
 from flow.distributed import (
@@ -27,6 +28,7 @@ from NIAF.continuous_sign_field.config import load_config
 from NIAF.continuous_sign_field.losses import (
     endpoint_losses,
     fk_temporal_dynamics_losses,
+    masked_feature_l1,
 )
 from NIAF.continuous_sign_field.metrics import (
     ScalarAverager,
@@ -45,6 +47,7 @@ from NIAF.continuous_sign_field.scripts.train_residual_flow import (
 )
 from NIAF.continuous_trajectory_field.losses import (
     analytic_fk_dynamics_losses,
+    coarse_and_residual_losses,
     duration_regression_loss,
     local_field_regularization,
     prior_and_residual_losses,
@@ -53,6 +56,34 @@ from NIAF.continuous_trajectory_field.models import build_continuous_trajectory_
 from NIAF.retrieval_confidence_field.scripts.train_retrieval_adaptive_field import (
     validate_train_only_retrieval_bank,
 )
+
+
+DUAL_MODE_MODEL_TYPE = "dual_mode_continuous_trajectory_field"
+TRAJECTORY_CONTRACT_VERSIONS = {
+    "continuous_trajectory_field": 1,
+    DUAL_MODE_MODEL_TYPE: 2,
+}
+WORD_PRIOR_MODES = {"dropout", "off", "on"}
+WORD_PRIOR_PART_NAMES = ("body", "left_hand", "right_hand", "face")
+
+
+def configured_model_type(cfg):
+    return str(
+        cfg.get("model", {}).get("type", "continuous_trajectory_field")
+    ).lower()
+
+
+def is_dual_mode(cfg):
+    return configured_model_type(cfg) == DUAL_MODE_MODEL_TYPE
+
+
+def checkpoint_contract(cfg):
+    model_type = configured_model_type(cfg)
+    try:
+        version = TRAJECTORY_CONTRACT_VERSIONS[model_type]
+    except KeyError as error:
+        raise ValueError(f"Unsupported model type {model_type!r}") from error
+    return model_type, version
 
 
 def parse_args():
@@ -146,14 +177,35 @@ def _masked_pearson(left, right, mask):
     return (left * right).sum() / denominator
 
 
-def prepare_field_batch(model, text_encoder, provider, batch, dataset, cfg, device):
-    target = prepare_motion(batch, dataset, device)
-    adapter_context, _anchors, metadata = provider.build_with_metadata(
-        batch,
-        x=None,
-        use_cache=True,
+def _word_prior_availability(batch_size, cfg, device, mode):
+    mode = str(mode).lower()
+    if mode not in WORD_PRIOR_MODES:
+        raise ValueError(
+            f"word_prior_mode must be one of {sorted(WORD_PRIOR_MODES)}, got {mode!r}"
+        )
+    if mode == "off":
+        return torch.zeros(int(batch_size), dtype=torch.bool, device=device)
+    if mode == "on":
+        return torch.ones(int(batch_size), dtype=torch.bool, device=device)
+    dropout_probability = float(
+        cfg.get("conditioning", {}).get("word_prior_dropout_probability", 0.5)
     )
-    retrieval = metadata["retrieval_features"]
+    if not 0.0 <= dropout_probability <= 1.0:
+        raise ValueError("word_prior_dropout_probability must be in [0, 1]")
+    return torch.rand(int(batch_size), device=device) >= dropout_probability
+
+
+def prepare_field_batch(
+    model,
+    text_encoder,
+    provider,
+    batch,
+    dataset,
+    cfg,
+    device,
+    word_prior_mode=None,
+):
+    target = prepare_motion(batch, dataset, device)
     text_tokens, text_mask = encode_batch_text(text_encoder, batch, cfg, device)
     tau = native_query_times(
         batch["length"],
@@ -161,20 +213,58 @@ def prepare_field_batch(model, text_encoder, provider, batch, dataset, cfg, devi
         device=device,
         dtype=target.dtype,
     )
-    outputs = model(
-        text_tokens=text_tokens,
-        adapter_context=adapter_context,
-        context_mask=batch["mask"],
-        retrieval_evidence=retrieval,
-        query_times=tau,
-        text_mask=text_mask,
-        time_domain="normalized",
-        query_mask=batch["mask"],
-    )
+    adapter_context = None
+    retrieval = None
+    availability = None
+    if is_dual_mode(cfg):
+        mode = "dropout" if word_prior_mode is None else word_prior_mode
+        availability = _word_prior_availability(
+            target.shape[0], cfg, device, mode
+        )
+        if bool(availability.any()):
+            if provider is None:
+                raise ValueError("word-prior mode requires a ScaffoldProvider")
+            adapter_context, _anchors, metadata = provider.build_with_metadata(
+                batch,
+                x=None,
+                use_cache=True,
+            )
+            retrieval = metadata["retrieval_features"]
+        outputs = model(
+            text_tokens=text_tokens,
+            query_times=tau,
+            text_mask=text_mask,
+            time_domain="normalized",
+            query_mask=batch["mask"],
+            word_prior_context=adapter_context,
+            word_prior_mask=batch["mask"] if adapter_context is not None else None,
+            word_prior_features=retrieval,
+            word_prior_available=availability,
+        )
+    else:
+        if provider is None:
+            raise ValueError("v1 continuous trajectory training requires a ScaffoldProvider")
+        adapter_context, _anchors, metadata = provider.build_with_metadata(
+            batch,
+            x=None,
+            use_cache=True,
+        )
+        retrieval = metadata["retrieval_features"]
+        outputs = model(
+            text_tokens=text_tokens,
+            adapter_context=adapter_context,
+            context_mask=batch["mask"],
+            retrieval_evidence=retrieval,
+            query_times=tau,
+            text_mask=text_mask,
+            time_domain="normalized",
+            query_mask=batch["mask"],
+        )
     return {
         "target": target,
         "adapter_context": adapter_context,
         "retrieval": retrieval,
+        "word_prior_available": availability,
         "text_tokens": text_tokens,
         "text_mask": text_mask,
         "tau": tau,
@@ -213,6 +303,7 @@ def compute_batch_losses(
     device,
     epoch=1,
     training=True,
+    word_prior_mode=None,
 ):
     prepared = prepare_field_batch(
         model,
@@ -222,6 +313,7 @@ def compute_batch_losses(
         dataset,
         cfg,
         device,
+        word_prior_mode=word_prior_mode,
     )
     target = prepared["target"]
     adapter_context = prepared["adapter_context"]
@@ -247,13 +339,21 @@ def compute_batch_losses(
         hand_weight=hand_weight,
         fk_chunk_size=fk_chunk_size,
     )
-    auxiliary = prior_and_residual_losses(
-        outputs,
-        adapter_context,
-        target,
-        mask,
-        hand_weight=hand_weight,
-    )
+    if is_dual_mode(cfg):
+        auxiliary = coarse_and_residual_losses(
+            outputs,
+            target,
+            mask,
+            hand_weight=hand_weight,
+        )
+    else:
+        auxiliary = prior_and_residual_losses(
+            outputs,
+            adapter_context,
+            target,
+            mask,
+            hand_weight=hand_weight,
+        )
     duration = duration_regression_loss(
         trajectory.log_duration_seconds,
         batch["duration"],
@@ -294,7 +394,12 @@ def compute_batch_losses(
     )
 
     total = float(objective_cfg.get("lambda_endpoint", 1.0)) * endpoint_total
-    total = total + float(objective_cfg.get("lambda_prior", 0.25)) * auxiliary["loss_prior"]
+    if is_dual_mode(cfg):
+        total = total + float(objective_cfg.get("lambda_coarse", 0.25)) * auxiliary[
+            "loss_coarse"
+        ]
+    else:
+        total = total + float(objective_cfg.get("lambda_prior", 0.25)) * auxiliary["loss_prior"]
     total = total + float(objective_cfg.get("lambda_residual", 0.5)) * auxiliary["loss_residual"]
     total = total + float(objective_cfg.get("lambda_duration", 0.25)) * duration
     total = total + float(objective_cfg.get("lambda_local_modulation", 1e-5)) * local[
@@ -345,16 +450,20 @@ def compute_batch_losses(
         losses["local_uncertainty_mean"] = (
             trajectory.local_uncertainty * active
         ).sum() / active.sum().clamp_min(1.0)
-        losses["center_density_uncertainty_correlation"] = _masked_pearson(
-            trajectory.context_density,
-            1.0 - prepared["retrieval"][..., 0].clamp(0.0, 1.0),
-            mask,
-        )
+        if not is_dual_mode(cfg):
+            losses["center_density_uncertainty_correlation"] = _masked_pearson(
+                trajectory.context_density,
+                1.0 - prepared["retrieval"][..., 0].clamp(0.0, 1.0),
+                mask,
+            )
+        else:
+            losses["center_density_uncertainty_correlation"] = local_axis.new_tensor(
+                0.0
+            )
         if trajectory.local_part_gates is not None:
             gate_mask = active.unsqueeze(-1)
             gate_count = gate_mask.sum().clamp_min(1.0)
-            part_names = ("body", "left_hand", "right_hand", "face")
-            for part_index, part_name in enumerate(part_names):
+            for part_index, part_name in enumerate(WORD_PRIOR_PART_NAMES):
                 part_gates = trajectory.local_part_gates[..., part_index]
                 mean_gate = (part_gates * active).sum() / gate_count
                 losses[f"local_gate_mean_{part_name}"] = mean_gate
@@ -368,6 +477,32 @@ def compute_batch_losses(
     else:
         losses["local_uncertainty_mean"] = local_axis.new_tensor(0.0)
         losses["center_density_uncertainty_correlation"] = local_axis.new_tensor(0.0)
+    if is_dual_mode(cfg):
+        availability = prepared["word_prior_available"].bool()
+        losses["word_prior_available_fraction"] = availability.float().mean()
+        for label, sample_selector in (
+            ("text_only", ~availability),
+            ("word_prior", availability),
+        ):
+            mode_mask = mask & sample_selector[:, None]
+            losses[f"mode_{label}_sample_count"] = sample_selector.float().sum()
+            losses[f"mode_{label}_compact_l1"] = masked_feature_l1(
+                outputs["prediction"],
+                target,
+                mode_mask,
+                hand_weight=hand_weight,
+            )
+        word_gates = trajectory.word_prior_gates
+        if word_gates is None:
+            raise RuntimeError("Dual-mode trajectory is missing word_prior_gates")
+        available_slots = availability[:, None].to(word_gates.dtype)
+        available_count = (
+            available_slots.sum() * word_gates.shape[1]
+        ).clamp_min(1.0)
+        for part_index, part_name in enumerate(WORD_PRIOR_PART_NAMES):
+            losses[f"word_prior_gate_mean_{part_name}"] = (
+                word_gates[..., part_index] * available_slots
+            ).sum() / available_count
     losses["loss_total"] = total
     return total, losses, prepared
 
@@ -515,6 +650,65 @@ def memory_microbatch_size(batch, cfg):
     )
 
 
+def synchronized_memory_microbatch_size(batch, cfg, dist_info, device):
+    """Choose one memory-safe microbatch size shared by every DDP rank.
+
+    A rank's padded sequence length can differ from the other ranks, so its
+    locally safe frame-budget size can differ as well. DDP requires every rank
+    to execute the same sequence of backward collectives. Gathering the local
+    sizes and using their minimum preserves each rank's memory bound while
+    guaranteeing an identical number of microbatches for equal logical batch
+    sizes.
+    """
+
+    logical_size = len(batch["name"])
+    local_microbatch_size = memory_microbatch_size(batch, cfg)
+    if not dist_info.get("enabled", False):
+        return local_microbatch_size
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError(
+            "Distributed microbatch synchronization requires an initialized "
+            "torch.distributed process group"
+        )
+
+    backend = str(dist_info.get("backend") or dist.get_backend()).lower()
+    if backend == "nccl":
+        if device.type != "cuda":
+            raise RuntimeError(
+                "NCCL microbatch synchronization requires a CUDA device"
+            )
+        collective_device = device
+    else:
+        collective_device = torch.device("cpu")
+
+    local_schedule = torch.tensor(
+        [logical_size, local_microbatch_size],
+        dtype=torch.int64,
+        device=collective_device,
+    )
+    gathered_schedules = [
+        torch.empty_like(local_schedule) for _ in range(dist.get_world_size())
+    ]
+    dist.all_gather(gathered_schedules, local_schedule)
+    rank_schedules = [
+        tuple(int(value) for value in schedule.detach().cpu().tolist())
+        for schedule in gathered_schedules
+    ]
+
+    logical_sizes = {schedule[0] for schedule in rank_schedules}
+    if len(logical_sizes) != 1:
+        raise RuntimeError(
+            "DDP ranks received different logical batch sizes; an identical "
+            f"backward schedule cannot be formed: {rank_schedules}"
+        )
+    shared_microbatch_size = min(schedule[1] for schedule in rank_schedules)
+    if shared_microbatch_size <= 0:
+        raise RuntimeError(
+            f"Invalid distributed memory-microbatch schedule: {rank_schedules}"
+        )
+    return shared_microbatch_size
+
+
 def validation_microbatch_size(batch, cfg):
     """Choose a validation microbatch; default to one sample for dense JVPs."""
 
@@ -542,6 +736,7 @@ WANDB_BATCH_METRICS = (
     "residual_rms",
     "global_residual_rms",
     "local_residual_rms",
+    "word_prior_available_fraction",
 )
 
 
@@ -562,6 +757,15 @@ def wandb_train_batch_payload(
     for name in WANDB_BATCH_METRICS:
         if name in metrics:
             payload[f"train/batch/{name}"] = float(metrics[name])
+    for name, value in metrics.items():
+        if name.startswith("mode_text_only_"):
+            key = name.removeprefix("mode_text_only_")
+            payload[f"train/text_only/batch/{key}"] = float(value)
+        elif name.startswith("mode_word_prior_"):
+            key = name.removeprefix("mode_word_prior_")
+            payload[f"train/word_prior/batch/{key}"] = float(value)
+        elif name.startswith("word_prior_gate_"):
+            payload[f"train/word_prior/gates/{name.removeprefix('word_prior_gate_')}"] = float(value)
     return payload
 
 
@@ -573,7 +777,15 @@ def wandb_train_epoch_payload(row):
     }
     for name, value in row.items():
         if name.startswith("train_"):
-            payload[f"train/epoch/{name.removeprefix('train_')}"] = value
+            key = name.removeprefix("train_")
+            if key.startswith("mode_text_only_"):
+                payload[f"train/text_only/epoch/{key.removeprefix('mode_text_only_')}"] = value
+            elif key.startswith("mode_word_prior_"):
+                payload[f"train/word_prior/epoch/{key.removeprefix('mode_word_prior_')}"] = value
+            elif key.startswith("word_prior_gate_"):
+                payload[f"train/word_prior/epoch/gates/{key.removeprefix('word_prior_gate_')}"] = value
+            else:
+                payload[f"train/epoch/{key}"] = value
         elif name.startswith("lr_"):
             payload[f"optimizer/{name.removeprefix('lr_')}_lr"] = value
     return payload
@@ -605,8 +817,13 @@ def configure_wandb_metrics(wandb_run):
     definitions = (
         ("train/optimizer_step", None),
         ("train/batch/*", "train/optimizer_step"),
+        ("train/text_only/batch/*", "train/optimizer_step"),
+        ("train/word_prior/batch/*", "train/optimizer_step"),
+        ("train/word_prior/gates/*", "train/optimizer_step"),
         ("train/epoch_step", None),
         ("train/epoch/*", "train/epoch_step"),
+        ("train/text_only/epoch/*", "train/epoch_step"),
+        ("train/word_prior/epoch/*", "train/epoch_step"),
         ("optimizer/*", "train/epoch_step"),
         ("validation/epoch_step", None),
         ("validation/*", "validation/epoch_step"),
@@ -651,7 +868,12 @@ def run_train_epoch(
         if max_batches and batch_index >= max_batches:
             break
         logical_size = len(batch["name"])
-        microbatch_size = memory_microbatch_size(batch, cfg)
+        microbatch_size = synchronized_memory_microbatch_size(
+            batch,
+            cfg,
+            dist_info,
+            device,
+        )
         batch_losses = {}
         for start in range(0, logical_size, microbatch_size):
             end = min(start + microbatch_size, logical_size)
@@ -795,6 +1017,7 @@ def evaluate_microbatch(
     cfg,
     device,
     epoch=1,
+    word_prior_mode=None,
 ):
     batch = move_batch_to_device(batch, device)
     metrics = {}
@@ -827,6 +1050,7 @@ def evaluate_microbatch(
             device,
             epoch=epoch,
             training=False,
+            word_prior_mode=word_prior_mode,
         )
     finally:
         cfg["analytic_dynamics"] = analytic_cfg
@@ -850,10 +1074,16 @@ def evaluate_microbatch(
     add_metrics("pred_dense", dense_dynamics)
 
     target = prepared["target"]
-    for label, values in (
-        ("prior", prepared["outputs"]["prior"]),
-        ("scaffold", prepared["adapter_context"]),
-    ):
+    if is_dual_mode(cfg):
+        baselines = [("coarse", prepared["outputs"]["coarse"])]
+        if prepared["adapter_context"] is not None:
+            baselines.append(("scaffold", prepared["adapter_context"]))
+    else:
+        baselines = [
+            ("prior", prepared["outputs"]["prior"]),
+            ("scaffold", prepared["adapter_context"]),
+        ]
+    for label, values in baselines:
         _baseline_total, baseline_losses = endpoint_losses(
             values,
             target,
@@ -906,6 +1136,7 @@ def evaluate(
     epoch=1,
     max_batches=0,
     show_progress=True,
+    word_prior_mode=None,
 ):
     model.eval()
     average = ScalarAverager()
@@ -930,6 +1161,7 @@ def evaluate(
                 cfg,
                 device,
                 epoch=epoch,
+                word_prior_mode=word_prior_mode,
             )
             average.update(metrics, n=end - start)
             if show_progress:
@@ -943,6 +1175,55 @@ def evaluate(
         ):
             torch.cuda.empty_cache()
     return average.mean()
+
+
+def evaluate_configured_modes(
+    model,
+    fk,
+    text_encoder,
+    provider,
+    loader,
+    dataset,
+    cfg,
+    device,
+    epoch=1,
+    max_batches=0,
+    show_progress=True,
+):
+    """Evaluate v2 deterministically both without and with its optional prior."""
+
+    if not is_dual_mode(cfg):
+        return evaluate(
+            model,
+            fk,
+            text_encoder,
+            provider,
+            loader,
+            dataset,
+            cfg,
+            device,
+            epoch=epoch,
+            max_batches=max_batches,
+            show_progress=show_progress,
+        )
+    combined = {}
+    for namespace, mode in (("text_only", "off"), ("word_prior", "on")):
+        metrics = evaluate(
+            model,
+            fk,
+            text_encoder,
+            provider,
+            loader,
+            dataset,
+            cfg,
+            device,
+            epoch=epoch,
+            max_batches=max_batches,
+            show_progress=show_progress,
+            word_prior_mode=mode,
+        )
+        combined.update({f"{namespace}/{name}": value for name, value in metrics.items()})
+    return combined
 
 
 def _selection_value(metrics, name, specification=None):
@@ -982,7 +1263,7 @@ def selection_diagnostics(metrics, cfg, return_details=False):
     total_violation = 0.0
     constraint_rows = []
     rejection_reasons = []
-    for name, specification in selection_cfg.get("constraints", {}).items():
+    for name, specification in (selection_cfg.get("constraints") or {}).items():
         specification = dict(specification)
         value, baseline_name, baseline = _selection_value(metrics, name, specification)
         if not math.isfinite(value):
@@ -1032,9 +1313,96 @@ def selection_score(metrics, cfg):
     return selection_diagnostics(metrics, cfg)[0]
 
 
+def _metrics_in_namespace(metrics, namespace):
+    prefix = f"{namespace}/"
+    return {
+        name.removeprefix(prefix): value
+        for name, value in metrics.items()
+        if name.startswith(prefix)
+    }
+
+
+def checkpoint_selection_diagnostics(metrics, cfg, return_details=False):
+    """Select v2 by text-only quality and gate prior regressions separately."""
+
+    if not is_dual_mode(cfg):
+        return selection_diagnostics(metrics, cfg, return_details=return_details)
+
+    text_metrics = _metrics_in_namespace(metrics, "text_only")
+    word_metrics = _metrics_in_namespace(metrics, "word_prior")
+    (
+        text_score,
+        text_violation,
+        text_feasible,
+        details,
+    ) = selection_diagnostics(text_metrics, cfg, return_details=True)
+    word_score, _word_selection_violation, _word_feasible = selection_diagnostics(
+        word_metrics, cfg
+    )
+    tolerance = float(
+        cfg.get("selection", {}).get(
+            "word_prior_max_relative_degradation", 0.02
+        )
+    )
+    if tolerance < 0:
+        raise ValueError("word_prior_max_relative_degradation must be non-negative")
+    comparison_scale = max(abs(float(text_score)), 1e-8)
+    allowed_word_score = float(text_score) + tolerance * comparison_scale
+    word_finite = math.isfinite(float(word_score))
+    word_violation = (
+        max(float(word_score) - allowed_word_score, 0.0) / comparison_scale
+        if word_finite and math.isfinite(float(text_score))
+        else float("inf")
+    )
+    total_violation = float(text_violation) + word_violation
+    feasible = bool(text_feasible and word_finite and word_violation <= 1e-12)
+    relative_degradation = (
+        (float(word_score) - float(text_score)) / comparison_scale
+        if word_finite and math.isfinite(float(text_score))
+        else float("inf")
+    )
+    if word_violation > 0:
+        details["rejection_reasons"].append(
+            "word-prior selection score "
+            f"{word_score:.6g} is more than {100.0 * tolerance:.2f}% worse "
+            f"than text-only score {text_score:.6g}"
+        )
+    details["dual_mode"] = {
+        "selection_source": "text_only",
+        "text_only_score": float(text_score),
+        "word_prior_score": float(word_score),
+        "word_prior_allowed_score": float(allowed_word_score),
+        "word_prior_relative_degradation": float(relative_degradation),
+        "word_prior_max_relative_degradation": tolerance,
+        "word_prior_violation": float(word_violation),
+    }
+    result = (float(text_score), total_violation, feasible)
+    return (*result, details) if return_details else result
+
+
+def validate_checkpoint_contract(checkpoint, cfg, source="checkpoint"):
+    expected_type, expected_version = checkpoint_contract(cfg)
+    actual_type = checkpoint.get("model_type")
+    actual_version = checkpoint.get("trajectory_contract_version")
+    # Historical v1 checkpoints predate explicit identity metadata.
+    if actual_type is None and expected_type == "continuous_trajectory_field":
+        actual_type = "continuous_trajectory_field"
+    if actual_version is None and expected_version == 1:
+        actual_version = 1
+    if actual_type != expected_type or int(actual_version or -1) != expected_version:
+        raise RuntimeError(
+            f"{source} has model_type={actual_type!r}, "
+            f"trajectory_contract_version={actual_version!r}; expected "
+            f"model_type={expected_type!r}, "
+            f"trajectory_contract_version={expected_version}. "
+            "v2 is a fresh model contract and cannot load v1 weights."
+        )
+
+
 def save_checkpoint(path, model, optimizer, epoch, global_step, cfg, metrics):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    model_type, contract_version = checkpoint_contract(cfg)
     torch.save(
         {
             "model": model.state_dict(),
@@ -1043,8 +1411,8 @@ def save_checkpoint(path, model, optimizer, epoch, global_step, cfg, metrics):
             "global_step": int(global_step),
             "config": cfg,
             "metrics": metrics,
-            "model_type": "continuous_trajectory_field",
-            "trajectory_contract_version": 1,
+            "model_type": model_type,
+            "trajectory_contract_version": contract_version,
         },
         path,
     )
@@ -1092,6 +1460,11 @@ def main():
     if args.resume is not None and args.warm_start is not None:
         raise ValueError("--resume and --warm_start are mutually exclusive")
     cfg = apply_overrides(load_config(args.config), args)
+    if args.warm_start is not None and is_dual_mode(cfg):
+        raise ValueError(
+            "Dual-mode v2 must be trained from scratch; --warm_start accepts only "
+            "v1-to-v1 Stage 2 initialization. Use --resume for a v2 checkpoint."
+        )
     dist_info = setup_distributed(args)
     set_seed(int(cfg.get("seed", 1234)) + int(dist_info.get("rank", 0)))
     device = resolve_distributed_device(cfg.get("device", "auto"), dist_info)
@@ -1146,6 +1519,7 @@ def main():
     best_infeasible_score = float("inf")
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu")
+        validate_checkpoint_contract(checkpoint, cfg, source=str(args.resume))
         model.load_state_dict(checkpoint["model"], strict=True)
         optimizer_state = checkpoint.get("optimizer")
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
@@ -1158,6 +1532,7 @@ def main():
             best_infeasible_score = checkpoint_score
     elif args.warm_start:
         checkpoint = torch.load(args.warm_start, map_location="cpu")
+        validate_checkpoint_contract(checkpoint, cfg, source=str(args.warm_start))
         incompatible = load_warm_start_state(model, checkpoint["model"])
         reset_local = bool(
             args.reset_local_branch
@@ -1174,7 +1549,12 @@ def main():
             "optimizer and epoch reset.",
         )
 
-    model = wrap_model(model, dist_info, device)
+    model = wrap_model(
+        model,
+        dist_info,
+        device,
+        find_unused_parameters=is_dual_mode(cfg),
+    )
     optimizer = build_optimizer(model, cfg)
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
@@ -1247,7 +1627,7 @@ def main():
             barrier(dist_info)
             if dist_info["is_main"] and wandb_run is not None:
                 wandb_run.log(wandb_validation_pending_payload(epoch, global_step))
-            val_metrics = evaluate(
+            val_metrics = evaluate_configured_modes(
                 unwrap_model(model),
                 fk,
                 text_encoder,
@@ -1268,13 +1648,16 @@ def main():
                 constraint_violation,
                 selection_feasible,
                 selection_details,
-            ) = selection_diagnostics(val_metrics, cfg, return_details=True)
+            ) = checkpoint_selection_diagnostics(val_metrics, cfg, return_details=True)
             row["selection_score"] = score
             row["selection_constraint_violation"] = constraint_violation
             row["selection_feasible"] = float(selection_feasible)
             row["selection_rejection_reasons"] = "; ".join(
                 selection_details["rejection_reasons"]
             )
+            for name, value in selection_details.get("dual_mode", {}).items():
+                if isinstance(value, (int, float)):
+                    row[f"selection_{name}"] = value
             if dist_info["is_main"] and wandb_run is not None:
                 wandb_run.log(wandb_validation_payload(row))
             if dist_info["is_main"] and bool(

@@ -23,9 +23,13 @@ from NIAF.continuous_sign_field.scripts.train_residual_flow import (
 )
 from NIAF.continuous_trajectory_field.models import build_continuous_trajectory_field
 from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field import (
+    checkpoint_selection_diagnostics,
     evaluate,
+    evaluate_configured_modes,
+    is_dual_mode,
     selection_diagnostics,
     set_seed,
+    validate_checkpoint_contract,
 )
 from NIAF.retrieval_confidence_field.scripts.train_retrieval_adaptive_field import (
     validate_train_only_retrieval_bank,
@@ -50,6 +54,16 @@ def parse_args():
         help=(
             "Use config behavior, require cached scaffolds, prefer cache with "
             "online fallback, or build every scaffold online."
+        ),
+    )
+    parser.add_argument(
+        "--word_prior",
+        dest="word_prior_mode",
+        default="auto",
+        choices=("auto", "off", "on", "both"),
+        help=(
+            "For v2, evaluate text-only (off), prior-enabled (on), or both. "
+            "auto means both for v2 and the original path for v1."
         ),
     )
     parser.add_argument("--device", default=None)
@@ -104,14 +118,23 @@ def main():
         device = resolve_distributed_device(cfg.get("device", "auto"), dist_info)
         text_device = torch.device(cfg.get("text", {}).get("device", "cpu"))
         data_cfg = cfg.get("data", {})
-
-        train_dataset, _train_loader, _train_sampler = make_loader(
-            cfg,
-            data_cfg.get("train_split", "train"),
-            limit=0,
-            shuffle=False,
-            distributed=False,
+        dual_mode = is_dual_mode(cfg)
+        if not dual_mode and args.word_prior_mode != "auto":
+            raise ValueError("--word_prior is available only for dual-mode v2")
+        resolved_word_prior_mode = (
+            "both" if dual_mode and args.word_prior_mode == "auto"
+            else args.word_prior_mode
         )
+        needs_provider = not dual_mode or resolved_word_prior_mode in {"on", "both"}
+        train_dataset = None
+        if needs_provider:
+            train_dataset, _train_loader, _train_sampler = make_loader(
+                cfg,
+                data_cfg.get("train_split", "train"),
+                limit=0,
+                shuffle=False,
+                distributed=False,
+            )
         eval_dataset, eval_loader, _eval_sampler = make_loader(
             cfg,
             args.split,
@@ -133,18 +156,30 @@ def main():
         )
 
         text_encoder = build_text_encoder(cfg, text_device)
-        provider = ScaffoldProvider(cfg, train_dataset, device)
-        retrieval_bank = validate_train_only_retrieval_bank(cfg, provider)
+        provider = (
+            ScaffoldProvider(cfg, train_dataset, device) if needs_provider else None
+        )
+        retrieval_bank = (
+            validate_train_only_retrieval_bank(cfg, provider)
+            if provider is not None
+            else None
+        )
         model = build_continuous_trajectory_field(
             cfg, text_dim=text_encoder.text_dim
         ).to(device)
         checkpoint = torch.load(args.checkpoint, map_location="cpu")
+        validate_checkpoint_contract(checkpoint, cfg, source=str(args.checkpoint))
         model.load_state_dict(checkpoint["model"], strict=True)
         model.eval()
         fk = build_fk(cfg, device)
 
         checkpoint_epoch = int(checkpoint.get("epoch", 0))
-        metrics = evaluate(
+        evaluate_both = dual_mode and resolved_word_prior_mode == "both"
+        evaluation_function = evaluate_configured_modes if evaluate_both else evaluate
+        evaluation_kwargs = {}
+        if dual_mode and not evaluate_both:
+            evaluation_kwargs["word_prior_mode"] = resolved_word_prior_mode
+        metrics = evaluation_function(
             model,
             fk,
             text_encoder,
@@ -156,10 +191,16 @@ def main():
             epoch=max(checkpoint_epoch, 1),
             max_batches=max(int(args.max_batches), 0),
             show_progress=dist_info["is_main"],
+            **evaluation_kwargs,
         )
         metrics = distributed_mean_scalars(metrics, device, dist_info)
-        score, constraint_violation, feasible, selection_details = selection_diagnostics(
-            metrics, cfg, return_details=True
+        diagnostics_function = (
+            checkpoint_selection_diagnostics if evaluate_both else selection_diagnostics
+        )
+        score, constraint_violation, feasible, selection_details = diagnostics_function(
+            metrics,
+            cfg,
+            return_details=True,
         )
         result = {
             "checkpoint": str(args.checkpoint.resolve()),
@@ -172,8 +213,11 @@ def main():
                 cfg.get("train", {}).get("eval_batch_size", 1)
             ),
             "max_batches_per_rank": max(int(args.max_batches), 0),
+            "word_prior_mode": resolved_word_prior_mode if dual_mode else "v1_required",
             "scaffold_mode": str(args.scaffold_mode),
-            "scaffold": provider.config_summary,
+            "scaffold": (
+                provider.config_summary if provider is not None else None
+            ),
             "retrieval_bank": retrieval_bank,
             "selection_score": float(score),
             "selection_constraint_violation": float(constraint_violation),

@@ -1,0 +1,60 @@
+_base_: csl_daily_continuous_trajectory_stage2_part_experts_joint_full.yaml
+
+experiment_name: csl_daily_signtrajfield_v2_full
+
+# SignTrajField-v2 is trained from scratch. The frozen CSL-Daily adapter is an
+# optional word prior and is never used as a model-weight initialization.
+model:
+  type: dual_mode_continuous_trajectory_field
+  max_local_fields: 16
+  frames_per_local_field: 24
+  local_center_mode: uniform
+  use_retrieval_guidance: false
+  part_specific_local_experts: true
+  time_dependent_local_gates: true
+
+conditioning:
+  temporal_slot_count: 16
+  temporal_slot_layers: 2
+  temporal_slot_heads: 8
+  context_fps: 20.0
+  word_prior_dropout_probability: 0.5
+
+objective:
+  lambda_prior: 0.0
+  lambda_coarse: 0.25
+  lambda_residual: 0.50
+
+selection:
+  weights:
+    pred_loss_endpoint: 1.0
+    pred_loss_hand_relative: 10.0
+    pred_loss_path: 0.5
+  constraints: null
+  word_prior_max_relative_degradation: 0.02
+  require_feasible: false
+  keep_validation_checkpoints: true
+
+train:
+  epochs: 50
+  batch_size: 32
+  accumulation_steps: 2
+  max_samples_per_memory_batch: 16
+  max_frames_per_memory_batch: 4096
+  num_workers: 0
+  persistent_workers: false
+  local_warmup_epochs: 0
+  lr: 0.0001
+  joint_global_lr: 0.0001
+  joint_local_lr: 0.0001
+  val_every: 5
+  save_every: 1
+
+eval:
+  num_workers: 0
+  max_samples_per_memory_batch: 1
+  max_frames_per_memory_batch: 512
+  empty_cache_between_batches: true
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v2_full

@@ -25,6 +25,8 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 CONTEXT_FPS="${CONTEXT_FPS:-20}"
 SAMPLE_FPS="${SAMPLE_FPS:-20}"
 LENGTH_MODE="${LENGTH_MODE:-predicted}"
+WORD_PRIOR="${WORD_PRIOR:-auto}"
+PRIOR_KEY="${PRIOR_KEY:-adapter_context_smplx}"
 DEVICE="${DEVICE:-cuda}"
 TEXT_DEVICE="${TEXT_DEVICE:-cpu}"
 
@@ -75,6 +77,7 @@ echo "Job ID: ${SLURM_JOB_ID:-local}"
 echo "Checkpoint: $CHECKPOINT"
 echo "Split: $SPLIT num_samples=$NUM_SAMPLES length_mode=$LENGTH_MODE"
 echo "Context/sample FPS: $CONTEXT_FPS/$SAMPLE_FPS"
+echo "Word prior: $WORD_PRIOR DTW prior key: $PRIOR_KEY"
 echo "Output: $OUT_DIR"
 
 srun --kill-on-bad-exit=1 "$PYTHON_BIN" \
@@ -89,6 +92,7 @@ srun --kill-on-bad-exit=1 "$PYTHON_BIN" \
   --device "$DEVICE" \
   --text_device "$TEXT_DEVICE" \
   --length_mode "$LENGTH_MODE" \
+  --word_prior "$WORD_PRIOR" \
   --context_fps "$CONTEXT_FPS" \
   --sample_fps "$SAMPLE_FPS"
 
@@ -100,7 +104,7 @@ for ALIGNMENT_MODE in default pa; do
     --out_csv "$OUT_DIR/dtw_mpjpe_t2m_${ALIGNMENT_MODE}_h2s_betas.csv" \
     --sample_key smplx \
     --gt_key smplx \
-    --prior_key adapter_context_smplx \
+    --prior_key "$PRIOR_KEY" \
     --device "$DEVICE" \
     --betas_mode h2s_fixed \
     --alignment_mode "$ALIGNMENT_MODE" \

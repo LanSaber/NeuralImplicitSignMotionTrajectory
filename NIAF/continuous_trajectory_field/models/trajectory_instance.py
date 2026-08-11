@@ -34,6 +34,9 @@ class TrajectoryInstance:
     context_density: Optional[torch.Tensor] = None
     context_tau: Optional[torch.Tensor] = None
     local_part_gates: Optional[torch.Tensor] = None
+    word_prior_available: Optional[torch.Tensor] = None
+    word_prior_gates: Optional[torch.Tensor] = None
+    temporal_slot_tau: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         self.validate()
@@ -95,6 +98,26 @@ class TrajectoryInstance:
             4,
         ):
             raise ValueError("local_part_gates must have shape [B,M,4]")
+        if self.word_prior_available is not None:
+            if self.word_prior_available.shape != (batch,):
+                raise ValueError("word_prior_available must have shape [B]")
+            if self.word_prior_available.dtype != torch.bool:
+                raise ValueError("word_prior_available must be boolean")
+        if self.word_prior_gates is not None:
+            if (
+                self.word_prior_gates.ndim != 3
+                or self.word_prior_gates.shape[0] != batch
+                or self.word_prior_gates.shape[-1] != 4
+            ):
+                raise ValueError("word_prior_gates must have shape [B,S,4]")
+        if self.temporal_slot_tau is not None:
+            if self.temporal_slot_tau.ndim != 2 or self.temporal_slot_tau.shape[0] != batch:
+                raise ValueError("temporal_slot_tau must have shape [B,S]")
+            if (
+                self.word_prior_gates is not None
+                and self.temporal_slot_tau.shape[1] != self.word_prior_gates.shape[1]
+            ):
+                raise ValueError("temporal slot counts must agree")
         if self.local_mask.dtype != torch.bool:
             raise ValueError("local_mask must be boolean")
         if torch.is_floating_point(self.duration_seconds):

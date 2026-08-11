@@ -25,6 +25,11 @@ from NIAF.continuous_sign_field.scripts.train_residual_flow import (
     prepare_motion,
 )
 from NIAF.continuous_trajectory_field.models import build_continuous_trajectory_field
+from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field import (
+    checkpoint_contract,
+    is_dual_mode,
+    validate_checkpoint_contract,
+)
 from NIAF.retrieval_confidence_field.scripts.export_retrieval_adaptive_samples import (
     generation_batch,
 )
@@ -62,6 +67,15 @@ def parse_args():
             "ground_truth_sampling keeps the predicted context but queries the "
             "trajectory at the GT frame count; ground_truth also rebuilds the "
             "context at the GT length"
+        ),
+    )
+    parser.add_argument(
+        "--word_prior",
+        default="auto",
+        choices=("auto", "off", "on"),
+        help=(
+            "For v2, export text-only (off) or prior-enabled (on). auto uses "
+            "text-only for v2 and the required scaffold path for v1."
         ),
     )
     parser.add_argument("--context_fps", type=float, default=20.0)
@@ -122,6 +136,7 @@ def prepare_inference_batch(
     device,
     context_fps,
     length_mode,
+    word_prior_mode="auto",
 ):
     text_tokens, text_mask = encode_batch_text(text_encoder, batch, cfg, device)
     predicted_log_duration, predicted_duration = model.predict_duration(
@@ -144,32 +159,69 @@ def prepare_inference_batch(
         if length_mode == "ground_truth"
         else predicted_context_lengths
     )
-    generated = generation_batch(batch, context_lengths, device)
-    adapter_context, _anchors, metadata = provider.build_with_metadata(
-        generated,
-        x=None,
-        use_cache=False,
-    )
-    trajectory = model.encode_trajectory(
-        text_tokens=text_tokens,
-        adapter_context=adapter_context,
-        context_mask=generated["mask"],
-        retrieval_evidence=metadata["retrieval_features"],
-        text_mask=text_mask,
-    )
+    dual_mode = is_dual_mode(cfg)
+    if not dual_mode and word_prior_mode != "auto":
+        raise ValueError("word_prior_mode is available only for dual-mode v2")
+    resolved_mode = "off" if dual_mode and word_prior_mode == "auto" else word_prior_mode
+    if dual_mode and resolved_mode not in {"off", "on"}:
+        raise ValueError("v2 word_prior_mode must be 'off' or 'on'")
+
+    adapter_context = None
+    retrieval_features = None
+    context_mask = None
+    if dual_mode and resolved_mode == "off":
+        context_lengths = torch.zeros_like(batch["length"])
+        trajectory = model.encode_trajectory(
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            word_prior_available=torch.zeros(
+                text_tokens.shape[0], dtype=torch.bool, device=device
+            ),
+        )
+    else:
+        if provider is None:
+            raise ValueError("Prior-enabled inference requires a ScaffoldProvider")
+        generated = generation_batch(batch, context_lengths, device)
+        adapter_context, _anchors, metadata = provider.build_with_metadata(
+            generated,
+            x=None,
+            use_cache=False,
+        )
+        retrieval_features = metadata["retrieval_features"]
+        context_mask = generated["mask"]
+        if dual_mode:
+            trajectory = model.encode_trajectory(
+                text_tokens=text_tokens,
+                text_mask=text_mask,
+                word_prior_context=adapter_context,
+                word_prior_mask=context_mask,
+                word_prior_features=retrieval_features,
+                word_prior_available=torch.ones(
+                    text_tokens.shape[0], dtype=torch.bool, device=device
+                ),
+            )
+        else:
+            trajectory = model.encode_trajectory(
+                text_tokens=text_tokens,
+                adapter_context=adapter_context,
+                context_mask=context_mask,
+                retrieval_evidence=retrieval_features,
+                text_mask=text_mask,
+            )
     output_duration = (
         trajectory.duration_seconds if length_mode == "predicted" else batch["duration"]
     )
     return {
         "trajectory": trajectory,
         "adapter_context": adapter_context,
-        "retrieval_features": metadata["retrieval_features"],
-        "context_mask": generated["mask"],
+        "retrieval_features": retrieval_features,
+        "context_mask": context_mask,
         "context_lengths": context_lengths,
         "predicted_context_lengths": predicted_context_lengths,
         "predicted_duration": predicted_duration,
         "predicted_log_duration": predicted_log_duration,
         "output_duration": output_duration,
+        "word_prior_mode": resolved_mode if dual_mode else "v1_required",
     }
 
 
@@ -247,10 +299,23 @@ def main():
         collate_fn=collate_continuous_sign,
     )
     text_encoder = build_text_encoder(cfg, text_device)
-    provider = ScaffoldProvider(cfg, dataset, device)
-    retrieval_bank = validate_train_only_retrieval_bank(cfg, provider)
+    dual_mode = is_dual_mode(cfg)
+    if not dual_mode and args.word_prior != "auto":
+        raise ValueError("--word_prior is available only for dual-mode v2")
+    resolved_word_prior_mode = (
+        "off" if dual_mode and args.word_prior == "auto" else args.word_prior
+    )
+    needs_provider = not dual_mode or resolved_word_prior_mode == "on"
+    provider = ScaffoldProvider(cfg, dataset, device) if needs_provider else None
+    retrieval_bank = (
+        validate_train_only_retrieval_bank(cfg, provider)
+        if provider is not None
+        else None
+    )
     model = build_continuous_trajectory_field(cfg, text_dim=text_encoder.text_dim).to(device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    validate_checkpoint_contract(checkpoint, cfg, source=str(args.checkpoint))
+    model_type, contract_version = checkpoint_contract(cfg)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
 
@@ -270,6 +335,7 @@ def main():
             device,
             context_fps=args.context_fps,
             length_mode=args.length_mode,
+            word_prior_mode=resolved_word_prior_mode,
         )
         sampled = sample_trajectory_fps(
             model,
@@ -316,33 +382,26 @@ def main():
                 target[local_index, :gt_length]
             )
             prediction = main_sample["outputs"]["prediction"][local_index, :output_length]
-            prior = main_sample["outputs"]["prior"][local_index, :output_length]
+            coarse_name = "coarse" if dual_mode else "prior"
+            coarse = main_sample["outputs"][coarse_name][local_index, :output_length]
             pred_rot6d, pred_axis, pred_smplx = rot6d_to_axis_and_smplx(prediction)
-            prior_rot6d, prior_axis, prior_smplx = rot6d_to_axis_and_smplx(prior)
-            context_rot6d, context_axis, context_smplx = rot6d_to_axis_and_smplx(
-                inference["adapter_context"][local_index, :context_length]
-            )
+            coarse_rot6d, coarse_axis, coarse_smplx = rot6d_to_axis_and_smplx(coarse)
             gt_path = out_dir / f"gt_{suffix}.npz"
             sample_path = out_dir / f"sample_{suffix}.npz"
             save_eval_npz(
                 gt_path, gt_axis, gt_smplx, gt_rot6d, meta, label="ground_truth"
             )
             extra = {
-                "continuous_prior_motion": prior_axis.astype(np.float32),
-                "continuous_prior_smplx": prior_smplx.astype(np.float32),
-                "continuous_prior_rot6d": prior_rot6d.astype(np.float32),
-                "adapter_context_motion": context_axis.astype(np.float32),
-                "adapter_context_smplx": context_smplx.astype(np.float32),
-                "adapter_context_rot6d": context_rot6d.astype(np.float32),
-                "retrieval_features": inference["retrieval_features"][
-                    local_index, :context_length
-                ].cpu().float().numpy(),
+                f"continuous_{coarse_name}_motion": coarse_axis.astype(np.float32),
+                f"continuous_{coarse_name}_smplx": coarse_smplx.astype(np.float32),
+                f"continuous_{coarse_name}_rot6d": coarse_rot6d.astype(np.float32),
                 "checkpoint": np.asarray(str(args.checkpoint)),
                 "checkpoint_epoch": np.asarray(
                     int(checkpoint.get("epoch", -1)), dtype=np.int32
                 ),
-                "model_type": np.asarray("continuous_trajectory_field"),
-                "trajectory_contract_version": np.asarray(1, dtype=np.int32),
+                "model_type": np.asarray(model_type),
+                "trajectory_contract_version": np.asarray(contract_version, dtype=np.int32),
+                "word_prior_mode": np.asarray(inference["word_prior_mode"]),
                 "length_mode": np.asarray(args.length_mode),
                 "context_fps": np.asarray(float(args.context_fps), dtype=np.float32),
                 "sample_fps": np.asarray(float(main_fps), dtype=np.float32),
@@ -354,6 +413,20 @@ def main():
                     dtype=np.float32,
                 ),
             }
+            if inference["adapter_context"] is not None:
+                context_rot6d, context_axis, context_smplx = rot6d_to_axis_and_smplx(
+                    inference["adapter_context"][local_index, :context_length]
+                )
+                extra.update(
+                    {
+                        "adapter_context_motion": context_axis.astype(np.float32),
+                        "adapter_context_smplx": context_smplx.astype(np.float32),
+                        "adapter_context_rot6d": context_rot6d.astype(np.float32),
+                        "retrieval_features": inference["retrieval_features"][
+                            local_index, :context_length
+                        ].cpu().float().numpy(),
+                    }
+                )
             extra.update(_trajectory_numpy(inference["trajectory"], local_index))
             for branch_name, branch_prediction in branch_samples.items():
                 branch_rot6d, branch_axis, branch_smplx = rot6d_to_axis_and_smplx(
@@ -381,7 +454,7 @@ def main():
                 pred_smplx,
                 pred_rot6d,
                 meta,
-                label="niaf_continuous_trajectory_field",
+                label="signtrajfield_v2" if dual_mode else "niaf_continuous_trajectory_field",
                 extra=extra,
             )
             rows.append(
@@ -394,6 +467,7 @@ def main():
                         batch["duration"][local_index].item()
                     ),
                     "context_length": context_length,
+                    "word_prior_mode": inference["word_prior_mode"],
                     "predicted_duration_seconds": float(
                         inference["trajectory"].duration_seconds[local_index].item()
                     ),
@@ -420,6 +494,9 @@ def main():
         "config": str(args.config),
         "split": args.split,
         "length_mode": args.length_mode,
+        "model_type": model_type,
+        "trajectory_contract_version": contract_version,
+        "word_prior_mode": resolved_word_prior_mode if dual_mode else "v1_required",
         "context_fps": float(args.context_fps),
         "sample_fps": list(fps_values),
         "retrieval_bank": retrieval_bank,

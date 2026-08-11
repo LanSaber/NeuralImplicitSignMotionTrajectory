@@ -117,7 +117,7 @@ def resolve_device(requested, dist_info):
     return torch.device(requested)
 
 
-def wrap_model(model, dist_info, device):
+def wrap_model(model, dist_info, device, find_unused_parameters=False):
     if not dist_info.get("enabled", False):
         return model
     if device.type == "cuda":
@@ -126,8 +126,13 @@ def wrap_model(model, dist_info, device):
             device_ids=[device.index],
             output_device=device.index,
             broadcast_buffers=False,
+            find_unused_parameters=bool(find_unused_parameters),
         )
-    return DistributedDataParallel(model, broadcast_buffers=False)
+    return DistributedDataParallel(
+        model,
+        broadcast_buffers=False,
+        find_unused_parameters=bool(find_unused_parameters),
+    )
 
 
 def unwrap_model(model):
