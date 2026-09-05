@@ -37,6 +37,10 @@ class TrajectoryInstance:
     word_prior_available: Optional[torch.Tensor] = None
     word_prior_gates: Optional[torch.Tensor] = None
     temporal_slot_tau: Optional[torch.Tensor] = None
+    sentence_memory_available: Optional[torch.Tensor] = None
+    sentence_memory_gates: Optional[torch.Tensor] = None
+    sentence_memory_null_mass: Optional[torch.Tensor] = None
+    sentence_memory_candidate_mass: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         self.validate()
@@ -118,6 +122,46 @@ class TrajectoryInstance:
                 and self.temporal_slot_tau.shape[1] != self.word_prior_gates.shape[1]
             ):
                 raise ValueError("temporal slot counts must agree")
+        if self.sentence_memory_available is not None:
+            if self.sentence_memory_available.shape != (batch,):
+                raise ValueError("sentence_memory_available must have shape [B]")
+            if self.sentence_memory_available.dtype != torch.bool:
+                raise ValueError("sentence_memory_available must be boolean")
+        sentence_slot_count = None
+        if self.sentence_memory_gates is not None:
+            if (
+                self.sentence_memory_gates.ndim != 3
+                or self.sentence_memory_gates.shape[0] != batch
+                or self.sentence_memory_gates.shape[-1] != 4
+            ):
+                raise ValueError("sentence_memory_gates must have shape [B,S,4]")
+            sentence_slot_count = self.sentence_memory_gates.shape[1]
+        if self.sentence_memory_null_mass is not None:
+            if (
+                self.sentence_memory_null_mass.ndim != 2
+                or self.sentence_memory_null_mass.shape[0] != batch
+            ):
+                raise ValueError("sentence_memory_null_mass must have shape [B,S]")
+            if (
+                sentence_slot_count is not None
+                and self.sentence_memory_null_mass.shape[1] != sentence_slot_count
+            ):
+                raise ValueError("sentence-memory slot counts must agree")
+            sentence_slot_count = self.sentence_memory_null_mass.shape[1]
+        if self.sentence_memory_candidate_mass is not None:
+            if (
+                self.sentence_memory_candidate_mass.ndim != 3
+                or self.sentence_memory_candidate_mass.shape[0] != batch
+            ):
+                raise ValueError(
+                    "sentence_memory_candidate_mass must have shape [B,S,K]"
+                )
+            if (
+                sentence_slot_count is not None
+                and self.sentence_memory_candidate_mass.shape[1]
+                != sentence_slot_count
+            ):
+                raise ValueError("sentence-memory slot counts must agree")
         if self.local_mask.dtype != torch.bool:
             raise ValueError("local_mask must be boolean")
         if torch.is_floating_point(self.duration_seconds):

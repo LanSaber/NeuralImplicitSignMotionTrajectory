@@ -26,9 +26,13 @@ CONTEXT_FPS="${CONTEXT_FPS:-20}"
 SAMPLE_FPS="${SAMPLE_FPS:-20}"
 LENGTH_MODE="${LENGTH_MODE:-predicted}"
 WORD_PRIOR="${WORD_PRIOR:-auto}"
+SENTENCE_MEMORY="${SENTENCE_MEMORY:-auto}"
 PRIOR_KEY="${PRIOR_KEY:-adapter_context_smplx}"
 DEVICE="${DEVICE:-cuda}"
 TEXT_DEVICE="${TEXT_DEVICE:-cpu}"
+SENTENCE_MEMORY_DIR="${SENTENCE_MEMORY_DIR:-}"
+STAGE_SENTENCE_MEMORY="${STAGE_SENTENCE_MEMORY:-0}"
+LOCAL_SENTENCE_MEMORY_DIR=""
 
 case "$LENGTH_MODE" in
   predicted|ground_truth_sampling|ground_truth) ;;
@@ -46,7 +50,8 @@ fi
 if [[ -d "$CHECKPOINT" ]]; then
   CHECKPOINT_DIR="$CHECKPOINT"
   CHECKPOINT=""
-  for CANDIDATE in best.pt best_infeasible.pt last.pt; do
+  # An infeasible checkpoint is diagnostic evidence, never a promoted model.
+  for CANDIDATE in best.pt last.pt; do
     if [[ -f "$CHECKPOINT_DIR/$CANDIDATE" ]]; then
       CHECKPOINT="$CHECKPOINT_DIR/$CANDIDATE"
       break
@@ -59,6 +64,44 @@ if [[ -d "$CHECKPOINT" ]]; then
 elif [[ ! -f "$CHECKPOINT" ]]; then
   echo "ERROR: checkpoint does not exist: $CHECKPOINT" >&2
   exit 1
+fi
+
+cleanup_sentence_memory() {
+  local exit_code=$?
+  trap - EXIT
+  if [[ -n "$LOCAL_SENTENCE_MEMORY_DIR" ]]; then
+    srun --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 \
+      bash "$PROJECT_DIR/scripts/NIAF/stage_sentence_memory_node.sh" \
+      cleanup "$LOCAL_SENTENCE_MEMORY_DIR" || true
+  fi
+  exit "$exit_code"
+}
+trap cleanup_sentence_memory EXIT
+
+case "$STAGE_SENTENCE_MEMORY" in
+  0|1) ;;
+  *)
+    echo "ERROR: STAGE_SENTENCE_MEMORY must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+if [[ "$STAGE_SENTENCE_MEMORY" == "1" ]]; then
+  if [[ -z "${SLURM_JOB_ID:-}" || -z "$SENTENCE_MEMORY_DIR" ]]; then
+    echo "ERROR: staging requires Slurm and SENTENCE_MEMORY_DIR" >&2
+    exit 1
+  fi
+  LOCAL_SENTENCE_MEMORY_DIR="/tmp/signtraj_sentence_memory_${SLURM_JOB_ID}"
+  srun --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 \
+    bash "$PROJECT_DIR/scripts/NIAF/stage_sentence_memory_node.sh" \
+    stage "$LOCAL_SENTENCE_MEMORY_DIR" "$SENTENCE_MEMORY_DIR" \
+    "$PROJECT_DIR" "$PYTHON_BIN" "$CFG" "train $SPLIT"
+  export SIGNTRAJ_SENTENCE_MEMORY_DIR="$LOCAL_SENTENCE_MEMORY_DIR"
+elif [[ -n "$SENTENCE_MEMORY_DIR" ]]; then
+  if [[ ! -d "$SENTENCE_MEMORY_DIR" || ! -f "$SENTENCE_MEMORY_DIR/READY" ]]; then
+    echo "ERROR: SENTENCE_MEMORY_DIR is not a ready bank: $SENTENCE_MEMORY_DIR" >&2
+    exit 1
+  fi
+  export SIGNTRAJ_SENTENCE_MEMORY_DIR="$SENTENCE_MEMORY_DIR"
 fi
 
 export PATH="$PYTHON_ENV/bin:$PATH"
@@ -77,7 +120,8 @@ echo "Job ID: ${SLURM_JOB_ID:-local}"
 echo "Checkpoint: $CHECKPOINT"
 echo "Split: $SPLIT num_samples=$NUM_SAMPLES length_mode=$LENGTH_MODE"
 echo "Context/sample FPS: $CONTEXT_FPS/$SAMPLE_FPS"
-echo "Word prior: $WORD_PRIOR DTW prior key: $PRIOR_KEY"
+echo "Word prior: $WORD_PRIOR sentence memory: $SENTENCE_MEMORY DTW prior key: $PRIOR_KEY"
+echo "Sentence-memory bank: ${SIGNTRAJ_SENTENCE_MEMORY_DIR:-config value} staged=$STAGE_SENTENCE_MEMORY"
 echo "Output: $OUT_DIR"
 
 srun --kill-on-bad-exit=1 "$PYTHON_BIN" \
@@ -93,6 +137,7 @@ srun --kill-on-bad-exit=1 "$PYTHON_BIN" \
   --text_device "$TEXT_DEVICE" \
   --length_mode "$LENGTH_MODE" \
   --word_prior "$WORD_PRIOR" \
+  --sentence_memory "$SENTENCE_MEMORY" \
   --context_fps "$CONTEXT_FPS" \
   --sample_fps "$SAMPLE_FPS"
 
@@ -108,5 +153,5 @@ for ALIGNMENT_MODE in default pa; do
     --device "$DEVICE" \
     --betas_mode h2s_fixed \
     --alignment_mode "$ALIGNMENT_MODE" \
-    --parts body lhand rhand wholebody
+    --parts body lhand rhand face wholebody
 done

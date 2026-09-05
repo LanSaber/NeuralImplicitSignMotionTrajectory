@@ -25,10 +25,14 @@ LIMIT="${LIMIT:-0}"
 MAX_BATCHES="${MAX_BATCHES:-0}"
 SCAFFOLD_MODE="${SCAFFOLD_MODE:-config}"
 WORD_PRIOR="${WORD_PRIOR:-auto}"
+SENTENCE_MEMORY="${SENTENCE_MEMORY:-auto}"
 DEVICE="${DEVICE:-auto}"
 TEXT_DEVICE="${TEXT_DEVICE:-cpu}"
 DDP_BACKEND="${DDP_BACKEND:-nccl}"
 DDP_TIMEOUT_MIN="${DDP_TIMEOUT_MIN:-120}"
+SENTENCE_MEMORY_DIR="${SENTENCE_MEMORY_DIR:-}"
+STAGE_SENTENCE_MEMORY="${STAGE_SENTENCE_MEMORY:-0}"
+LOCAL_SENTENCE_MEMORY_DIR=""
 
 export PATH="$PYTHON_ENV/bin:$PATH"
 export PYTHONNOUSERSITE=1
@@ -53,7 +57,8 @@ fi
 if [[ -d "$CHECKPOINT" ]]; then
   CHECKPOINT_DIR="$CHECKPOINT"
   CHECKPOINT=""
-  for CANDIDATE in best.pt best_infeasible.pt last.pt; do
+  # An infeasible checkpoint is diagnostic evidence, never a promoted model.
+  for CANDIDATE in best.pt last.pt; do
     if [[ -f "$CHECKPOINT_DIR/$CANDIDATE" ]]; then
       CHECKPOINT="$CHECKPOINT_DIR/$CANDIDATE"
       break
@@ -75,6 +80,44 @@ if [[ -n "${SLURM_JOB_ID:-}" ]]; then
   if [[ -n "${SLURM_NTASKS:-}" ]]; then export WORLD_SIZE="$SLURM_NTASKS"; fi
 fi
 
+cleanup_sentence_memory() {
+  local exit_code=$?
+  trap - EXIT
+  if [[ -n "$LOCAL_SENTENCE_MEMORY_DIR" ]]; then
+    srun --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 \
+      bash "$PROJECT_DIR/scripts/NIAF/stage_sentence_memory_node.sh" \
+      cleanup "$LOCAL_SENTENCE_MEMORY_DIR" || true
+  fi
+  exit "$exit_code"
+}
+trap cleanup_sentence_memory EXIT
+
+case "$STAGE_SENTENCE_MEMORY" in
+  0|1) ;;
+  *)
+    echo "ERROR: STAGE_SENTENCE_MEMORY must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
+if [[ "$STAGE_SENTENCE_MEMORY" == "1" ]]; then
+  if [[ -z "${SLURM_JOB_ID:-}" || -z "$SENTENCE_MEMORY_DIR" ]]; then
+    echo "ERROR: staging requires Slurm and SENTENCE_MEMORY_DIR" >&2
+    exit 1
+  fi
+  LOCAL_SENTENCE_MEMORY_DIR="/tmp/signtraj_sentence_memory_${SLURM_JOB_ID}"
+  srun --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 \
+    bash "$PROJECT_DIR/scripts/NIAF/stage_sentence_memory_node.sh" \
+    stage "$LOCAL_SENTENCE_MEMORY_DIR" "$SENTENCE_MEMORY_DIR" \
+    "$PROJECT_DIR" "$PYTHON_BIN" "$CFG" "train $SPLIT"
+  export SIGNTRAJ_SENTENCE_MEMORY_DIR="$LOCAL_SENTENCE_MEMORY_DIR"
+elif [[ -n "$SENTENCE_MEMORY_DIR" ]]; then
+  if [[ ! -d "$SENTENCE_MEMORY_DIR" || ! -f "$SENTENCE_MEMORY_DIR/READY" ]]; then
+    echo "ERROR: SENTENCE_MEMORY_DIR is not a ready bank: $SENTENCE_MEMORY_DIR" >&2
+    exit 1
+  fi
+  export SIGNTRAJ_SENTENCE_MEMORY_DIR="$SENTENCE_MEMORY_DIR"
+fi
+
 mkdir -p "$PROJECT_DIR/logs/sbatch" "$(dirname "$OUT_JSON")"
 cd "$PROJECT_DIR"
 
@@ -90,6 +133,7 @@ CMD=(
   --max_batches "$MAX_BATCHES"
   --scaffold_mode "$SCAFFOLD_MODE"
   --word_prior "$WORD_PRIOR"
+  --sentence_memory "$SENTENCE_MEMORY"
   --device "$DEVICE"
   --text_device "$TEXT_DEVICE"
   --distributed ddp
@@ -103,6 +147,8 @@ echo "Checkpoint: $CHECKPOINT"
 echo "Split: $SPLIT batch_per_rank=$BATCH_SIZE limit=$LIMIT max_batches=$MAX_BATCHES"
 echo "Scaffold mode: $SCAFFOLD_MODE"
 echo "Word prior: $WORD_PRIOR"
+echo "Sentence memory: $SENTENCE_MEMORY"
+echo "Sentence-memory bank: ${SIGNTRAJ_SENTENCE_MEMORY_DIR:-config value} staged=$STAGE_SENTENCE_MEMORY"
 echo "Output: $OUT_JSON"
 printf 'Command:'
 printf ' %q' "${CMD[@]}"

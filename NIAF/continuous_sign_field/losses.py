@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 from flow.smplx_features import COMPACT6D_EXPRESSION, feature_weight_vector
 from NIAF.oracle_smplx_field.geometry.rotation import geodesic_loss
@@ -323,8 +322,8 @@ def fk_temporal_regularization_losses(
     return total, losses
 
 
-def hand_path_length_loss(pred_parts, target_parts, lengths):
-    losses = []
+def hand_path_length_losses(pred_parts, target_parts, lengths):
+    losses = {"lhand": [], "rhand": []}
     for idx, length in enumerate(lengths.detach().cpu().tolist()):
         length = int(length)
         if length <= 1:
@@ -335,10 +334,17 @@ def hand_path_length_loss(pred_parts, target_parts, lengths):
             pred_path = torch.linalg.norm(pred[1:] - pred[:-1], dim=-1).sum()
             target_path = torch.linalg.norm(target[1:] - target[:-1], dim=-1).sum()
             ratio = pred_path / target_path.clamp_min(1e-6)
-            losses.append(torch.abs(ratio - 1.0))
-    if not losses:
-        return target_parts["wholebody"].new_tensor(0.0)
-    return torch.stack(losses).mean()
+            losses[key].append(torch.abs(ratio - 1.0))
+    zero = target_parts["wholebody"].new_tensor(0.0)
+    return {
+        key: torch.stack(values).mean() if values else zero
+        for key, values in losses.items()
+    }
+
+
+def hand_path_length_loss(pred_parts, target_parts, lengths):
+    by_hand = hand_path_length_losses(pred_parts, target_parts, lengths)
+    return torch.stack([by_hand["lhand"], by_hand["rhand"]]).mean()
 
 
 def endpoint_losses(
@@ -450,7 +456,14 @@ def endpoint_losses(
                 )
                 total = total + float(weights["lambda_acc"]) * losses["loss_acc"]
             if weights.get("lambda_path", 0.0) > 0:
-                losses["loss_path"] = hand_path_length_loss(pred_padded, target_padded, lengths)
+                path_by_hand = hand_path_length_losses(
+                    pred_padded, target_padded, lengths
+                )
+                losses["loss_path_lhand"] = path_by_hand["lhand"]
+                losses["loss_path_rhand"] = path_by_hand["rhand"]
+                losses["loss_path"] = torch.stack(
+                    [path_by_hand["lhand"], path_by_hand["rhand"]]
+                ).mean()
                 total = total + float(weights["lambda_path"]) * losses["loss_path"]
 
     losses["loss_endpoint"] = total

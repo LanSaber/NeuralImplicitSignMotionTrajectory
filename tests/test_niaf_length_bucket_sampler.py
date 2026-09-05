@@ -1,6 +1,9 @@
 from collections import Counter
 
-from NIAF.continuous_sign_field.data import LengthBucketDistributedSampler
+from NIAF.continuous_sign_field.data import (
+    ExactDistributedEvalSampler,
+    LengthBucketDistributedSampler,
+)
 
 
 def _rank_batches(sampler, batch_size):
@@ -59,3 +62,26 @@ def test_length_bucket_sampler_changes_batch_order_by_epoch_deterministically():
     sampler.set_epoch(1)
     epoch_one = list(iter(sampler))
     assert epoch_one != epoch_zero
+
+
+def test_exact_distributed_eval_sampler_never_pads_or_duplicates():
+    lengths = [91, 40, 73, 55, 120, 64, 88, 47, 102, 59, 80]
+    samplers = [
+        ExactDistributedEvalSampler(
+            lengths,
+            num_replicas=4,
+            rank=rank,
+            sort_by_length=True,
+        )
+        for rank in range(4)
+    ]
+    shards = [list(sampler) for sampler in samplers]
+    flattened = [index for shard in shards for index in shard]
+
+    assert sorted(flattened) == list(range(len(lengths)))
+    assert len(flattened) == len(set(flattened)) == len(lengths)
+    assert sorted(len(shard) for shard in shards) == [2, 3, 3, 3]
+    for shard in shards:
+        assert [lengths[index] for index in shard] == sorted(
+            lengths[index] for index in shard
+        )

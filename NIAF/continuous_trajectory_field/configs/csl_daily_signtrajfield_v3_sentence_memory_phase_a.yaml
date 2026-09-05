@@ -1,0 +1,91 @@
+_base_: csl_daily_signtrajfield_v2_mt5_text_only_full.yaml
+
+experiment_name: csl_daily_signtrajfield_v3_sentence_memory_phase_a
+
+# Phase A adds sentence-level latent retrieval to the frozen, validated v2
+# text-only model. The inherited word-prior branch remains available in the
+# contract, but is deliberately disabled for this controlled experiment.
+model:
+  type: sentence_memory_continuous_trajectory_field
+
+sentence_memory:
+  enabled: true
+  bank_dir: /media/cvpr/haomian/data/SOKE_FLOW/csl_daily_upper_smplx/meta/niaf_sentence_memory/mt5_vae_mu_train_v1
+  codec_checkpoint: experiments/flow/VAE/csl_daily_rot6d_vae_jerk_b16x4_online/checkpoints/best.pt
+  local_bank_env: SIGNTRAJ_SENTENCE_MEMORY_DIR
+  motion_dim: 256
+  key_dim: 768
+  attention_layers: 2
+  attention_heads: 8
+  score_temperature: 0.10
+  duration_weight: 0.10
+  retrieval_prior_scale: 1.0
+  gate_initial_bias: -2.2
+  k: 8
+  top_m: 64
+  sampling: weighted
+  sampling_temperature: 0.07
+  candidate_dropout_probability: 0.10
+  seed: 1234
+  verify_artifact_hashes: true
+  filter:
+    exclude_self: true
+    exclude_same_source: true
+    exclude_same_group: true
+    exclude_exact_text_train: true
+    exclude_exact_text_eval: false
+
+conditioning:
+  word_prior_train_mode: "off"
+  word_prior_dropout_probability: 1.0
+  sentence_memory_train_mode: "on"
+  sentence_memory_dropout_probability: 0.0
+
+sentence_memory_safety:
+  enabled: true
+  nonregression_margin: 0.0
+  shuffle_probability: 0.25
+  shuffle_huber_beta: 0.10
+  # Phase B can selectively unfreeze base prefixes and distill its memory-off
+  # output against an explicit frozen v2 teacher. It is disabled in Phase A.
+  phase_b:
+    enabled: false
+    teacher_checkpoint: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v2_mt5_text_only_full/checkpoints/best.pt
+    huber_beta: 0.10
+
+objective:
+  lambda_sentence_safe: 1.0
+  lambda_sentence_shuffle: 1.0
+  lambda_sentence_sparsity: 0.0001
+  lambda_sentence_off_distill: 1.0
+
+train:
+  base_checkpoint: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v2_mt5_text_only_full/checkpoints/best.pt
+  freeze_base: true
+  unfreeze_base_prefixes: []
+  sentence_memory_lr: 0.0001
+  epochs: 10
+  val_every: 1
+  save_every: 1
+
+eval:
+  word_prior_modes:
+    - "off"
+  sentence_memory_word_prior_mode: "off"
+  sentence_memory_modes:
+    - "off"
+    - "on"
+    - "shuffled"
+  export_sentence_memory_mode: "on"
+
+selection:
+  require_sentence_memory_improvement: true
+  sentence_memory_min_relative_improvement: 0.001
+  require_sentence_memory_outperform_shuffled: true
+  sentence_memory_min_relative_improvement_over_shuffled: 0.001
+  require_hand_path_nonregression: true
+  hand_path_max_relative_degradation: 0.02
+  keep_validation_checkpoints: true
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a

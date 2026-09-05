@@ -5,7 +5,7 @@ runs. Read it before answering an unqualified question such as "What is the
 current training progress?" The scheduler and logs remain the source of truth
 for live state; this registry determines **which run** the question refers to.
 
-Last observed: **2026-08-10 15:07 Asia/Dubai (UTC+04:00)**
+Last observed: **2026-09-05 23:52 Asia/Dubai (UTC+04:00)**
 
 ## Default run resolution
 
@@ -19,6 +19,46 @@ has the highest Slurm job ID or is already in the `RUNNING` state.
 Dataset-qualified requests override that default: "the How2Sign training"
 refers to `how2sign-signtrajfield-v2-full-20260807`, and "the CSL-Daily
 training" refers to `csl-daily-signtrajfield-v2-full-20260807`.
+
+## Active prerequisite artifact jobs (not training)
+
+### CSL-Daily SignTrajField-RAG train-only sentence bank
+
+| Field | Value |
+|---|---|
+| Artifact alias | `csl-daily-signtrajfield-rag-bank-mt5-vae-mu-train-v1-20260905` |
+| Run class | Offline preprocessing artifact; **not** a model-training run and does not change `DEFAULT_RUN_ALIAS` |
+| Dataset | CSL-Daily train split only: 18,399 items and 6,578 normalized-text semantic groups |
+| Build job | Slurm `142705`, name `csl_rag_bank` (`COMPLETED`, exit code 0, runtime 1:44:23, node 19) |
+| Superseded launches | Slurm `142700` exited before Python because the original inline `/bin/sh` wrapper did not support `pipefail`; Slurm `142701` was cancelled before data creation so exact dirty-worktree source hashes could be added to bank provenance. Neither created target files |
+| Launcher | `scripts/NIAF/build_sentence_motion_bank_sbatch.sh` |
+| Configuration | `NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v3_sentence_memory_phase_a.yaml` |
+| Target | `/media/cvpr/haomian/data/SOKE_FLOW/csl_daily_upper_smplx/meta/niaf_sentence_memory/mt5_vae_mu_train_v1` |
+| Motion codec | Deterministic `mu` from `experiments/flow/VAE/csl_daily_rot6d_vae_jerk_b16x4_online/checkpoints/best.pt`; rot6d, latent dimension 256, temporal downsampling 4 |
+| Text keys | Frozen `deps/mt5-base`, masked-mean pooled and L2-normalized sentence-text keys |
+| Build settings | Batch 64, 8 spawn-context data workers, CUDA VAE and text encoder; no row limit and no overwrite |
+| Allocation | 1 Spark node (`ADUAED21038WKLX19`), 1 GPU, 8 CPUs, 32 GiB, six-hour limit |
+| W&B | Disabled/not applicable |
+| Result | Complete 243 MiB bank: 18,399 items, 6,578 semantic groups, 430,364 ragged VAE tokens (`float16`, 256-D), bank ID `a65661333c0f60aa65dc68d896f439a698e37832f04bb8834a378a2d5f068bcd` |
+| Success contract | Satisfied: `bank.json` and `build_summary.json` passed the builder's content validation and `READY` was written last |
+| Independent verification | CPU-only Slurm `142732` on node 19; strict `--verify_only --verify_hashes` completed with exit code 0 and reported `valid: true`, the same bank ID, and 18,399 rows |
+| Follow-up | Build and audit full top-64 train/validation/test neighbor tables before retrieval training |
+
+Logs:
+
+```text
+logs/sbatch/csl_rag_bank_142705.out
+logs/sbatch/csl_rag_bank_142705.err
+```
+
+Live tracing commands:
+
+```bash
+squeue -j 142705 -o '%.18i %.28j %.2t %.12M %.12l %.4D %R'
+scontrol show job 142705
+tail -F logs/sbatch/csl_rag_bank_142705.out
+tail -F logs/sbatch/csl_rag_bank_142705.err
+```
 
 ## Default: full PHOENIX-2014T SignTrajField-v2 training
 

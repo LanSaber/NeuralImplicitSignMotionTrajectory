@@ -235,6 +235,7 @@ def main():
             "body": list(UPPER_BODY_JOINTS),
             "lhand": "mGPT orig_hand_regressor left layout, 21 keypoints",
             "rhand": "mGPT orig_hand_regressor right layout, 21 keypoints",
+            "face": "68 SMPL-X static/dynamic facial landmarks",
             "wholebody": "upper_body + lhand + rhand, 54 keypoints",
         },
         "definition": (

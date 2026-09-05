@@ -5,6 +5,7 @@ omegaconf
 shortuuid
 chumpy
 transformers
+sentencepiece
 diffusers
 einops
 wandb

@@ -1,0 +1,19 @@
+_base_: csl_daily_signtrajfield_v2_full.yaml
+
+experiment_name: csl_daily_signtrajfield_v2_mt5_text_only_full
+
+# Controlled CSL-Daily ablation: the word-retrieval provider is never
+# initialized, and every train/validation sample is conditioned only on mT5.
+text:
+  model_path: deps/mt5-base
+
+conditioning:
+  word_prior_train_mode: "off"
+  word_prior_dropout_probability: 1.0
+
+eval:
+  word_prior_modes:
+    - "off"
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v2_mt5_text_only_full

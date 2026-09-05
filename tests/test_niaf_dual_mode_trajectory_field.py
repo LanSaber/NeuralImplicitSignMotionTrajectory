@@ -20,8 +20,11 @@ from NIAF.continuous_trajectory_field.models import (
 from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field import (
     _word_prior_availability,
     checkpoint_selection_diagnostics,
+    configured_word_prior_eval_modes,
+    configured_word_prior_train_mode,
     evaluate_configured_modes,
     memory_microbatch_size,
+    requires_scaffold_provider,
     synchronized_memory_microbatch_size,
     validate_checkpoint_contract,
     wandb_train_batch_payload,
@@ -207,6 +210,31 @@ def test_word_prior_dropout_handles_both_deterministic_endpoints():
     ).all()
 
 
+def test_word_prior_modes_preserve_legacy_defaults_and_support_pure_text():
+    legacy = {"model": {"type": "dual_mode_continuous_trajectory_field"}}
+    assert configured_word_prior_train_mode(legacy) == "dropout"
+    assert configured_word_prior_eval_modes(legacy) == ("off", "on")
+    assert requires_scaffold_provider(legacy)
+
+    pure_text = {
+        "model": {"type": "dual_mode_continuous_trajectory_field"},
+        "conditioning": {"word_prior_train_mode": "off"},
+        "eval": {"word_prior_modes": ["off"]},
+    }
+    assert configured_word_prior_train_mode(pure_text) == "off"
+    assert configured_word_prior_eval_modes(pure_text) == ("off",)
+    assert not requires_scaffold_provider(pure_text)
+
+
+def test_word_prior_modes_reject_stochastic_validation():
+    cfg = {
+        "model": {"type": "dual_mode_continuous_trajectory_field"},
+        "eval": {"word_prior_modes": ["dropout"]},
+    }
+    with pytest.raises(ValueError, match="deterministic"):
+        configured_word_prior_eval_modes(cfg)
+
+
 def test_coarse_auxiliary_is_supervised_against_ground_truth():
     model = _dual_model().eval()
     text, text_mask, _context, _context_mask, _features, query = _dual_inputs()
@@ -249,6 +277,27 @@ def test_dual_checkpoint_selection_is_text_led_with_two_percent_gate():
     assert details["rejection_reasons"]
 
 
+@pytest.mark.parametrize(
+    ("namespace", "expected_source"),
+    (("text_only", "text_only"), ("word_prior", "word_prior")),
+)
+def test_dual_checkpoint_selection_supports_one_configured_mode(
+    namespace, expected_source
+):
+    cfg = {
+        "model": {"type": "dual_mode_continuous_trajectory_field"},
+        "selection": {"weights": {"pred_loss_endpoint": 1.0}},
+    }
+    metrics = {f"{namespace}/pred_loss_endpoint": 2.5}
+    score, violation, feasible, details = checkpoint_selection_diagnostics(
+        metrics, cfg, return_details=True
+    )
+    assert score == 2.5
+    assert violation == 0.0
+    assert feasible
+    assert details["dual_mode"]["selection_source"] == expected_source
+
+
 def test_v2_checkpoint_contract_cannot_load_v1_identity():
     cfg = {"model": {"type": "dual_mode_continuous_trajectory_field"}}
     validate_checkpoint_contract(
@@ -263,6 +312,22 @@ def test_v2_checkpoint_contract_cannot_load_v1_identity():
             {
                 "model_type": "continuous_trajectory_field",
                 "trajectory_contract_version": 1,
+            },
+            cfg,
+        )
+
+
+def test_checkpoint_contract_rejects_different_text_encoder():
+    cfg = {
+        "model": {"type": "dual_mode_continuous_trajectory_field"},
+        "text": {"model_path": "deps/mt5-base"},
+    }
+    with pytest.raises(RuntimeError, match="semantically incompatible"):
+        validate_checkpoint_contract(
+            {
+                "model_type": "dual_mode_continuous_trajectory_field",
+                "trajectory_contract_version": 2,
+                "config": {"text": {"model_path": "deps/flan-t5-base"}},
             },
             cfg,
         )
@@ -317,6 +382,25 @@ def test_v2_configs_resolve_the_approved_contract():
         assert cfg["selection"]["word_prior_max_relative_degradation"] == 0.02
 
 
+def test_csl_mt5_ablation_configs_are_matched_except_for_prior_mode():
+    config_root = Path("NIAF/continuous_trajectory_field/configs")
+    text_only = load_config(
+        config_root / "csl_daily_signtrajfield_v2_mt5_text_only_full.yaml"
+    )
+    word_prior = load_config(
+        config_root / "csl_daily_signtrajfield_v2_mt5_word_prior_full.yaml"
+    )
+
+    assert text_only["text"]["model_path"] == "deps/mt5-base"
+    assert word_prior["text"]["model_path"] == "deps/mt5-base"
+    assert text_only["conditioning"]["word_prior_train_mode"] == "off"
+    assert word_prior["conditioning"]["word_prior_train_mode"] == "dropout"
+    assert text_only["eval"]["word_prior_modes"] == ["off"]
+    assert word_prior["eval"]["word_prior_modes"] == ["off", "on"]
+    assert not requires_scaffold_provider(text_only)
+    assert requires_scaffold_provider(word_prior)
+
+
 def test_dual_validation_runs_off_and_on_with_separate_namespaces():
     cfg = {"model": {"type": "dual_mode_continuous_trajectory_field"}}
     with patch(
@@ -346,3 +430,29 @@ def test_dual_validation_runs_off_and_on_with_separate_namespaces():
     assert [
         call.kwargs["word_prior_mode"] for call in evaluate_mock.call_args_list
     ] == ["off", "on"]
+
+
+def test_dual_validation_runs_only_the_configured_text_mode():
+    cfg = {
+        "model": {"type": "dual_mode_continuous_trajectory_field"},
+        "eval": {"word_prior_modes": ["off"]},
+    }
+    with patch(
+        "NIAF.continuous_trajectory_field.scripts."
+        "train_continuous_trajectory_field.evaluate",
+        return_value={"pred_loss_endpoint": 2.0},
+    ) as evaluate_mock:
+        metrics = evaluate_configured_modes(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            cfg,
+            torch.device("cpu"),
+            show_progress=False,
+        )
+
+    assert metrics == {"text_only/pred_loss_endpoint": 2.0}
+    assert evaluate_mock.call_args.kwargs["word_prior_mode"] == "off"

@@ -30,6 +30,7 @@ from flow.text_encoder import FrozenT5TextEncoder
 from NIAF.continuous_sign_field.config import load_config
 from NIAF.continuous_sign_field.data import (
     ContinuousSignDataset,
+    ExactDistributedEvalSampler,
     LengthBucketDistributedSampler,
     collate_continuous_sign,
     denormalize_motion,
@@ -116,7 +117,16 @@ def make_loader(
         train_cfg.get(batch_size_key, train_cfg.get("batch_size", 2))
     )
     drop_last = bool(shuffle and train_cfg.get("drop_last", False))
-    if bool(train_cfg.get("length_bucketed_batches", False)):
+    length_bucketed = bool(train_cfg.get("length_bucketed_batches", False))
+    if distributed and not shuffle:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        sampler = ExactDistributedEvalSampler(
+            dataset.estimated_lengths,
+            num_replicas=int(world_size),
+            rank=rank,
+            sort_by_length=length_bucketed,
+        )
+    elif length_bucketed:
         replicas = int(world_size) if distributed else 1
         rank = dist.get_rank() if distributed and dist.is_initialized() else 0
         sampler = LengthBucketDistributedSampler(

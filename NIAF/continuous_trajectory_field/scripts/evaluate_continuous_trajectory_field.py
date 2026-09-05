@@ -9,7 +9,6 @@ import torch
 from flow.distributed import (
     barrier,
     cleanup_distributed,
-    distributed_mean_scalars,
     rank_zero_print,
     resolve_device as resolve_distributed_device,
     setup_distributed,
@@ -23,13 +22,22 @@ from NIAF.continuous_sign_field.scripts.train_residual_flow import (
 )
 from NIAF.continuous_trajectory_field.models import build_continuous_trajectory_field
 from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field import (
+    build_sentence_memory_provider,
     checkpoint_selection_diagnostics,
+    configured_sentence_memory_eval_modes,
+    distributed_sample_weighted_mean_scalars,
     evaluate,
     evaluate_configured_modes,
+    evaluated_loader_sample_count,
     is_dual_mode,
+    is_sentence_memory_model,
+    sentence_memory_enabled,
+    sentence_memory_provider_required,
     selection_diagnostics,
     set_seed,
+    set_sentence_memory_provider_epoch_from_checkpoint,
     validate_checkpoint_contract,
+    validate_sentence_memory_checkpoint_identity,
 )
 from NIAF.retrieval_confidence_field.scripts.train_retrieval_adaptive_field import (
     validate_train_only_retrieval_bank,
@@ -64,6 +72,16 @@ def parse_args():
         help=(
             "For v2, evaluate text-only (off), prior-enabled (on), or both. "
             "auto means both for v2 and the original path for v1."
+        ),
+    )
+    parser.add_argument(
+        "--sentence_memory",
+        dest="sentence_memory_mode",
+        default="auto",
+        choices=("auto", "off", "on", "both", "shuffled"),
+        help=(
+            "For v3, evaluate configured modes (auto), off, on, off+on "
+            "(both), or the deterministic shuffled-memory control."
         ),
     )
     parser.add_argument("--device", default=None)
@@ -119,12 +137,52 @@ def main():
         text_device = torch.device(cfg.get("text", {}).get("device", "cpu"))
         data_cfg = cfg.get("data", {})
         dual_mode = is_dual_mode(cfg)
+        sentence_memory_model = is_sentence_memory_model(cfg)
         if not dual_mode and args.word_prior_mode != "auto":
             raise ValueError("--word_prior is available only for dual-mode v2")
-        resolved_word_prior_mode = (
-            "both" if dual_mode and args.word_prior_mode == "auto"
-            else args.word_prior_mode
-        )
+        if not sentence_memory_model and args.sentence_memory_mode != "auto":
+            raise ValueError(
+                "--sentence_memory is available only for the v3 sentence-memory model"
+            )
+        if sentence_memory_model:
+            memory_enabled = sentence_memory_enabled(cfg)
+            resolved_word_prior_mode = (
+                str(
+                    cfg.get("eval", {}).get(
+                        "sentence_memory_word_prior_mode", "off"
+                    )
+                ).lower()
+                if args.word_prior_mode == "auto"
+                else args.word_prior_mode
+            )
+            if resolved_word_prior_mode not in {"off", "on"}:
+                raise ValueError(
+                    "v3 evaluation uses one fixed --word_prior mode ('off' or 'on')"
+                )
+            resolved_sentence_memory_mode = (
+                args.sentence_memory_mode if memory_enabled else "off"
+            )
+            if memory_enabled and resolved_sentence_memory_mode == "both":
+                cfg.setdefault("eval", {})["sentence_memory_modes"] = ["off", "on"]
+            cfg.setdefault("eval", {})[
+                "sentence_memory_word_prior_mode"
+            ] = resolved_word_prior_mode
+            sentence_modes = (
+                ("off",)
+                if not memory_enabled
+                else (
+                    configured_sentence_memory_eval_modes(cfg)
+                    if resolved_sentence_memory_mode in {"auto", "both"}
+                    else (resolved_sentence_memory_mode,)
+                )
+            )
+        else:
+            resolved_word_prior_mode = (
+                "both" if dual_mode and args.word_prior_mode == "auto"
+                else args.word_prior_mode
+            )
+            resolved_sentence_memory_mode = "not_applicable"
+            sentence_modes = ()
         needs_provider = not dual_mode or resolved_word_prior_mode in {"on", "both"}
         train_dataset = None
         if needs_provider:
@@ -159,6 +217,17 @@ def main():
         provider = (
             ScaffoldProvider(cfg, train_dataset, device) if needs_provider else None
         )
+        sentence_memory_provider = (
+            build_sentence_memory_provider(cfg, text_encoder, dataset=eval_dataset)
+            if sentence_memory_model
+            and sentence_memory_provider_required(sentence_modes)
+            else None
+        )
+        if sentence_memory_provider is not None:
+            sentence_memory_provider.validate_query_dataset(
+                eval_dataset,
+                require_neighbors=any(mode != "off" for mode in sentence_modes),
+            )
         retrieval_bank = (
             validate_train_only_retrieval_bank(cfg, provider)
             if provider is not None
@@ -169,15 +238,40 @@ def main():
         ).to(device)
         checkpoint = torch.load(args.checkpoint, map_location="cpu")
         validate_checkpoint_contract(checkpoint, cfg, source=str(args.checkpoint))
+        validate_sentence_memory_checkpoint_identity(
+            checkpoint,
+            sentence_memory_provider,
+            source=str(args.checkpoint),
+            cfg=cfg,
+            text_encoder_identity=(
+                text_encoder.checkpoint_identity()
+                if hasattr(text_encoder, "checkpoint_identity")
+                else None
+            ),
+        )
         model.load_state_dict(checkpoint["model"], strict=True)
         model.eval()
         fk = build_fk(cfg, device)
 
-        checkpoint_epoch = int(checkpoint.get("epoch", 0))
-        evaluate_both = dual_mode and resolved_word_prior_mode == "both"
+        checkpoint_epoch = set_sentence_memory_provider_epoch_from_checkpoint(
+            sentence_memory_provider, checkpoint
+        )
+        evaluate_both = (
+            sentence_memory_model
+            and resolved_sentence_memory_mode in {"auto", "both"}
+        ) or (
+            not sentence_memory_model
+            and dual_mode
+            and resolved_word_prior_mode == "both"
+        )
         evaluation_function = evaluate_configured_modes if evaluate_both else evaluate
         evaluation_kwargs = {}
-        if dual_mode and not evaluate_both:
+        if sentence_memory_model:
+            evaluation_kwargs["sentence_memory_provider"] = sentence_memory_provider
+            if not evaluate_both:
+                evaluation_kwargs["word_prior_mode"] = resolved_word_prior_mode
+                evaluation_kwargs["sentence_memory_mode"] = sentence_modes[0]
+        elif dual_mode and not evaluate_both:
             evaluation_kwargs["word_prior_mode"] = resolved_word_prior_mode
         metrics = evaluation_function(
             model,
@@ -193,7 +287,12 @@ def main():
             show_progress=dist_info["is_main"],
             **evaluation_kwargs,
         )
-        metrics = distributed_mean_scalars(metrics, device, dist_info)
+        metrics = distributed_sample_weighted_mean_scalars(
+            metrics,
+            evaluated_loader_sample_count(eval_loader, args.max_batches),
+            device,
+            dist_info,
+        )
         diagnostics_function = (
             checkpoint_selection_diagnostics if evaluate_both else selection_diagnostics
         )
@@ -214,11 +313,17 @@ def main():
             ),
             "max_batches_per_rank": max(int(args.max_batches), 0),
             "word_prior_mode": resolved_word_prior_mode if dual_mode else "v1_required",
+            "sentence_memory_mode": resolved_sentence_memory_mode,
             "scaffold_mode": str(args.scaffold_mode),
             "scaffold": (
                 provider.config_summary if provider is not None else None
             ),
             "retrieval_bank": retrieval_bank,
+            "sentence_memory": (
+                getattr(sentence_memory_provider, "config_summary", None)
+                if sentence_memory_provider is not None
+                else None
+            ),
             "selection_score": float(score),
             "selection_constraint_violation": float(constraint_violation),
             "selection_feasible": bool(feasible),

@@ -17,6 +17,9 @@ from NIAF.continuous_trajectory_field.models.modulated_siren import (
 from NIAF.continuous_trajectory_field.models.dual_mode_trajectory_hypernetwork import (
     DualModeTrajectoryHypernetwork,
 )
+from NIAF.continuous_trajectory_field.models.sentence_memory_trajectory_hypernetwork import (
+    SentenceMemoryTrajectoryHypernetwork,
+)
 from NIAF.continuous_trajectory_field.models.trajectory_hypernetwork import (
     TrajectoryHypernetwork,
 )
@@ -530,6 +533,159 @@ class DualModeContinuousTrajectoryField(ContinuousTrajectoryField):
         )
 
 
+class SentenceMemoryContinuousTrajectoryField(DualModeContinuousTrajectoryField):
+    """V3 trajectory field with optional top-K sentence-motion memory."""
+
+    model_type = "sentence_memory_continuous_trajectory_field"
+
+    def __init__(
+        self,
+        *args,
+        sentence_motion_dim: int = 256,
+        sentence_key_dim: int | None = None,
+        sentence_attention_layers: int = 2,
+        sentence_attention_heads: int = 8,
+        sentence_score_temperature: float = 0.10,
+        sentence_duration_weight: float = 0.10,
+        sentence_retrieval_prior_scale: float = 1.0,
+        sentence_gate_initial_bias: float = -2.2,
+        **kwargs,
+    ):
+        # Build v2 first and copy its state into the extended hypernetwork. This
+        # keeps all inherited state-dict names and makes a disabled v3 memory
+        # branch execute the exact v2 path.
+        super().__init__(*args, **kwargs)
+        legacy = self.hypernetwork
+        duration_head = legacy.duration_head
+        extended = SentenceMemoryTrajectoryHypernetwork(
+            text_dim=legacy.text_dim,
+            pose_dim=legacy.pose_dim,
+            retrieval_dim=legacy.retrieval_dim,
+            context_hidden_dim=legacy.context_hidden_dim,
+            context_layers=len(legacy.word_encoder.context_blocks),
+            field_hidden_dim=legacy.field_hidden_dim,
+            field_depth=legacy.field_depth,
+            residual_dim=legacy.residual_dim,
+            max_local_fields=legacy.max_local_fields,
+            frames_per_local_field=legacy.frames_per_local_field,
+            minimum_local_width=legacy.minimum_local_width,
+            maximum_local_width=legacy.maximum_local_width,
+            time_dependent_local_gates=legacy.time_dependent_local_gates,
+            temporal_slot_count=legacy.temporal_slot_count,
+            temporal_slot_layers=len(legacy.text_planner.decoder.layers),
+            temporal_slot_heads=legacy.text_planner.decoder.layers[0].self_attn.num_heads,
+            context_fps=legacy.context_fps,
+            initial_duration_seconds=float(
+                duration_head.net[-1].bias.detach().exp().mean().item()
+            ),
+            minimum_duration_seconds=duration_head.minimum_seconds,
+            maximum_duration_seconds=duration_head.maximum_seconds,
+            dropout=float(legacy.global_context[3].p),
+            sentence_motion_dim=int(sentence_motion_dim),
+            sentence_key_dim=sentence_key_dim,
+            sentence_attention_layers=int(sentence_attention_layers),
+            sentence_attention_heads=int(sentence_attention_heads),
+            sentence_score_temperature=float(sentence_score_temperature),
+            sentence_duration_weight=float(sentence_duration_weight),
+            sentence_retrieval_prior_scale=float(sentence_retrieval_prior_scale),
+            sentence_gate_initial_bias=float(sentence_gate_initial_bias),
+        )
+        incompatible = extended.load_state_dict(legacy.state_dict(), strict=False)
+        if incompatible.unexpected_keys or any(
+            not name.startswith("sentence_memory_") for name in incompatible.missing_keys
+        ):
+            raise RuntimeError(
+                "Internal v2-to-v3 hypernetwork migration failed: "
+                f"missing={incompatible.missing_keys}, "
+                f"unexpected={incompatible.unexpected_keys}"
+            )
+        self.hypernetwork = extended
+
+    def encode_trajectory(
+        self,
+        text_tokens: torch.Tensor,
+        text_mask: torch.Tensor | None = None,
+        *,
+        word_prior_context: torch.Tensor | None = None,
+        word_prior_mask: torch.Tensor | None = None,
+        word_prior_features: torch.Tensor | None = None,
+        word_prior_available: torch.Tensor | None = None,
+        sentence_motion_tokens: torch.Tensor | None = None,
+        sentence_motion_mask: torch.Tensor | None = None,
+        sentence_motion_tau: torch.Tensor | None = None,
+        sentence_text_keys: torch.Tensor | None = None,
+        sentence_scores: torch.Tensor | None = None,
+        sentence_durations: torch.Tensor | None = None,
+        sentence_candidate_mask: torch.Tensor | None = None,
+        sentence_part_validity: torch.Tensor | None = None,
+        sentence_memory_available: torch.Tensor | None = None,
+    ) -> TrajectoryInstance:
+        return self.hypernetwork(
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            word_prior_context=word_prior_context,
+            word_prior_mask=word_prior_mask,
+            word_prior_features=word_prior_features,
+            word_prior_available=word_prior_available,
+            sentence_motion_tokens=sentence_motion_tokens,
+            sentence_motion_mask=sentence_motion_mask,
+            sentence_motion_tau=sentence_motion_tau,
+            sentence_text_keys=sentence_text_keys,
+            sentence_scores=sentence_scores,
+            sentence_durations=sentence_durations,
+            sentence_candidate_mask=sentence_candidate_mask,
+            sentence_part_validity=sentence_part_validity,
+            sentence_memory_available=sentence_memory_available,
+        )
+
+    def forward(
+        self,
+        text_tokens: torch.Tensor,
+        query_times: torch.Tensor,
+        text_mask: torch.Tensor | None = None,
+        time_domain: str = "normalized",
+        query_mask: torch.Tensor | None = None,
+        *,
+        word_prior_context: torch.Tensor | None = None,
+        word_prior_mask: torch.Tensor | None = None,
+        word_prior_features: torch.Tensor | None = None,
+        word_prior_available: torch.Tensor | None = None,
+        sentence_motion_tokens: torch.Tensor | None = None,
+        sentence_motion_mask: torch.Tensor | None = None,
+        sentence_motion_tau: torch.Tensor | None = None,
+        sentence_text_keys: torch.Tensor | None = None,
+        sentence_scores: torch.Tensor | None = None,
+        sentence_durations: torch.Tensor | None = None,
+        sentence_candidate_mask: torch.Tensor | None = None,
+        sentence_part_validity: torch.Tensor | None = None,
+        sentence_memory_available: torch.Tensor | None = None,
+    ):
+        trajectory = self.encode_trajectory(
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            word_prior_context=word_prior_context,
+            word_prior_mask=word_prior_mask,
+            word_prior_features=word_prior_features,
+            word_prior_available=word_prior_available,
+            sentence_motion_tokens=sentence_motion_tokens,
+            sentence_motion_mask=sentence_motion_mask,
+            sentence_motion_tau=sentence_motion_tau,
+            sentence_text_keys=sentence_text_keys,
+            sentence_scores=sentence_scores,
+            sentence_durations=sentence_durations,
+            sentence_candidate_mask=sentence_candidate_mask,
+            sentence_part_validity=sentence_part_validity,
+            sentence_memory_available=sentence_memory_available,
+        )
+        return self.query_trajectory(
+            trajectory,
+            query_times,
+            time_domain=time_domain,
+            query_mask=query_mask,
+            return_details=True,
+        )
+
+
 def build_continuous_trajectory_field(cfg, text_dim: int):
     model_cfg = cfg.get("model", {})
     duration_cfg = cfg.get("duration", {})
@@ -539,6 +695,7 @@ def build_continuous_trajectory_field(cfg, text_dim: int):
     allowed = {
         "continuous_trajectory_field",
         "dual_mode_continuous_trajectory_field",
+        "sentence_memory_continuous_trajectory_field",
     }
     if model_type not in allowed:
         raise ValueError(f"Unsupported continuous trajectory model type {model_type!r}")
@@ -582,7 +739,10 @@ def build_continuous_trajectory_field(cfg, text_dim: int):
         maximum_duration_seconds=float(duration_cfg.get("max_seconds", 20.0)),
         dropout=float(model_cfg.get("dropout", 0.0)),
     )
-    if model_type == "dual_mode_continuous_trajectory_field":
+    if model_type in {
+        "dual_mode_continuous_trajectory_field",
+        "sentence_memory_continuous_trajectory_field",
+    }:
         conditioning_cfg = cfg.get("conditioning", {})
         common.update(
             local_center_mode="uniform",
@@ -592,5 +752,34 @@ def build_continuous_trajectory_field(cfg, text_dim: int):
             temporal_slot_heads=int(conditioning_cfg.get("temporal_slot_heads", 8)),
             context_fps=float(conditioning_cfg.get("context_fps", 20.0)),
         )
+        if model_type == "sentence_memory_continuous_trajectory_field":
+            sentence_cfg = cfg.get("sentence_memory", {})
+            common.update(
+                sentence_motion_dim=int(sentence_cfg.get("motion_dim", 256)),
+                sentence_key_dim=(
+                    int(sentence_cfg["key_dim"])
+                    if sentence_cfg.get("key_dim") is not None
+                    else None
+                ),
+                sentence_attention_layers=int(
+                    sentence_cfg.get("attention_layers", 2)
+                ),
+                sentence_attention_heads=int(
+                    sentence_cfg.get("attention_heads", 8)
+                ),
+                sentence_score_temperature=float(
+                    sentence_cfg.get("score_temperature", 0.10)
+                ),
+                sentence_duration_weight=float(
+                    sentence_cfg.get("duration_weight", 0.10)
+                ),
+                sentence_retrieval_prior_scale=float(
+                    sentence_cfg.get("retrieval_prior_scale", 1.0)
+                ),
+                sentence_gate_initial_bias=float(
+                    sentence_cfg.get("gate_initial_bias", -2.2)
+                ),
+            )
+            return SentenceMemoryContinuousTrajectoryField(**common)
         return DualModeContinuousTrajectoryField(**common)
     return ContinuousTrajectoryField(**common)

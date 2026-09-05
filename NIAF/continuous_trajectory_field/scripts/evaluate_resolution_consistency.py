@@ -27,8 +27,14 @@ from NIAF.continuous_trajectory_field.scripts.export_continuous_trajectory impor
     sampled_lengths,
 )
 from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field import (
+    build_sentence_memory_provider,
     is_dual_mode,
+    is_sentence_memory_model,
+    sentence_memory_enabled,
+    sentence_memory_provider_required,
+    set_sentence_memory_provider_epoch_from_checkpoint,
     validate_checkpoint_contract,
+    validate_sentence_memory_checkpoint_identity,
 )
 
 
@@ -51,6 +57,11 @@ def parse_args():
         "--word_prior",
         default="auto",
         choices=("auto", "off", "on"),
+    )
+    parser.add_argument(
+        "--sentence_memory",
+        default="auto",
+        choices=("auto", "off", "on", "shuffled"),
     )
     parser.add_argument("--sample_fps", type=float, nargs="+", default=[20.0, 40.0, 80.0])
     parser.add_argument("--common_queries", type=int, default=31)
@@ -105,19 +116,57 @@ def main():
     )
     text_encoder = build_text_encoder(cfg, text_device)
     dual_mode = is_dual_mode(cfg)
+    sentence_memory_model = is_sentence_memory_model(cfg)
     if not dual_mode and args.word_prior != "auto":
         raise ValueError("--word_prior is available only for dual-mode v2")
     resolved_word_prior_mode = (
-        "off" if dual_mode and args.word_prior == "auto" else args.word_prior
+        str(cfg.get("eval", {}).get("sentence_memory_word_prior_mode", "off"))
+        if sentence_memory_model and args.word_prior == "auto"
+        else ("off" if dual_mode and args.word_prior == "auto" else args.word_prior)
+    )
+    if not sentence_memory_model and args.sentence_memory != "auto":
+        raise ValueError("--sentence_memory is available only for v3")
+    resolved_sentence_memory_mode = (
+        "off"
+        if sentence_memory_model and not sentence_memory_enabled(cfg)
+        else (
+            str(cfg.get("eval", {}).get("export_sentence_memory_mode", "on"))
+            if sentence_memory_model and args.sentence_memory == "auto"
+            else args.sentence_memory
+        )
     )
     provider = (
         ScaffoldProvider(cfg, dataset, device)
         if not dual_mode or resolved_word_prior_mode == "on"
         else None
     )
+    sentence_memory_provider = (
+        build_sentence_memory_provider(cfg, text_encoder, dataset=dataset)
+        if sentence_memory_model
+        and sentence_memory_provider_required(resolved_sentence_memory_mode)
+        else None
+    )
+    if sentence_memory_provider is not None:
+        sentence_memory_provider.validate_query_dataset(
+            dataset, require_neighbors=False
+        )
     model = build_continuous_trajectory_field(cfg, text_dim=text_encoder.text_dim).to(device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     validate_checkpoint_contract(checkpoint, cfg, source=str(args.checkpoint))
+    validate_sentence_memory_checkpoint_identity(
+        checkpoint,
+        sentence_memory_provider,
+        source=str(args.checkpoint),
+        cfg=cfg,
+        text_encoder_identity=(
+            text_encoder.checkpoint_identity()
+            if hasattr(text_encoder, "checkpoint_identity")
+            else None
+        ),
+    )
+    set_sentence_memory_provider_epoch_from_checkpoint(
+        sentence_memory_provider, checkpoint
+    )
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
 
@@ -136,6 +185,8 @@ def main():
             context_fps=args.context_fps,
             length_mode="predicted",
             word_prior_mode=resolved_word_prior_mode,
+            sentence_memory_provider=sentence_memory_provider,
+            sentence_memory_mode=resolved_sentence_memory_mode,
         )
         trajectory = inference["trajectory"]
         before_digest = trajectory_digest(trajectory)
@@ -206,6 +257,12 @@ def main():
         "manifest": manifest_summary,
         "num_samples": len(rows),
         "sample_fps": [float(value) for value in args.sample_fps],
+        "word_prior_mode": resolved_word_prior_mode if dual_mode else "v1_required",
+        "sentence_memory_mode": (
+            resolved_sentence_memory_mode
+            if sentence_memory_model
+            else "not_applicable"
+        ),
         "tolerance": float(args.tolerance),
         "maximum_shared_time_error": maximum_shared_error,
         "maximum_query_order_error": maximum_order_error,

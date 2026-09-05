@@ -1,0 +1,50 @@
+_base_: csl_daily_signtrajfield_v3_sentence_memory_phase_a.yaml
+
+experiment_name: csl_daily_signtrajfield_v3_sentence_memory_phase_b
+
+# Launch Phase B with --warm_start pointing at the selected Phase-A v3
+# checkpoint. Its model weights are retained while epoch, optimizer, and
+# selection state restart for this distinct training phase.
+train:
+  base_checkpoint: null
+  freeze_base: true
+  unfreeze_base_prefixes:
+    - hypernetwork.global_context.
+    - hypernetwork.coarse_head.
+    - hypernetwork.residual_head.
+    - hypernetwork.gate_head.
+    - hypernetwork.local_context.
+    - hypernetwork.local_head.
+    - hypernetwork.local_gate_head.
+  sentence_memory_lr: 0.0001
+  joint_global_lr: 0.00001
+  joint_local_lr: 0.00001
+  epochs: 10
+
+conditioning:
+  word_prior_train_mode: "off"
+  sentence_memory_train_mode: "dropout"
+  sentence_memory_dropout_probability: 0.25
+
+sentence_memory_safety:
+  enabled: true
+  nonregression_margin: 0.0
+  shuffle_probability: 0.25
+  shuffle_huber_beta: 0.10
+  phase_b:
+    enabled: true
+    # Must be supplied at launch with --phase_b_gate_report (or this field)
+    # and must bind to the exact checkpoint passed through --warm_start.
+    gate_report: null
+    teacher_checkpoint: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v2_mt5_text_only_full/checkpoints/best.pt
+    huber_beta: 0.10
+    text_only_max_relative_degradation: 0.005
+
+objective:
+  lambda_sentence_safe: 1.0
+  lambda_sentence_shuffle: 1.0
+  lambda_sentence_sparsity: 0.0001
+  lambda_sentence_off_distill: 1.0
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_b

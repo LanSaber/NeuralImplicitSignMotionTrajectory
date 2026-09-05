@@ -14,6 +14,36 @@ from flow.smplx_features import resample_array
 PART_KEYS = ("body", "lhand", "rhand", "wholebody")
 
 
+class ExactDistributedEvalSampler(Sampler[int]):
+    """Partition evaluation rows across ranks exactly, without padding copies."""
+
+    def __init__(self, lengths, num_replicas=1, rank=0, sort_by_length=False):
+        self.lengths = tuple(int(value) for value in lengths)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.sort_by_length = bool(sort_by_length)
+        if self.num_replicas <= 0:
+            raise ValueError("num_replicas must be positive.")
+        if not 0 <= self.rank < self.num_replicas:
+            raise ValueError(
+                f"rank must be in [0, {self.num_replicas}), got {self.rank}."
+            )
+
+    def __len__(self):
+        remaining = max(len(self.lengths) - self.rank, 0)
+        return (remaining + self.num_replicas - 1) // self.num_replicas
+
+    def set_epoch(self, epoch):
+        # Evaluation order is deliberately invariant to epoch.
+        del epoch
+
+    def __iter__(self):
+        indices = list(range(len(self.lengths)))
+        if self.sort_by_length:
+            indices.sort(key=self.lengths.__getitem__)
+        return iter(indices[self.rank :: self.num_replicas])
+
+
 class LengthBucketDistributedSampler(Sampler[int]):
     """Build equal-rank batches from neighboring sequence lengths.
 

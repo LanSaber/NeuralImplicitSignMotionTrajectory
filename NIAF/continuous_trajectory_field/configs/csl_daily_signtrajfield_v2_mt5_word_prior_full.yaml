@@ -1,0 +1,20 @@
+_base_: csl_daily_signtrajfield_v2_full.yaml
+
+experiment_name: csl_daily_signtrajfield_v2_mt5_word_prior_full
+
+# Matched CSL-Daily control: the established v2 protocol exposes half of the
+# training samples to the cached, training-only word-retrieval prior.
+text:
+  model_path: deps/mt5-base
+
+conditioning:
+  word_prior_train_mode: dropout
+  word_prior_dropout_probability: 0.5
+
+eval:
+  word_prior_modes:
+    - "off"
+    - "on"
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v2_mt5_word_prior_full

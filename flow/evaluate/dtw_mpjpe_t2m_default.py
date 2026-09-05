@@ -60,7 +60,8 @@ RIGHT_HAND_LAYOUT = (
     ("joint", 48),
     ("vertex", 8022),
 )
-PARTS = ("body", "lhand", "rhand", "wholebody")
+FACE_LANDMARK_COUNT = 68
+PARTS = ("body", "lhand", "rhand", "face", "wholebody")
 
 
 def parse_args():
@@ -197,9 +198,20 @@ def normalize_first(points):
     return points - points[:, 0:1, :]
 
 
+def face_landmarks(joints):
+    """Return the 68 SMPL-X facial landmarks appended by the model layer."""
+
+    if joints.ndim != 3 or joints.shape[1] < FACE_LANDMARK_COUNT:
+        raise ValueError(
+            "SMPL-X joint output does not contain the expected 68 face landmarks"
+        )
+    return joints[:, -FACE_LANDMARK_COUNT:, :].astype(np.float32)
+
+
 def t2m_raw_parts(joints, vertices):
     lhand = hand_from_layout(joints, vertices, LEFT_HAND_LAYOUT)
     rhand = hand_from_layout(joints, vertices, RIGHT_HAND_LAYOUT)
+    face = face_landmarks(joints)
     wholebody = np.concatenate(
         [
             joints[:, UPPER_BODY_JOINTS, :],
@@ -213,6 +225,7 @@ def t2m_raw_parts(joints, vertices):
         "body": joints[:, UPPER_BODY_JOINTS, :].astype(np.float32),
         "lhand": lhand.astype(np.float32),
         "rhand": rhand.astype(np.float32),
+        "face": face,
         "wholebody": wholebody.astype(np.float32),
     }
 
@@ -223,6 +236,7 @@ def t2m_default_parts(joints, vertices):
         "body": (raw["body"] - joints[:, 0:1, :]).astype(np.float32),
         "lhand": normalize_first(raw["lhand"]).astype(np.float32),
         "rhand": normalize_first(raw["rhand"]).astype(np.float32),
+        "face": normalize_first(raw["face"]).astype(np.float32),
         "wholebody": normalize_first(raw["wholebody"]).astype(np.float32),
     }
 
@@ -349,6 +363,48 @@ def dtw_distance_pa(pred_parts, gt_parts, part):
     return dtw_from_distance_matrix(frame_distance_matrix_pa(pred_parts, gt_parts, part))
 
 
+def motion_path_and_jerk_diagnostics(
+    pred,
+    gt,
+    *,
+    pred_fps=20.0,
+    gt_fps=20.0,
+):
+    """Compare unwarped hand travel and finite-difference jerk magnitudes."""
+
+    pred = np.asarray(pred, dtype=np.float64)
+    gt = np.asarray(gt, dtype=np.float64)
+    pred_fps = max(float(pred_fps), 1e-6)
+    gt_fps = max(float(gt_fps), 1e-6)
+
+    def path_length(values):
+        if len(values) < 2:
+            return 0.0
+        return float(np.linalg.norm(np.diff(values, axis=0), axis=-1).sum())
+
+    def jerk_magnitude(values, fps):
+        if len(values) < 4:
+            return 0.0
+        jerk = np.diff(values, n=3, axis=0) * fps**3
+        return float(np.linalg.norm(jerk, axis=-1).mean())
+
+    gt_path = path_length(gt)
+    pred_path = path_length(pred)
+    gt_jerk = jerk_magnitude(gt, gt_fps)
+    pred_jerk = jerk_magnitude(pred, pred_fps)
+    path_ratio = pred_path / max(gt_path, 1e-12)
+    jerk_ratio = pred_jerk / max(gt_jerk, 1e-12)
+    return {
+        "gt_motion_path": gt_path,
+        "pred_motion_path": pred_path,
+        "motion_path_ratio": path_ratio,
+        "motion_path_error": abs(path_ratio - 1.0),
+        "gt_jerk_magnitude": gt_jerk,
+        "pred_jerk_magnitude": pred_jerk,
+        "jerk_magnitude_ratio": jerk_ratio,
+    }
+
+
 def pair_files(samples_dir, sample_glob):
     pairs = []
     for sample_path in sorted(samples_dir.glob(sample_glob)):
@@ -357,6 +413,14 @@ def pair_files(samples_dir, sample_glob):
         if gt_path.is_file():
             pairs.append((suffix, gt_path, sample_path))
     return pairs
+
+
+def load_export_fps(path, key, default=20.0):
+    with np.load(path) as data:
+        if key not in data.files:
+            return float(default)
+        value = float(np.asarray(data[key]).reshape(-1)[0])
+    return value if math.isfinite(value) and value > 0.0 else float(default)
 
 
 def summarize(rows):
@@ -378,6 +442,20 @@ def summarize(rows):
             "ndtw_ref_std": float(ndtw_ref.std()),
             "ndtw_ref_median": float(np.median(ndtw_ref)),
         }
+        for diagnostic in (
+            "motion_path_ratio",
+            "motion_path_error",
+            "jerk_magnitude_ratio",
+        ):
+            values = [row[diagnostic] for row in subset if diagnostic in row]
+            if values:
+                array = np.asarray(values, dtype=np.float64)
+                summary[f"{comparison}/{part}"][f"{diagnostic}_mean"] = float(
+                    array.mean()
+                )
+                summary[f"{comparison}/{part}"][f"{diagnostic}_std"] = float(
+                    array.std()
+                )
     return summary
 
 
@@ -393,6 +471,13 @@ def write_csv(path, rows):
         "path_len",
         "ndtw",
         "ndtw_ref",
+        "gt_motion_path",
+        "pred_motion_path",
+        "motion_path_ratio",
+        "motion_path_error",
+        "gt_jerk_magnitude",
+        "pred_jerk_magnitude",
+        "jerk_magnitude_ratio",
         "sample",
         "gt",
     ]
@@ -433,6 +518,7 @@ def main():
             betas_override=betas_override,
         )
         prior_outputs = None
+        prior_raw_parts = None
         try:
             prior_joints, prior_vertices = smplx_to_joints_vertices(
                 load_smplx(sample_path, args.prior_key),
@@ -446,20 +532,25 @@ def main():
                 prior_outputs = t2m_raw_parts(prior_joints, prior_vertices)
             else:
                 prior_outputs = t2m_default_parts(prior_joints, prior_vertices)
+            prior_raw_parts = t2m_raw_parts(prior_joints, prior_vertices)
         except KeyError:
             skipped_prior += 1
 
+        gt_raw_parts = t2m_raw_parts(gt_joints, gt_vertices)
+        sample_raw_parts = t2m_raw_parts(sample_joints, sample_vertices)
         if args.alignment_mode == "pa":
-            gt_parts = t2m_raw_parts(gt_joints, gt_vertices)
-            sample_parts = t2m_raw_parts(sample_joints, sample_vertices)
+            gt_parts = gt_raw_parts
+            sample_parts = sample_raw_parts
         else:
             gt_parts = t2m_default_parts(gt_joints, gt_vertices)
             sample_parts = t2m_default_parts(sample_joints, sample_vertices)
-        comparisons = [("flow", sample_parts)]
+        pred_fps = load_export_fps(sample_path, "sample_fps")
+        gt_fps = load_export_fps(sample_path, "context_fps")
+        comparisons = [("flow", sample_parts, sample_raw_parts)]
         if prior_outputs is not None:
-            comparisons.append(("adapter_prior", prior_outputs))
+            comparisons.append(("adapter_prior", prior_outputs, prior_raw_parts))
 
-        for comparison, pred_parts in comparisons:
+        for comparison, pred_parts, pred_raw_parts in comparisons:
             for part in args.parts:
                 if args.alignment_mode == "pa":
                     values = dtw_distance_pa(pred_parts, gt_parts, part)
@@ -478,6 +569,20 @@ def main():
                         "ndtw_ref": values["ndtw_ref"],
                         "sample": str(sample_path),
                         "gt": str(gt_path),
+                        **(
+                            motion_path_and_jerk_diagnostics(
+                                # Path and jerk are physical, unwarped
+                                # diagnostics and therefore always use raw
+                                # absolute hand keypoints, independent of the
+                                # DTW alignment preset.
+                                pred_raw_parts[part],
+                                gt_raw_parts[part],
+                                pred_fps=pred_fps,
+                                gt_fps=gt_fps,
+                            )
+                            if part in {"lhand", "rhand"}
+                            else {}
+                        ),
                     }
                 )
 
@@ -502,6 +607,7 @@ def main():
             "body": list(UPPER_BODY_JOINTS),
             "lhand": "mGPT orig_hand_regressor left layout, 21 keypoints",
             "rhand": "mGPT orig_hand_regressor right layout, 21 keypoints",
+            "face": "68 SMPL-X static/dynamic facial landmarks",
             "wholebody": "upper_body + lhand + rhand, 54 keypoints",
         },
         "definition": (
@@ -513,8 +619,12 @@ def main():
             "Procrustes-aligned to the corresponding GT part before MPJPE, using "
             "the same keypoint set for fitting and scoring. Body uses the 12 "
             "upper-body keypoints, each hand uses its 21-keypoint layout, and "
-            "wholebody uses all 54 concatenated keypoints. dtw_mean is the raw DTW "
-            "value; ndtw is dtw divided by optimal path length."
+            "face uses the 68 SMPL-X landmarks. Wholebody retains the historical "
+            "54 body-and-hand keypoints for comparability. dtw_mean is the raw DTW "
+            "value; ndtw is dtw divided by optimal path length. Hand rows also "
+            "report unwarped absolute-keypoint travel ratio/error and the ratio "
+            "of mean time-scaled third-finite-difference jerk magnitude, using "
+            "the stored sample/context frame rates."
         ),
         "num_pairs": len(pairs),
         "skipped_prior": skipped_prior,

@@ -10,9 +10,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from NIAF.continuous_sign_field.config import load_config
-from NIAF.continuous_sign_field.data import ContinuousSignDataset, collate_continuous_sign
+from NIAF.continuous_sign_field.data import (
+    ContinuousSignDataset,
+    collate_continuous_sign,
+)
 from NIAF.continuous_sign_field.scaffold_provider import ScaffoldProvider
 from NIAF.continuous_sign_field.scripts.export_eval_samples import (
+    read_jsonl,
     rot6d_to_axis_and_smplx,
     save_eval_npz,
     select_manifest,
@@ -26,9 +30,18 @@ from NIAF.continuous_sign_field.scripts.train_residual_flow import (
 )
 from NIAF.continuous_trajectory_field.models import build_continuous_trajectory_field
 from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field import (
+    _sentence_memory_field,
+    build_sentence_memory_provider,
     checkpoint_contract,
     is_dual_mode,
+    is_sentence_memory_model,
+    retrieve_sentence_memory,
+    sentence_memory_enabled,
+    sentence_memory_forward_kwargs,
+    sentence_memory_provider_required,
+    set_sentence_memory_provider_epoch_from_checkpoint,
     validate_checkpoint_contract,
+    validate_sentence_memory_checkpoint_identity,
 )
 from NIAF.retrieval_confidence_field.scripts.export_retrieval_adaptive_samples import (
     generation_batch,
@@ -46,7 +59,12 @@ def parse_args():
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--split", default="test")
     parser.add_argument("--manifest", type=Path, default=None)
-    parser.add_argument("--num_samples", type=int, default=5)
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=0,
+        help="Number of rows to export; 0 exports the complete split (default).",
+    )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument(
         "--selection_mode",
@@ -78,14 +96,28 @@ def parse_args():
             "text-only for v2 and the required scaffold path for v1."
         ),
     )
+    parser.add_argument(
+        "--sentence_memory",
+        default="auto",
+        choices=("auto", "off", "on", "shuffled"),
+        help=(
+            "For v3, export with memory off, retrieved memory on, or the "
+            "deterministic shuffled-memory control. auto uses the configured "
+            "export mode (on by default)."
+        ),
+    )
     parser.add_argument("--context_fps", type=float, default=20.0)
-    parser.add_argument("--sample_fps", type=float, nargs="+", default=[20.0, 40.0, 80.0])
+    parser.add_argument(
+        "--sample_fps", type=float, nargs="+", default=[20.0, 40.0, 80.0]
+    )
     return parser.parse_args()
 
 
 def sampled_lengths(duration_seconds, fps, min_frames=2, max_frames=4000):
-    return torch.round(duration_seconds * float(fps)).long().clamp(
-        int(min_frames), int(max_frames)
+    return (
+        torch.round(duration_seconds * float(fps))
+        .long()
+        .clamp(int(min_frames), int(max_frames))
     )
 
 
@@ -97,9 +129,12 @@ def resampled_frame_counts(
     max_frames=4000,
 ):
     intervals = (reference_lengths.long() - 1).clamp_min(1)
-    lengths = torch.round(
-        intervals.to(torch.float32) * float(target_fps) / float(reference_fps)
-    ).long() + 1
+    lengths = (
+        torch.round(
+            intervals.to(torch.float32) * float(target_fps) / float(reference_fps)
+        ).long()
+        + 1
+    )
     return lengths.clamp(int(min_frames), int(max_frames))
 
 
@@ -115,7 +150,9 @@ def padded_normalized_grid(lengths, device, dtype):
 
 def _fps_key(fps):
     value = float(fps)
-    return f"fps{int(value)}" if value.is_integer() else f"fps{value:g}".replace(".", "p")
+    return (
+        f"fps{int(value)}" if value.is_integer() else f"fps{value:g}".replace(".", "p")
+    )
 
 
 def _trajectory_numpy(instance, index):
@@ -123,6 +160,65 @@ def _trajectory_numpy(instance, index):
     for key, value in instance.select(index).detach().tensor_dict().items():
         output[key] = value.squeeze(0).cpu().numpy()
     return output
+
+
+def _memory_row_numpy(memory_batch, field, index, *aliases):
+    value = _sentence_memory_field(memory_batch, field, *aliases)
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return value[index].detach().cpu().numpy()
+    row = value[index]
+    if torch.is_tensor(row):
+        return row.detach().cpu().numpy()
+    return np.asarray(row)
+
+
+def sentence_memory_diagnostics_row(instance, index):
+    """Return compact per-sample gate/null summaries for paired reports."""
+
+    gates = getattr(instance, "sentence_memory_gates", None)
+    null_mass = getattr(instance, "sentence_memory_null_mass", None)
+    if gates is None or null_mass is None:
+        return None
+    row_gates = gates[int(index)].detach().float()
+    row_null = null_mass[int(index)].detach().float()
+    if row_gates.ndim != 2 or row_gates.shape[-1] != 4 or row_null.ndim != 1:
+        raise ValueError("Malformed sentence-memory trajectory diagnostics")
+    part_names = ("body", "lhand", "rhand", "face")
+    available = getattr(instance, "sentence_memory_available", None)
+    candidate_mass = getattr(instance, "sentence_memory_candidate_mass", None)
+    candidate_mass_mean = None
+    if candidate_mass is not None:
+        row_candidate_mass = candidate_mass[int(index)].detach().float()
+        if row_candidate_mass.ndim != 2:
+            raise ValueError("Malformed sentence-memory candidate attention mass")
+        candidate_mass_mean = float(row_candidate_mass.sum(dim=-1).mean().item())
+    return {
+        "available": bool(
+            available is not None and available[int(index)].detach().bool().item()
+        ),
+        "gate_mean_by_part": {
+            name: float(row_gates[:, part_index].mean().item())
+            for part_index, name in enumerate(part_names)
+        },
+        "null_mass_mean": float(row_null.mean().item()),
+        "candidate_mass_mean": candidate_mass_mean,
+    }
+
+
+def sentence_memory_text_subset(memory_batch, provider, index, text):
+    """Classify a query only when the train-bank vocabulary is available."""
+
+    provenance = (
+        getattr(memory_batch, "provenance", {}) if memory_batch is not None else {}
+    )
+    seen_rows = (provenance or {}).get("query_seen_text", [])
+    if index < len(seen_rows):
+        return "exact_seen_text" if bool(seen_rows[index]) else "novel_text"
+    if provider is not None:
+        return "exact_seen_text" if provider.is_seen_text(text) else "novel_text"
+    return "not_available"
 
 
 @torch.no_grad()
@@ -137,15 +233,25 @@ def prepare_inference_batch(
     context_fps,
     length_mode,
     word_prior_mode="auto",
+    sentence_memory_provider=None,
+    sentence_memory_mode="auto",
 ):
     text_tokens, text_mask = encode_batch_text(text_encoder, batch, cfg, device)
     predicted_log_duration, predicted_duration = model.predict_duration(
         text_tokens, text_mask=text_mask
     )
     duration_cfg = cfg.get("duration", {})
-    min_frames = int(duration_cfg.get("min_frames", cfg.get("data", {}).get("min_frames", 40)))
-    max_frames = int(duration_cfg.get("max_frames", cfg.get("data", {}).get("max_frames", 400)))
-    multiple = int(duration_cfg.get("length_multiple", cfg.get("data", {}).get("length_multiple", 4)))
+    min_frames = int(
+        duration_cfg.get("min_frames", cfg.get("data", {}).get("min_frames", 40))
+    )
+    max_frames = int(
+        duration_cfg.get("max_frames", cfg.get("data", {}).get("max_frames", 400))
+    )
+    multiple = int(
+        duration_cfg.get(
+            "length_multiple", cfg.get("data", {}).get("length_multiple", 4)
+        )
+    )
     predicted_context_lengths = model.predict_lengths(
         text_tokens,
         text_mask=text_mask,
@@ -155,29 +261,48 @@ def prepare_inference_batch(
         multiple=multiple,
     )
     context_lengths = (
-        batch["length"]
-        if length_mode == "ground_truth"
-        else predicted_context_lengths
+        batch["length"] if length_mode == "ground_truth" else predicted_context_lengths
     )
     dual_mode = is_dual_mode(cfg)
+    sentence_memory_model = is_sentence_memory_model(cfg)
     if not dual_mode and word_prior_mode != "auto":
         raise ValueError("word_prior_mode is available only for dual-mode v2")
-    resolved_mode = "off" if dual_mode and word_prior_mode == "auto" else word_prior_mode
+    resolved_mode = (
+        str(cfg.get("eval", {}).get("sentence_memory_word_prior_mode", "off"))
+        if sentence_memory_model and word_prior_mode == "auto"
+        else ("off" if dual_mode and word_prior_mode == "auto" else word_prior_mode)
+    )
     if dual_mode and resolved_mode not in {"off", "on"}:
-        raise ValueError("v2 word_prior_mode must be 'off' or 'on'")
+        raise ValueError("word_prior_mode must be 'off' or 'on'")
+    if not sentence_memory_model and sentence_memory_mode != "auto":
+        raise ValueError("sentence_memory_mode is available only for v3")
+    resolved_sentence_mode = (
+        "off"
+        if sentence_memory_model and not sentence_memory_enabled(cfg)
+        else (
+            str(cfg.get("eval", {}).get("export_sentence_memory_mode", "on"))
+            if sentence_memory_model and sentence_memory_mode == "auto"
+            else sentence_memory_mode
+        )
+    )
+    if sentence_memory_model and resolved_sentence_mode not in {
+        "off",
+        "on",
+        "shuffled",
+    }:
+        raise ValueError("v3 sentence_memory_mode must be 'off', 'on', or 'shuffled'")
 
     adapter_context = None
     retrieval_features = None
     context_mask = None
+    word_kwargs = {}
     if dual_mode and resolved_mode == "off":
         context_lengths = torch.zeros_like(batch["length"])
-        trajectory = model.encode_trajectory(
-            text_tokens=text_tokens,
-            text_mask=text_mask,
-            word_prior_available=torch.zeros(
+        word_kwargs = {
+            "word_prior_available": torch.zeros(
                 text_tokens.shape[0], dtype=torch.bool, device=device
-            ),
-        )
+            )
+        }
     else:
         if provider is None:
             raise ValueError("Prior-enabled inference requires a ScaffoldProvider")
@@ -190,16 +315,14 @@ def prepare_inference_batch(
         retrieval_features = metadata["retrieval_features"]
         context_mask = generated["mask"]
         if dual_mode:
-            trajectory = model.encode_trajectory(
-                text_tokens=text_tokens,
-                text_mask=text_mask,
-                word_prior_context=adapter_context,
-                word_prior_mask=context_mask,
-                word_prior_features=retrieval_features,
-                word_prior_available=torch.ones(
+            word_kwargs = {
+                "word_prior_context": adapter_context,
+                "word_prior_mask": context_mask,
+                "word_prior_features": retrieval_features,
+                "word_prior_available": torch.ones(
                     text_tokens.shape[0], dtype=torch.bool, device=device
                 ),
-            )
+            }
         else:
             trajectory = model.encode_trajectory(
                 text_tokens=text_tokens,
@@ -208,6 +331,41 @@ def prepare_inference_batch(
                 retrieval_evidence=retrieval_features,
                 text_mask=text_mask,
             )
+    sentence_memory_batch = None
+    sentence_kwargs = {}
+    if sentence_memory_model:
+        sentence_available = torch.full(
+            (text_tokens.shape[0],),
+            resolved_sentence_mode != "off",
+            dtype=torch.bool,
+            device=device,
+        )
+        sentence_kwargs = {"sentence_memory_available": sentence_available}
+        if bool(sentence_available.any()):
+            if sentence_memory_provider is None:
+                raise ValueError(
+                    "Memory-enabled inference requires a SentenceMemoryProvider"
+                )
+            sentence_memory_batch = retrieve_sentence_memory(
+                sentence_memory_provider,
+                dataset=dataset,
+                batch=batch,
+                text_tokens=text_tokens,
+                text_mask=text_mask,
+                predicted_duration=predicted_duration.detach(),
+                available=sentence_available,
+                training=False,
+                device=device,
+                mode=resolved_sentence_mode,
+            )
+            sentence_kwargs = sentence_memory_forward_kwargs(sentence_memory_batch)
+    if dual_mode:
+        trajectory = model.encode_trajectory(
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            **word_kwargs,
+            **sentence_kwargs,
+        )
     output_duration = (
         trajectory.duration_seconds if length_mode == "predicted" else batch["duration"]
     )
@@ -222,6 +380,10 @@ def prepare_inference_batch(
         "predicted_log_duration": predicted_log_duration,
         "output_duration": output_duration,
         "word_prior_mode": resolved_mode if dual_mode else "v1_required",
+        "sentence_memory_mode": (
+            resolved_sentence_mode if sentence_memory_model else "not_applicable"
+        ),
+        "sentence_memory_batch": sentence_memory_batch,
     }
 
 
@@ -271,6 +433,17 @@ def main():
     cfg.setdefault("scaffold", {})["prefer_cache"] = False
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    configured_manifest = cfg.get("data", {}).get(
+        f"{args.split}_manifest_path"
+    )
+    canonical_manifest = (
+        Path(configured_manifest)
+        if configured_manifest
+        else Path(cfg["data"]["data_dir"])
+        / "meta"
+        / f"manifest_{args.split}.jsonl"
+    )
+    canonical_rows = read_jsonl(canonical_manifest)
     selected_manifest, _selected_rows, manifest_summary = select_manifest(
         cfg,
         args.split,
@@ -280,7 +453,31 @@ def main():
         manifest=args.manifest,
         selection_mode=args.selection_mode,
     )
-    cfg.setdefault("data", {})[f"{args.split}_manifest_path"] = str(selected_manifest)
+    complete_canonical_manifest = (
+        len(_selected_rows) == len(canonical_rows)
+        and sorted(
+            json.dumps(row, sort_keys=True, separators=(",", ":"))
+            for row in _selected_rows
+        )
+        == sorted(
+            json.dumps(row, sort_keys=True, separators=(",", ":"))
+            for row in canonical_rows
+        )
+    )
+    canonical_order = _selected_rows == canonical_rows
+    manifest_summary.update(
+        {
+            "canonical_source_manifest": str(canonical_manifest),
+            "canonical_sample_count": len(canonical_rows),
+            "is_complete_canonical_manifest": complete_canonical_manifest,
+            "is_canonical_order": canonical_order,
+        }
+    )
+    # A complete first-order export can consume the precomputed neighbor table
+    # directly. Subsets and reordered manifests deliberately use the copied
+    # manifest and fall back to audited exact retrieval by stable query fields.
+    dataset_manifest = canonical_manifest if canonical_order else selected_manifest
+    cfg.setdefault("data", {})[f"{args.split}_manifest_path"] = str(dataset_manifest)
     cfg.setdefault("data", {})[f"limit_{args.split}"] = 0
     device = resolve_device(args.device)
     text_device = resolve_device(args.text_device)
@@ -300,21 +497,65 @@ def main():
     )
     text_encoder = build_text_encoder(cfg, text_device)
     dual_mode = is_dual_mode(cfg)
+    sentence_memory_model = is_sentence_memory_model(cfg)
     if not dual_mode and args.word_prior != "auto":
         raise ValueError("--word_prior is available only for dual-mode v2")
     resolved_word_prior_mode = (
-        "off" if dual_mode and args.word_prior == "auto" else args.word_prior
+        str(cfg.get("eval", {}).get("sentence_memory_word_prior_mode", "off"))
+        if sentence_memory_model and args.word_prior == "auto"
+        else ("off" if dual_mode and args.word_prior == "auto" else args.word_prior)
+    )
+    if not sentence_memory_model and args.sentence_memory != "auto":
+        raise ValueError("--sentence_memory is available only for v3")
+    resolved_sentence_memory_mode = (
+        "off"
+        if sentence_memory_model and not sentence_memory_enabled(cfg)
+        else (
+            str(cfg.get("eval", {}).get("export_sentence_memory_mode", "on"))
+            if sentence_memory_model and args.sentence_memory == "auto"
+            else args.sentence_memory
+        )
     )
     needs_provider = not dual_mode or resolved_word_prior_mode == "on"
     provider = ScaffoldProvider(cfg, dataset, device) if needs_provider else None
+    sentence_memory_provider = (
+        build_sentence_memory_provider(cfg, text_encoder, dataset=dataset)
+        if sentence_memory_model
+        and sentence_memory_provider_required(resolved_sentence_memory_mode)
+        else None
+    )
+    if sentence_memory_provider is not None:
+        sentence_memory_provider.validate_query_dataset(
+            # Export manifests are often five-row subsets whose hash cannot
+            # match the precomputed full-split table. The provider safely
+            # falls back to online search for this small query set.
+            dataset,
+            require_neighbors=False,
+        )
     retrieval_bank = (
         validate_train_only_retrieval_bank(cfg, provider)
         if provider is not None
         else None
     )
-    model = build_continuous_trajectory_field(cfg, text_dim=text_encoder.text_dim).to(device)
+    model = build_continuous_trajectory_field(cfg, text_dim=text_encoder.text_dim).to(
+        device
+    )
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     validate_checkpoint_contract(checkpoint, cfg, source=str(args.checkpoint))
+    validate_sentence_memory_checkpoint_identity(
+        checkpoint,
+        sentence_memory_provider,
+        source=str(args.checkpoint),
+        cfg=cfg,
+        text_encoder_identity=(
+            text_encoder.checkpoint_identity()
+            if hasattr(text_encoder, "checkpoint_identity")
+            else None
+        ),
+    )
+    set_sentence_memory_provider_epoch_from_checkpoint(
+        sentence_memory_provider, checkpoint
+    )
     model_type, contract_version = checkpoint_contract(cfg)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
@@ -336,6 +577,8 @@ def main():
             context_fps=args.context_fps,
             length_mode=args.length_mode,
             word_prior_mode=resolved_word_prior_mode,
+            sentence_memory_provider=sentence_memory_provider,
+            sentence_memory_mode=resolved_sentence_memory_mode,
         )
         sampled = sample_trajectory_fps(
             model,
@@ -381,7 +624,9 @@ def main():
             gt_rot6d, gt_axis, gt_smplx = rot6d_to_axis_and_smplx(
                 target[local_index, :gt_length]
             )
-            prediction = main_sample["outputs"]["prediction"][local_index, :output_length]
+            prediction = main_sample["outputs"]["prediction"][
+                local_index, :output_length
+            ]
             coarse_name = "coarse" if dual_mode else "prior"
             coarse = main_sample["outputs"][coarse_name][local_index, :output_length]
             pred_rot6d, pred_axis, pred_smplx = rot6d_to_axis_and_smplx(prediction)
@@ -400,8 +645,11 @@ def main():
                     int(checkpoint.get("epoch", -1)), dtype=np.int32
                 ),
                 "model_type": np.asarray(model_type),
-                "trajectory_contract_version": np.asarray(contract_version, dtype=np.int32),
+                "trajectory_contract_version": np.asarray(
+                    contract_version, dtype=np.int32
+                ),
                 "word_prior_mode": np.asarray(inference["word_prior_mode"]),
+                "sentence_memory_mode": np.asarray(inference["sentence_memory_mode"]),
                 "length_mode": np.asarray(args.length_mode),
                 "context_fps": np.asarray(float(args.context_fps), dtype=np.float32),
                 "sample_fps": np.asarray(float(main_fps), dtype=np.float32),
@@ -424,9 +672,52 @@ def main():
                         "adapter_context_rot6d": context_rot6d.astype(np.float32),
                         "retrieval_features": inference["retrieval_features"][
                             local_index, :context_length
-                        ].cpu().float().numpy(),
+                        ]
+                        .cpu()
+                        .float()
+                        .numpy(),
                     }
                 )
+            memory_batch = inference["sentence_memory_batch"]
+            if memory_batch is not None:
+                for output_name, field_name, aliases in (
+                    ("sentence_memory_ids", "ids", ()),
+                    ("sentence_memory_scores", "scores", ()),
+                    ("sentence_memory_durations", "durations", ()),
+                    (
+                        "sentence_memory_duration_log_gap",
+                        "duration_log_gap",
+                        ("duration_ratio",),
+                    ),
+                    ("sentence_memory_candidate_mask", "candidate_mask", ()),
+                ):
+                    value = _memory_row_numpy(
+                        memory_batch,
+                        field_name,
+                        local_index,
+                        *aliases,
+                    )
+                    if value is not None:
+                        extra[output_name] = value
+                memory_provenance = getattr(memory_batch, "provenance", {}) or {}
+                candidate_group_ids = memory_provenance.get("candidate_group_ids", [])
+                candidate_exact_text = memory_provenance.get("candidate_exact_text", [])
+                query_seen_text = memory_provenance.get("query_seen_text", [])
+                if local_index < len(candidate_group_ids):
+                    extra["sentence_memory_group_ids"] = np.asarray(
+                        candidate_group_ids[local_index], dtype=np.int64
+                    )
+                if local_index < len(candidate_exact_text):
+                    extra["sentence_memory_exact_text"] = np.asarray(
+                        candidate_exact_text[local_index], dtype=np.bool_
+                    )
+                if local_index < len(query_seen_text):
+                    extra["sentence_memory_query_seen_text"] = np.asarray(
+                        bool(query_seen_text[local_index]), dtype=np.bool_
+                    )
+                bank_id = memory_provenance.get("bank_id")
+                if bank_id:
+                    extra["sentence_memory_bank_id"] = np.asarray(str(bank_id))
             extra.update(_trajectory_numpy(inference["trajectory"], local_index))
             for branch_name, branch_prediction in branch_samples.items():
                 branch_rot6d, branch_axis, branch_smplx = rot6d_to_axis_and_smplx(
@@ -445,17 +736,31 @@ def main():
                 extra[f"continuous_{key}_rot6d"] = fps_rot6d.astype(np.float32)
                 extra[f"continuous_{key}_motion"] = fps_axis.astype(np.float32)
                 extra[f"continuous_{key}_smplx"] = fps_smplx.astype(np.float32)
-                extra[f"continuous_{key}_tau"] = fps_sample["tau"][
-                    local_index, :fps_length
-                ].cpu().float().numpy()
+                extra[f"continuous_{key}_tau"] = (
+                    fps_sample["tau"][local_index, :fps_length].cpu().float().numpy()
+                )
             save_eval_npz(
                 sample_path,
                 pred_axis,
                 pred_smplx,
                 pred_rot6d,
                 meta,
-                label="signtrajfield_v2" if dual_mode else "niaf_continuous_trajectory_field",
+                label=(
+                    "signtrajfield_rag_v3"
+                    if sentence_memory_model
+                    else (
+                        "signtrajfield_v2"
+                        if dual_mode
+                        else "niaf_continuous_trajectory_field"
+                    )
+                ),
                 extra=extra,
+            )
+            text_subset = sentence_memory_text_subset(
+                inference["sentence_memory_batch"],
+                sentence_memory_provider,
+                local_index,
+                meta["text"],
             )
             rows.append(
                 {
@@ -468,6 +773,17 @@ def main():
                     ),
                     "context_length": context_length,
                     "word_prior_mode": inference["word_prior_mode"],
+                    "sentence_memory_mode": inference["sentence_memory_mode"],
+                    "sentence_memory_text_subset": (text_subset)
+                    if sentence_memory_model
+                    else "not_applicable",
+                    "sentence_memory_diagnostics": (
+                        sentence_memory_diagnostics_row(
+                            inference["trajectory"], local_index
+                        )
+                        if sentence_memory_model
+                        else None
+                    ),
                     "predicted_duration_seconds": float(
                         inference["trajectory"].duration_seconds[local_index].item()
                     ),
@@ -482,10 +798,7 @@ def main():
             sample_counter += 1
 
     duration_errors = [
-        abs(
-            row["predicted_duration_seconds"]
-            - row["ground_truth_duration_seconds"]
-        )
+        abs(row["predicted_duration_seconds"] - row["ground_truth_duration_seconds"])
         for row in rows
     ]
     summary = {
@@ -497,12 +810,26 @@ def main():
         "model_type": model_type,
         "trajectory_contract_version": contract_version,
         "word_prior_mode": resolved_word_prior_mode if dual_mode else "v1_required",
+        "sentence_memory_mode": (
+            resolved_sentence_memory_mode if sentence_memory_model else "not_applicable"
+        ),
+        "sentence_memory": (
+            getattr(sentence_memory_provider, "config_summary", None)
+            if sentence_memory_provider is not None
+            else (
+                checkpoint.get("sentence_memory_identity")
+                if sentence_memory_model
+                else None
+            )
+        ),
         "context_fps": float(args.context_fps),
         "sample_fps": list(fps_values),
         "retrieval_bank": retrieval_bank,
         "manifest": manifest_summary,
         "num_exported": len(rows),
-        "duration_mae_seconds": float(sum(duration_errors) / max(len(duration_errors), 1)),
+        "duration_mae_seconds": float(
+            sum(duration_errors) / max(len(duration_errors), 1)
+        ),
         "rows": rows,
     }
     (out_dir / "export_summary.json").write_text(

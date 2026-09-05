@@ -4,7 +4,13 @@ import torch
 
 
 class FrozenT5TextEncoder:
-    """Frozen local T5 encoder with pooled and token-level embeddings."""
+    """Frozen local T5 encoder with pooled and token-level embeddings.
+
+    The loader deliberately retains the historical ``T5EncoderModel`` and
+    default ``AutoTokenizer`` path. Existing SignTrajField checkpoints were
+    trained through that frontend, so changing either class would invalidate
+    full-pipeline text-only parity even when all trajectory weights match.
+    """
 
     def __init__(self, model_path, device, max_length=64, local_files_only=True, cache=True):
         try:
@@ -29,7 +35,24 @@ class FrozenT5TextEncoder:
         self.model.to(self.device)
         self.model.eval()
         self.model.requires_grad_(False)
+        self.model_type = str(getattr(self.model.config, "model_type", "t5")).lower()
         self.text_dim = int(self.model.config.d_model)
+
+    def checkpoint_identity(self):
+        """Return the semantic text-encoder contract persisted with checkpoints."""
+
+        return {
+            "model_type": self.model_type,
+            "model_path": self.model_path.as_posix(),
+            "text_dim": self.text_dim,
+            "max_length": self.max_length,
+            "encoder_loader": "T5EncoderModel",
+            "tokenizer_loader": "AutoTokenizer",
+            "tokenizer_use_fast": "transformers_default",
+            "encoder_class": type(self.model).__name__,
+            "tokenizer_class": type(self.tokenizer).__name__,
+            "tokenizer_is_fast": bool(getattr(self.tokenizer, "is_fast", False)),
+        }
 
     @torch.no_grad()
     def encode(self, texts):

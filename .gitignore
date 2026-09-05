@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 scripts/key
+/key
 
 
 # Runtime output and online logging state.
