@@ -1,0 +1,16 @@
+_base_: csl_daily_signtrajfield_v3_sentence_memory_phase_a.yaml
+
+# Controlled full-data Phase-A pilot.  The duration reranking weight is the
+# only modeling change from the original w=0.10 experiment; the inherited
+# train-only bank, top-64 neighbors, K=8, frozen v2 backbone, optimizer,
+# objectives, validation modes, and checkpoint feasibility rules are retained.
+experiment_name: csl_daily_signtrajfield_v3_sentence_memory_phase_a_dw005_pilot2
+
+sentence_memory:
+  duration_weight: 0.05
+
+train:
+  epochs: 2
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_dw005_pilot2
