@@ -5,7 +5,7 @@ runs. Read it before answering an unqualified question such as "What is the
 current training progress?" The scheduler and logs remain the source of truth
 for live state; this registry determines **which run** the question refers to.
 
-Last observed: **2026-09-06 03:12 Asia/Dubai (UTC+04:00)**
+Last observed: **2026-09-06 15:48 Asia/Dubai (UTC+04:00)**
 
 ## Default run resolution
 
@@ -18,7 +18,8 @@ has the highest Slurm job ID or is already in the `RUNNING` state.
 
 Dataset-qualified requests override that default: "the How2Sign training"
 refers to `how2sign-signtrajfield-v2-full-20260807`, and "the CSL-Daily
-training" refers to `csl-daily-signtrajfield-rag-v3-phase-a-20260906`.
+training" refers to
+`csl-daily-signtrajfield-rag-v3-phase-a-dw005-pilot2-20260906`.
 
 ## Active prerequisite artifact jobs (not training)
 
@@ -42,7 +43,7 @@ training" refers to `csl-daily-signtrajfield-rag-v3-phase-a-20260906`.
 | Result | Complete 243 MiB bank: 18,399 items, 6,578 semantic groups, 430,364 ragged VAE tokens (`float16`, 256-D), bank ID `a65661333c0f60aa65dc68d896f439a698e37832f04bb8834a378a2d5f068bcd` |
 | Success contract | Satisfied: `bank.json` and `build_summary.json` passed the builder's content validation and `READY` was written last |
 | Independent verification | CPU-only Slurm `142732` on node 19; strict `--verify_only --verify_hashes` completed with exit code 0 and reported `valid: true`, the same bank ID, and 18,399 rows |
-| Follow-up | Slurm `142745` completed and strictly audited all top-64 train/validation/test neighbor tables; dependent Phase-A job `142746` was released and is running |
+| Follow-up | Slurm `142745` completed and strictly audited all top-64 train/validation/test neighbor tables; Phase-A job `142746` subsequently completed, and duration-weight pilot `142893` reuses the same verified artifacts |
 
 Logs:
 
@@ -83,13 +84,54 @@ logs/sbatch/csl_rag_neighbors_142745.out
 logs/sbatch/csl_rag_neighbors_142745.err
 ```
 
-## Active: CSL-Daily Sentence-Retrieval SignTrajField v3 Phase A
+## Active: CSL-Daily SignTrajField-RAG v3 Phase-A duration-weight 0.05 pilot
+
+| Field | Value |
+|---|---|
+| Alias | `csl-daily-signtrajfield-rag-v3-phase-a-dw005-pilot2-20260906` |
+| Dataset | Full CSL-Daily train/validation splits (18,399/1,077 samples); this is a two-epoch controlled pilot, not a reduced-data run |
+| Training job | Slurm `142893`, name `csl_rag_dw005_p2` (`RUNNING`; started 2026-09-06 15:46:14 Asia/Dubai, completed strict per-node staging audits, and launched the four-rank training process at the last observation) |
+| Configuration | `NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v3_sentence_memory_phase_a_dw005_pilot2.yaml`; SHA256 `80843eb89075d9829c9db829b16b5d0930a6b6bce91262e4f655a4b4e70febdb` |
+| Output | `experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_dw005_pilot2` (fresh output; the duration-weight 0.10 experiment is not resumed or overwritten) |
+| Source | Branch `codex/csl-daily-signtrajfield-rag-v3`, commit `cfe41628efe99cad7f33666da26278029d4b2fac`, pushed to `origin` before submission |
+| Initialization | Fresh strict v2-to-v3 base import from `csl_daily_signtrajfield_v2_mt5_text_only_full/checkpoints/best.pt`; SHA256 `06ca0a2613005b6e3949bab0e5d7ded999b212723debd3e7685a58c077e44c54`; no resume or warm start |
+| Controlled change | Sentence duration-reranking weight is reduced from `0.10` to `0.05`, and the run length is reduced from 10 to 2 epochs; the train-only bank, raw top-64 neighbor tables, `K=8`, model, losses, seed, optimizer, validation modes, and feasibility rules are unchanged |
+| Frozen/trainable | Phase A only: all inherited v2 parameters remain frozen and only the 82 `hypernetwork.sentence_memory_*` tensors train at learning rate `1e-4`; Phase B is disabled |
+| Epochs | 2; full `text_only`, `sentence_memory`, and `shuffled_sentence_memory` validation and checkpointing every epoch |
+| Allocation | Exact ordered nodes `ADUAED21025WKLX11,ADUAED21027WKLX14,ADUAED21028WKLX16,ADUAED21047WKLX01`; batch host/rank 0 is node 11; 1 GPU, 16 CPUs, and 100 GiB per node; four-hour limit |
+| Batch semantics | 32 samples/GPU/loader batch, 2 accumulation steps, effective 64/GPU and 256 globally; physical memory microbatch cap 16 |
+| Memory staging | Complete bank and train/validation neighbor tables are copied into job-specific `/tmp` storage and strictly hash-audited once per allocated node before training |
+| Artifact identities | Bank ID `a65661333c0f60aa65dc68d896f439a698e37832f04bb8834a378a2d5f068bcd`; train-neighbor SHA256 `d61c0271e190c41d20e822dd4d4f6a2690daa5bfbcd62ef45b58a767377d3852`; validation-neighbor SHA256 `b5f5d0914e55ba9e9c79963bacb955b97d62f99f16f117381187e72c345eb199` |
+| W&B | Disabled (`WANDB=0`); this launch has no W&B run name, ID, URL, resume policy, or online credential dependency |
+| Comparison contract | Compare both epochs against the frozen text-only baseline, shuffled retrieval, and the duration-weight 0.10 Phase-A result; do not advance to Phase B unless correct retrieval passes the existing validation and hand-path feasibility gates |
+
+Live tracing commands:
+
+```bash
+squeue -j 142893 -o '%.18i %.28j %.10T %.12M %.12l %.4D %R'
+scontrol show job 142893
+tail -F logs/sbatch/csl_rag_dw005_p2_142893.out
+tail -F logs/sbatch/csl_rag_dw005_p2_142893.err
+```
+
+Epoch metrics will be written to:
+
+```text
+experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_dw005_pilot2/metrics.jsonl
+```
+
+If job `142893` fails after producing a recovery checkpoint, resume only from
+this pilot's own `checkpoints/last.pt` with the exact committed configuration,
+bank, neighbor tables, optimizer, and RNG state. Do not resume from the
+duration-weight 0.10 run or silently reuse an incomplete fresh output.
+
+## Previous: CSL-Daily SignTrajField-RAG v3 Phase A (duration weight 0.10)
 
 | Field | Value |
 |---|---|
 | Alias | `csl-daily-signtrajfield-rag-v3-phase-a-20260906` |
 | Dataset | Full CSL-Daily train/validation splits (18,399/1,077 samples) |
-| Training job | Slurm `142746`, name `csl_rag_phasea` (`RUNNING`; epoch 2 reached batch 12/144 at the last observation) |
+| Training job | Slurm `142746`, name `csl_rag_phasea` (`COMPLETED`; all 10 epochs and global step 720 were durably written, and W&B synced cleanly) |
 | Configuration | `NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v3_sentence_memory_phase_a.yaml`; SHA256 `9cc4c8b7ed5a740b0788374ae604797fe692a953f8a6c7a1230868c85c8b71b1` |
 | Output | `experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a` |
 | Source | Branch `codex/csl-daily-signtrajfield-rag-v3`, commit `39328f12e2b604a4335fd1f6ec1a81790331ff93`, pushed to `origin` |
@@ -100,7 +142,7 @@ logs/sbatch/csl_rag_neighbors_142745.err
 | Allocation | Exact ordered nodes `ADUAED21042WKLX08,ADUAED21045WKLX28,ADUAED21046WKLX02,ADUAED21047WKLX01`; batch host/rank 0 is node 08; 1 GPU, 16 CPUs, and 100 GiB per node; DDP/NCCL 2.27.5; 72-hour limit |
 | Batch semantics | 32 samples/GPU/loader batch, 2 accumulation steps, effective 64/GPU and 256 globally; physical memory microbatch cap 16 |
 | Memory staging | Complete bank, including neighbor tables, copied to job-specific `/tmp` and strictly audited once per node before training |
-| W&B | Online entity `hh3443-new-york-university`, project `soke-niaf-continuous-trajectory`; run `csl_daily_signtrajfield_v3_sentence_memory_phase_a_142746`, ID `ax3fimep`, URL `https://wandb.ai/hh3443-new-york-university/soke-niaf-continuous-trajectory/runs/ax3fimep`; distinct `train/*` and `validation/*` namespaces are active |
+| W&B | Online entity `hh3443-new-york-university`, project `soke-niaf-continuous-trajectory`; run `csl_daily_signtrajfield_v3_sentence_memory_phase_a_142746`, ID `ax3fimep`, URL `https://wandb.ai/hh3443-new-york-university/soke-niaf-continuous-trajectory/runs/ax3fimep`; distinct `train/*` and `validation/*` namespaces were synced successfully |
 | Auth gate | Read-only node-08 preflight Slurm `142744` passed for viewer `hh3443`; launcher rejects inline/shared credentials and fails closed if the rank-0 node-local check changes |
 | Validation | Full repository suite passed in Slurm `142742`: 182 tests; Ruff, Python compilation, shell syntax, and Git whitespace checks passed |
 | Deliberate fast path | The user explicitly chose to skip separate retrieval diagnostics, smoke training, and K-ablation pilots before this full run |
@@ -109,31 +151,22 @@ logs/sbatch/csl_rag_neighbors_142745.err
 | Epoch 1 validation | All 34 batches completed in each of `text_only`, `sentence_memory`, and `shuffled_sentence_memory`; sentence score `12.717379` versus text-only `12.838353` (0.9423% better), but shuffled score `12.717333` is effectively tied/slightly better, so the epoch is infeasible under the required 0.1% correct-over-shuffled margin |
 | Epoch 1 hand/duration diagnostics | Sentence memory changed left/right path from `0.359614/0.334957` to `0.287256/0.229979` (20.1%/31.3% lower); hand-relative loss rose only 0.67%, within the 2% guard; predicted duration is exactly unchanged at `4.731181` seconds |
 | Epoch 1 memory diagnostics | Part gates are approximately `0.1196`--`0.1198`; null mass `0.04116`; real-candidate mass `0.95884` |
-| Checkpoints | `epoch0001.pt`, resumable `last.pt`, and `best_infeasible.pt` exist; no feasible `best.pt` has been created and `best_infeasible.pt` must not be promoted |
+| Final outcome | Epoch 10 completed with selection score `12.807284`, sentence-memory score `12.807284`, shuffled-memory score `12.806838`, and text-only score `12.838353`; correct retrieval still failed the required 0.1% margin over shuffled retrieval |
+| Checkpoints | `epoch0001.pt` through `epoch0010.pt` and resumable `last.pt` exist; `best_infeasible.pt` selects epoch 2 at score `12.715823`; no feasible `best.pt` was created, and `best_infeasible.pt` must not be promoted |
 | Checkpoint identities | Bank and all neighbor identities are embedded; sentence behavior digest `880d9ca2a61c80d56a53a0609dec39d58eee17f50e1b41e171d9f24ba87609fd`; exact-resume digest `da581b2d5db2d3fd262df6bb889e4f20922f8dafab2abc90769ff832282a98e8`; optimizer, per-rank RNG, and historical selection state are present |
 
-Live tracing commands:
+Historical inspection commands:
 
 ```bash
-squeue -j 142745,142746 -o '%.18i %.28j %.10T %.12M %.12l %.4D %R'
-scontrol show job 142745
-scontrol show job 142746
-tail -F logs/sbatch/csl_rag_neighbors_142745.out logs/sbatch/csl_rag_neighbors_142745.err
-tail -F logs/sbatch/csl_rag_phasea_142746.out logs/sbatch/csl_rag_phasea_142746.err
+tail logs/sbatch/csl_rag_phasea_142746.out
+tail logs/sbatch/csl_rag_phasea_142746.err
 ```
 
-Epoch metrics will be written to:
+Epoch metrics are stored in:
 
 ```text
 experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a/metrics.jsonl
 ```
-
-If job `142746` fails after the existing recovery checkpoint, resume only from
-`experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a/checkpoints/last.pt`
-with the same committed configuration, bank, neighbor tables, optimizer/RNG
-state, `WANDB_ID=ax3fimep`, and `WANDB_RESUME=must`. Do not use warm start,
-change retrieval/batch settings, silently reuse an incomplete fresh output, or
-promote `best_infeasible.pt`.
 
 ## Default: full PHOENIX-2014T SignTrajField-v2 training
 
