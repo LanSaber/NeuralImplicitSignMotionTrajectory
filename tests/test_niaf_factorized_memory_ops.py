@@ -1219,5 +1219,7 @@ def test_factorized_launchers_are_validation_only_and_ordered():
     assert "git ls-remote --heads origin" in smoke
     assert "build_validation_text_partition" not in smoke
     assert "SIGNTRAJ_VALIDATION_TEXT_PARTITION_DIR" in smoke
+    assert "train_sentence_memory_motion_corrupt_fraction" in smoke
+    assert "train_sentence_memory_full_shuffle_fraction" in smoke
     assert "manifest_confirmation.jsonl" not in smoke
     assert "partition.json" not in smoke

@@ -180,8 +180,12 @@ for prefix in (
 for key, value in metrics.items():
     if isinstance(value, (int, float)) and not math.isfinite(float(value)):
         raise SystemExit(f"ERROR: smoke metric is non-finite: {key}")
-motion_fraction = float(metrics.get("sentence_memory_motion_corrupt_fraction", 0.0))
-full_fraction = float(metrics.get("sentence_memory_full_shuffle_fraction", 0.0))
+motion_fraction = float(
+    metrics.get("train_sentence_memory_motion_corrupt_fraction", 0.0)
+)
+full_fraction = float(
+    metrics.get("train_sentence_memory_full_shuffle_fraction", 0.0)
+)
 if not (0.0 <= motion_fraction <= 1.0 and 0.0 <= full_fraction <= 1.0
         and motion_fraction + full_fraction > 0.0):
     raise SystemExit("ERROR: smoke did not exercise paired corrupt outputs")
