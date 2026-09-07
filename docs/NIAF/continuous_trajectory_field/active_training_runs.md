@@ -5,7 +5,7 @@ runs. Read it before answering an unqualified question such as "What is the
 current training progress?" The scheduler and logs remain the source of truth
 for live state; this registry determines **which run** the question refers to.
 
-Last observed: **2026-09-06 15:48 Asia/Dubai (UTC+04:00)**
+Last observed: **2026-09-07 17:05 Asia/Dubai (UTC+04:00)**
 
 ## Default run resolution
 
@@ -19,7 +19,7 @@ has the highest Slurm job ID or is already in the `RUNNING` state.
 Dataset-qualified requests override that default: "the How2Sign training"
 refers to `how2sign-signtrajfield-v2-full-20260807`, and "the CSL-Daily
 training" refers to
-`csl-daily-signtrajfield-rag-v3-phase-a-dw005-pilot2-20260906`.
+`csl-daily-signtrajfield-rag-v3-phase-a-motion-contrast-v1-20260907`.
 
 ## Active prerequisite artifact jobs (not training)
 
@@ -84,13 +84,55 @@ logs/sbatch/csl_rag_neighbors_142745.out
 logs/sbatch/csl_rag_neighbors_142745.err
 ```
 
-## Active: CSL-Daily SignTrajField-RAG v3 Phase-A duration-weight 0.05 pilot
+## Latest CSL-Daily: SignTrajField-RAG v3 Phase-A' motion-contrast v1
+
+| Field | Value |
+|---|---|
+| Alias | `csl-daily-signtrajfield-rag-v3-phase-a-motion-contrast-v1-20260907` |
+| State | **Stopped by the scientific gate; not deployable.** The full engineering run completed all configured training and development-validation work, but no feasible checkpoint was produced |
+| Dataset | Full CSL-Daily train split (18,399 rows) plus the validation-only novel-text partition. Epoch selection used 256 development texts/347 signer rows; 540 confirmation texts/728 rows stayed hidden. The two exact-seen validation rows were descriptive only |
+| Training job | Slurm `143050`, name `csl_v3_motion_contrast` (`FAILED`, exit code `143:0`, runtime 1:09:03). This scheduler state records the intentional fail-closed `require_feasible` exception after epoch 4; it is not an OOM, NCCL, staging, or training failure |
+| Configuration | `NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v3_sentence_memory_phase_a_motion_contrast_v1.yaml`; SHA256 `277592b4cebb5d07da4e0cb7f9c162501e6c2ac3fa4860c3459fc1d2ae6b71f5` |
+| Output | `experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_motion_contrast_v1` |
+| Source | Branch `codex/csl-daily-signtrajfield-rag-v3`, commit `16b627681ab96a1dc086cc334de815a9ae990800`, pushed to `origin` before submission |
+| Initialization | Fresh strict import from the frozen CSL-Daily v2 text-only `best.pt`, SHA256 `06ca0a2613005b6e3949bab0e5d7ded999b212723debd3e7685a58c077e44c54`; no resume or warm start. Prediction and duration parity were both exactly `0.0` against the v2 model (tolerance `1e-7`) |
+| Controlled objective change | Every train sample retained its correct-memory task loss and received one auxiliary corrupt copy: deterministic motion-only payload shuffle 90% of the time and full candidate shuffle 10% of the time. Benefit, detached ranking, and fallback losses were enabled at unit weight; sentence sparsity remained `1e-4`. Architecture, frozen generator, bank, `K=8`, top-M 64, duration weight `0.05`, temperature `0.10`, candidate dropout `0.10`, and seed `1234` were unchanged |
+| Frozen/trainable | Phase A' only: all inherited v2 parameters stayed frozen; only the 82 `hypernetwork.sentence_memory_*` tensors trained. Phase B was disabled |
+| Validation partition | SHA256 ordering of normalized novel texts; artifact digest `80f9f5e9fe8414d66730ff0f19bd95fa9f8156922b7cd6f14f27b182cae7d74e`. Durable artifact: `experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_motion_contrast_v1.prerequisites/validation_text_partition` |
+| Validation protocol | Four paired development modes every epoch: text-only, correct retrieval, motion-only shuffle, and full shuffle. Four complete validation events were recorded; no validation batch cap was active |
+| Allocation | Four nodes (`ADUAED21020WKLX07,ADUAED21032WKLX20,ADUAED21033WKLX27,ADUAED21036WKLX05`), one GPU/node, 16 CPUs/node, and 100 GiB/node; rank 0 on node 07 |
+| Batch semantics | Batch 32/GPU, accumulation 2, global effective batch 256; input microbatch cap 8 and frame cap 2048 for the doubled trainable forward |
+| Memory staging | The verified bank and only the train/validation neighbor tables were staged under job-local `/tmp` and strictly audited on every allocated node. No test neighbor table was staged |
+| W&B | Disabled; no external run or online credential dependency |
+| Engineering validation | CPU Slurm `143046` exposed one stale synthetic fixture after the unsalted partition correction (241 passed, 1 failed); targeted repair job `143047` passed 4/4; final CPU Slurm `143048` passed the complete suite (242 tests, 12 warnings). Mandatory one-GPU smoke `143049` completed with exit code 0, exactly one optimizer step (`global_step=1`), exact v2 parity, all four validation modes, and W&B disabled |
+| Best infeasible checkpoint | Epoch 3/global step 216: correct score `12.618111`, text-only `12.714579`, motion-shuffled `12.618139`, full-shuffled `12.618706`, `Rmotion=0.00293078`, constraint violation `0.943335`. It was selected lexicographically for the lowest violation, not promoted |
+| Terminal epoch | Epoch 4/global step 288: correct score `12.607652`, text-only `12.714579`, motion-shuffled `12.607613`, full-shuffled `12.603107`, `Rmotion=0.00267572`, constraint violation `0.948849`. Correct retrieval remained effectively tied with motion shuffle and was worse than full shuffle |
+| Scientific outcome | Failed the correct-over-motion/full 0.1% development margins and the internal `Rmotion >= 0.05` requirement. The run therefore stopped as predeclared; it does not justify Phase B, weaker gates, or checkpoint promotion |
+| Checkpoints | `epoch0001.pt` through `epoch0004.pt`, `last.pt`, and `best_infeasible.pt` exist. **No `best.pt` exists**, and `best_infeasible.pt` must not be promoted or deployed |
+| Confirmation/test status | The 540-text confirmation partition was constructed but never evaluated or used for selection; no confirmation/default-DTW/PA-DTW export was run, and no test-set data was accessed. The selected-checkpoint temporal-slot audit was also not launched because the feasibility prerequisite failed |
+
+Historical inspection commands:
+
+```bash
+scontrol show job 143050
+tail logs/sbatch/csl_v3_motion_contrast_143050.out
+tail logs/sbatch/csl_v3_motion_contrast_143050.err
+```
+
+Run metrics and selection state are stored in:
+
+```text
+experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_motion_contrast_v1/metrics.jsonl
+experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_motion_contrast_v1/selection_summary.json
+```
+
+## Previous: CSL-Daily SignTrajField-RAG v3 Phase-A duration-weight 0.05 pilot
 
 | Field | Value |
 |---|---|
 | Alias | `csl-daily-signtrajfield-rag-v3-phase-a-dw005-pilot2-20260906` |
 | Dataset | Full CSL-Daily train/validation splits (18,399/1,077 samples); this is a two-epoch controlled pilot, not a reduced-data run |
-| Training job | Slurm `142893`, name `csl_rag_dw005_p2` (`RUNNING`; started 2026-09-06 15:46:14 Asia/Dubai, completed strict per-node staging audits, and launched the four-rank training process at the last observation) |
+| Training job | Slurm `142893`, name `csl_rag_dw005_p2` (`COMPLETED`; both configured epochs and global step 144 were written) |
 | Configuration | `NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v3_sentence_memory_phase_a_dw005_pilot2.yaml`; SHA256 `80843eb89075d9829c9db829b16b5d0930a6b6bce91262e4f655a4b4e70febdb` |
 | Output | `experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_dw005_pilot2` (fresh output; the duration-weight 0.10 experiment is not resumed or overwritten) |
 | Source | Branch `codex/csl-daily-signtrajfield-rag-v3`, commit `cfe41628efe99cad7f33666da26278029d4b2fac`, pushed to `origin` before submission |
@@ -104,8 +146,9 @@ logs/sbatch/csl_rag_neighbors_142745.err
 | Artifact identities | Bank ID `a65661333c0f60aa65dc68d896f439a698e37832f04bb8834a378a2d5f068bcd`; train-neighbor SHA256 `d61c0271e190c41d20e822dd4d4f6a2690daa5bfbcd62ef45b58a767377d3852`; validation-neighbor SHA256 `b5f5d0914e55ba9e9c79963bacb955b97d62f99f16f117381187e72c345eb199` |
 | W&B | Disabled (`WANDB=0`); this launch has no W&B run name, ID, URL, resume policy, or online credential dependency |
 | Comparison contract | Compare both epochs against the frozen text-only baseline, shuffled retrieval, and the duration-weight 0.10 Phase-A result; do not advance to Phase B unless correct retrieval passes the existing validation and hand-path feasibility gates |
+| Final outcome | Epoch 2 correct-memory score `12.716377` versus text-only `12.838353` and shuffled-memory `12.716469`; the required 0.1% correct-over-shuffled margin failed. `best_infeasible.pt` selects epoch 2, no feasible `best.pt` was created, and the pilot did not advance to Phase B |
 
-Live tracing commands:
+Historical inspection commands:
 
 ```bash
 squeue -j 142893 -o '%.18i %.28j %.10T %.12M %.12l %.4D %R'
@@ -120,10 +163,8 @@ Epoch metrics will be written to:
 experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_dw005_pilot2/metrics.jsonl
 ```
 
-If job `142893` fails after producing a recovery checkpoint, resume only from
-this pilot's own `checkpoints/last.pt` with the exact committed configuration,
-bank, neighbor tables, optimizer, and RNG state. Do not resume from the
-duration-weight 0.10 run or silently reuse an incomplete fresh output.
+The pilot is complete. Do not promote its `best_infeasible.pt` or resume it as
+the Phase-A' motion-contrast experiment.
 
 ## Previous: CSL-Daily SignTrajField-RAG v3 Phase A (duration weight 0.10)
 
