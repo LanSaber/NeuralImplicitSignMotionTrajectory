@@ -25,7 +25,7 @@ from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field 
     build_sentence_memory_provider,
     checkpoint_selection_diagnostics,
     configured_sentence_memory_eval_modes,
-    distributed_sample_weighted_mean_scalars,
+    distributed_validation_metrics,
     evaluate,
     evaluate_configured_modes,
     evaluated_loader_sample_count,
@@ -78,10 +78,17 @@ def parse_args():
         "--sentence_memory",
         dest="sentence_memory_mode",
         default="auto",
-        choices=("auto", "off", "on", "both", "shuffled"),
+        choices=(
+            "auto",
+            "off",
+            "on",
+            "both",
+            "shuffled",
+            "motion_shuffled",
+        ),
         help=(
             "For v3, evaluate configured modes (auto), off, on, off+on "
-            "(both), or the deterministic shuffled-memory control."
+            "(both), or a deterministic full- or motion-only-shuffled control."
         ),
     )
     parser.add_argument("--device", default=None)
@@ -107,6 +114,23 @@ def parse_args():
         default=60,
     )
     return parser.parse_args()
+
+
+def reduce_external_evaluation_metrics(
+    metrics,
+    loader,
+    max_batches,
+    device,
+    dist_info,
+):
+    """Reduce ordinary means and paired Rmotion moments for standalone eval."""
+
+    return distributed_validation_metrics(
+        metrics,
+        evaluated_loader_sample_count(loader, max_batches),
+        device,
+        dist_info,
+    )
 
 
 def main():
@@ -287,9 +311,10 @@ def main():
             show_progress=dist_info["is_main"],
             **evaluation_kwargs,
         )
-        metrics = distributed_sample_weighted_mean_scalars(
+        metrics = reduce_external_evaluation_metrics(
             metrics,
-            evaluated_loader_sample_count(eval_loader, args.max_batches),
+            eval_loader,
+            args.max_batches,
             device,
             dist_info,
         )

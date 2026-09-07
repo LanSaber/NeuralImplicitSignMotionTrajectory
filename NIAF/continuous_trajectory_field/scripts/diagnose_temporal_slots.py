@@ -1,8 +1,10 @@
 """Diagnose temporal-slot organization and sentence-memory use on CSL-Daily.
 
-This entry point is deliberately bound to the completed epoch-2, duration-
-weight-0.05 Phase-A experiment.  It is a read-only validation audit: it never
-updates weights, never reads the test split, and never initializes W&B.
+This entry point exposes two explicit, provenance-checked profiles: the
+completed epoch-2 duration-weight-0.05 Phase-A experiment, and the locked
+``best.pt`` selected by the full Phase-A' motion-contrast run.  It is a
+read-only validation audit: it never updates weights, never reads the test
+split, and never initializes W&B.
 
 The command has two independently promoted stages.  ``smoke`` exercises the
 full pipeline on eight validation examples; ``full`` audits all validation rows
@@ -16,6 +18,7 @@ complete successfully.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import dataclasses
 import fcntl
@@ -67,13 +70,18 @@ from NIAF.continuous_trajectory_field.models.hierarchical_field import (
 )
 from NIAF.continuous_trajectory_field.sentence_memory import (
     SentenceMemoryBatch,
+    motion_only_shuffle_sentence_memory_batch,
     normalize_sentence_text,
     sentence_text_hash,
 )
 from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field import (
     build_sentence_memory_provider,
     retrieve_sentence_memory,
+    sentence_memory_behavior_identity,
     sentence_memory_forward_kwargs,
+    sentence_memory_objective_identity,
+    sentence_memory_query_ids,
+    sentence_memory_resume_identity,
     set_seed,
     set_sentence_memory_provider_epoch_from_checkpoint,
     validate_checkpoint_contract,
@@ -151,6 +159,58 @@ EXPECTED_OUTPUT = (
     / EXPECTED_EXPERIMENT
     / "evaluation/epoch0002_validation_slot_diagnostics"
 )
+LEGACY_PROFILE_NAME = "dw005_epoch2"
+PHASE_A_PRIME_PROFILE_NAME = "phase_a_motion_contrast_v1"
+PHASE_A_PRIME_EXPERIMENT = (
+    "csl_daily_signtrajfield_v3_sentence_memory_phase_a_motion_contrast_v1"
+)
+PHASE_A_PRIME_CONFIG = (
+    PROJECT_ROOT
+    / "NIAF/continuous_trajectory_field/configs"
+    / f"{PHASE_A_PRIME_EXPERIMENT}.yaml"
+)
+PHASE_A_PRIME_RUN_DIR = (
+    PROJECT_ROOT
+    / "experiments/NIAF/continuous_trajectory_field"
+    / PHASE_A_PRIME_EXPERIMENT
+)
+PHASE_A_PRIME_CHECKPOINT = PHASE_A_PRIME_RUN_DIR / "checkpoints/best.pt"
+PHASE_A_PRIME_OUTPUT = (
+    PHASE_A_PRIME_RUN_DIR / "evaluation/locked_validation_slot_diagnostics"
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class DiagnosticProfile:
+    name: str
+    experiment_name: str
+    config: Path
+    checkpoint: Path
+    output: Path
+    fixed_checkpoint_sha256: str | None = None
+    fixed_epoch: int | None = None
+    require_locked_full_run: bool = False
+
+
+DIAGNOSTIC_PROFILES = {
+    LEGACY_PROFILE_NAME: DiagnosticProfile(
+        name=LEGACY_PROFILE_NAME,
+        experiment_name=EXPECTED_EXPERIMENT,
+        config=EXPECTED_CONFIG,
+        checkpoint=EXPECTED_CHECKPOINT,
+        output=EXPECTED_OUTPUT,
+        fixed_checkpoint_sha256=EXPECTED_CHECKPOINT_SHA256,
+        fixed_epoch=EXPECTED_EPOCH,
+    ),
+    PHASE_A_PRIME_PROFILE_NAME: DiagnosticProfile(
+        name=PHASE_A_PRIME_PROFILE_NAME,
+        experiment_name=PHASE_A_PRIME_EXPERIMENT,
+        config=PHASE_A_PRIME_CONFIG,
+        checkpoint=PHASE_A_PRIME_CHECKPOINT,
+        output=PHASE_A_PRIME_OUTPUT,
+        require_locked_full_run=True,
+    ),
+}
 DIAGNOSTIC_RUNNER_SOURCE = Path(__file__).resolve()
 DIAGNOSTIC_CORE_SOURCE = (
     PROJECT_ROOT
@@ -224,12 +284,17 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Measure temporal-slot collapse, slot-to-token organization, "
             "sentence-memory selectivity, and causal slot locality for the "
-            "fixed CSL-Daily duration-weight-0.05 epoch-2 checkpoint."
+            "provenance-locked CSL-Daily duration-weight-0.05 checkpoint."
         )
     )
-    parser.add_argument("--config", type=Path, default=EXPECTED_CONFIG)
-    parser.add_argument("--checkpoint", type=Path, default=EXPECTED_CHECKPOINT)
-    parser.add_argument("--out_dir", "--out-dir", type=Path, default=EXPECTED_OUTPUT)
+    parser.add_argument(
+        "--profile",
+        choices=tuple(DIAGNOSTIC_PROFILES),
+        default=LEGACY_PROFILE_NAME,
+    )
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--out_dir", "--out-dir", type=Path)
     parser.add_argument("--stage", choices=("smoke", "full"), default="full")
     parser.add_argument("--batch_size", "--batch-size", type=int, default=16)
     parser.add_argument(
@@ -255,7 +320,12 @@ def parse_args() -> argparse.Namespace:
             "successfully when an identity-matching READY result exists."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    profile = DIAGNOSTIC_PROFILES[args.profile]
+    args.config = args.config or profile.config
+    args.checkpoint = args.checkpoint or profile.checkpoint
+    args.out_dir = args.out_dir or profile.output
+    return args
 
 
 def _utc_now() -> str:
@@ -443,7 +513,18 @@ def _git_head() -> str:
     return value.lower()
 
 
-def _validate_arguments(args: argparse.Namespace) -> None:
+def _selected_profile(args: argparse.Namespace) -> DiagnosticProfile:
+    name = str(getattr(args, "profile", LEGACY_PROFILE_NAME))
+    try:
+        return DIAGNOSTIC_PROFILES[name]
+    except KeyError as error:
+        raise ValueError(f"Unknown diagnostic profile: {name!r}") from error
+
+
+def _validate_arguments(
+    args: argparse.Namespace, profile: DiagnosticProfile | None = None
+) -> None:
+    profile = profile or _selected_profile(args)
     for name in (
         "batch_size",
         "perturb_batch_size",
@@ -484,28 +565,33 @@ def _validate_arguments(args: argparse.Namespace) -> None:
 
     config = args.config.resolve(strict=True)
     checkpoint = args.checkpoint.resolve(strict=True)
-    if config != EXPECTED_CONFIG.resolve(strict=True):
+    if config != profile.config.resolve(strict=True):
         raise ValueError(
-            "This audit is pinned to the duration-weight-0.05 config: "
-            f"{EXPECTED_CONFIG}"
+            f"Profile {profile.name!r} is pinned to config {profile.config}"
         )
-    if checkpoint != EXPECTED_CHECKPOINT.resolve(strict=True):
+    if checkpoint != profile.checkpoint.resolve(strict=True):
         raise ValueError(
-            "This audit is pinned to the explicit epoch-2 checkpoint: "
-            f"{EXPECTED_CHECKPOINT}"
+            f"Profile {profile.name!r} is pinned to checkpoint "
+            f"{profile.checkpoint}"
         )
     checkpoint_sha = _sha256(checkpoint)
-    if checkpoint_sha != EXPECTED_CHECKPOINT_SHA256:
+    if (
+        profile.fixed_checkpoint_sha256 is not None
+        and checkpoint_sha != profile.fixed_checkpoint_sha256
+    ):
         raise RuntimeError(
             "Pinned checkpoint hash mismatch: "
-            f"expected={EXPECTED_CHECKPOINT_SHA256}, actual={checkpoint_sha}"
+            f"expected={profile.fixed_checkpoint_sha256}, actual={checkpoint_sha}"
         )
-    if args.stage == "full" and args.out_dir.resolve() != EXPECTED_OUTPUT.resolve():
-        raise ValueError(f"Full output must be written to {EXPECTED_OUTPUT}")
+    if args.stage == "full" and args.out_dir.resolve() != profile.output.resolve():
+        raise ValueError(f"Full output must be written to {profile.output}")
 
 
-def _validate_config(cfg: Mapping[str, Any]) -> None:
-    if str(cfg.get("experiment_name")) != EXPECTED_EXPERIMENT:
+def _validate_config(
+    cfg: Mapping[str, Any], profile: DiagnosticProfile | None = None
+) -> None:
+    profile = profile or DIAGNOSTIC_PROFILES[LEGACY_PROFILE_NAME]
+    if str(cfg.get("experiment_name")) != profile.experiment_name:
         raise ValueError("Unexpected experiment_name in pinned configuration")
     if str(cfg.get("data", {}).get("train_split")) != "train":
         raise ValueError("The sentence bank must remain train-only")
@@ -552,18 +638,307 @@ def _validate_config(cfg: Mapping[str, Any]) -> None:
         raise ValueError("Word prior must be disabled for this attribution audit")
 
 
-def _load_checkpoint(path: Path) -> dict[str, Any]:
+def _load_checkpoint(
+    path: Path, *, expected_epoch: int | None = EXPECTED_EPOCH
+) -> dict[str, Any]:
     try:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
         checkpoint = torch.load(path, map_location="cpu")
     if not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("model"), dict):
         raise RuntimeError("Checkpoint does not contain a model state dictionary")
-    if int(checkpoint.get("epoch", -1)) != EXPECTED_EPOCH:
+    checkpoint_epoch = int(checkpoint.get("epoch", -1))
+    if checkpoint_epoch < 1:
+        raise RuntimeError(f"Checkpoint has invalid epoch={checkpoint_epoch!r}")
+    if expected_epoch is not None and checkpoint_epoch != expected_epoch:
         raise RuntimeError(
-            f"Checkpoint epoch={checkpoint.get('epoch')!r}; expected {EXPECTED_EPOCH}"
+            f"Checkpoint epoch={checkpoint_epoch!r}; expected {expected_epoch}"
         )
     return checkpoint
+
+
+_PHASE_A_PRIME_DYNAMIC_PARTITION_FIELDS = (
+    "partition_digest",
+    "resolved_artifact",
+    "development_row_count",
+    "exact_seen_row_count",
+    "exact_seen_text_count",
+    "exact_seen_evaluated_during_training",
+    "confirmation_evaluated_during_training",
+)
+
+
+def _static_phase_a_prime_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove only attested runtime fields before exact config comparison."""
+
+    payload = copy.deepcopy(dict(cfg))
+    memory_cfg = payload.get("sentence_memory")
+    if isinstance(memory_cfg, dict):
+        memory_cfg.pop("resolved_identity", None)
+        memory_cfg.pop("resolved_behavior_identity", None)
+    safety_cfg = payload.get("sentence_memory_safety")
+    if isinstance(safety_cfg, dict):
+        safety_cfg.pop("v2_to_v3_text_only_parity", None)
+    partition_cfg = payload.get("validation_text_partition")
+    if isinstance(partition_cfg, dict):
+        for field in _PHASE_A_PRIME_DYNAMIC_PARTITION_FIELDS:
+            partition_cfg.pop(field, None)
+    out_dir = str(dict(payload.get("output", {}) or {}).get("out_dir", ""))
+    if Path(out_dir).name != PHASE_A_PRIME_EXPERIMENT:
+        raise RuntimeError("Checkpoint output is not the full Phase-A' run")
+    payload.setdefault("output", {})["out_dir"] = PHASE_A_PRIME_EXPERIMENT
+    return payload
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Cannot read locked-run artifact {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Locked-run artifact is not an object: {path}")
+    return value
+
+
+def _read_jsonl_objects(path: Path) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise RuntimeError(f"Cannot read locked-run metrics {path}: {error}") from error
+    rows: list[dict[str, Any]] = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"Invalid JSON in {path} at line {line_number}"
+            ) from error
+        if not isinstance(row, dict):
+            raise RuntimeError(f"Non-object metrics row in {path} at line {line_number}")
+        rows.append(row)
+    return rows
+
+
+def _validate_phase_a_prime_locked_run(
+    checkpoint: Mapping[str, Any],
+    *,
+    checkpoint_path: Path,
+    config_path: Path,
+    run_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Prove that ``best.pt`` came from the completed four-rank full run.
+
+    This deliberately consumes only checkpoint and run-control artifacts.  It
+    does not require confirmation results and never opens a test manifest or a
+    test neighbor table.
+    """
+
+    run_dir = (run_dir or PHASE_A_PRIME_RUN_DIR).resolve()
+    if run_dir.name != PHASE_A_PRIME_EXPERIMENT:
+        raise RuntimeError("Phase-A' run directory has the wrong experiment name")
+    resolved_checkpoint = checkpoint_path.resolve(strict=True)
+    if resolved_checkpoint != (run_dir / "checkpoints/best.pt").resolve():
+        raise RuntimeError(
+            "Phase-A' diagnostics accept only the locked RUN_DIR/checkpoints/best.pt"
+        )
+    if config_path.resolve(strict=True) != PHASE_A_PRIME_CONFIG.resolve(strict=True):
+        raise RuntimeError("Phase-A' diagnostics require the exact full-run config")
+
+    cfg = copy.deepcopy(dict(checkpoint.get("config", {}) or {}))
+    expected_cfg = load_config(config_path)
+    expected_cfg["device"] = "cuda"
+    checkpoint_partition_cfg = dict(
+        cfg.get("validation_text_partition", {}) or {}
+    )
+    expected_partition_cfg = expected_cfg.setdefault(
+        "validation_text_partition", {}
+    )
+    for field in _PHASE_A_PRIME_DYNAMIC_PARTITION_FIELDS:
+        if field in checkpoint_partition_cfg:
+            expected_partition_cfg[field] = copy.deepcopy(
+                checkpoint_partition_cfg[field]
+            )
+    if _static_phase_a_prime_config(cfg) != _static_phase_a_prime_config(expected_cfg):
+        raise RuntimeError("Selected checkpoint config differs from the full-run config")
+    epoch = int(checkpoint.get("epoch", -1))
+    if epoch < 1 or epoch > 4:
+        raise RuntimeError("Selected Phase-A' epoch must be in [1, 4]")
+
+    train_cfg = dict(cfg.get("train", {}) or {})
+    data_cfg = dict(cfg.get("data", {}) or {})
+    eval_cfg = dict(cfg.get("eval", {}) or {})
+    if (
+        int(train_cfg.get("epochs", -1)) != 4
+        or int(train_cfg.get("early_stopping_patience", -1)) != 2
+        or int(train_cfg.get("early_stopping_min_epochs", -1)) != 2
+    ):
+        raise RuntimeError("Selected checkpoint lacks the approved early-stop contract")
+    if any(
+        int(value or 0) != 0
+        for value in (
+            data_cfg.get("limit_train", 0),
+            data_cfg.get("limit_val", 0),
+            train_cfg.get("max_train_batches", 0),
+            eval_cfg.get("max_batches", 0),
+        )
+    ):
+        raise RuntimeError("Smoke or subset checkpoints cannot enter full diagnostics")
+    if not bool(train_cfg.get("freeze_base", False)) or train_cfg.get(
+        "unfreeze_base_prefixes"
+    ):
+        raise RuntimeError("Selected checkpoint is not frozen-base Phase A")
+    if bool(cfg.get("sentence_memory_safety", {}).get("phase_b", {}).get("enabled")):
+        raise RuntimeError("Phase-B checkpoints cannot enter Phase-A' diagnostics")
+
+    metrics = dict(checkpoint.get("metrics", {}) or {})
+    if float(metrics.get("selection_feasible", 0.0)) != 1.0:
+        raise RuntimeError("Selected checkpoint did not pass development selection")
+    required_namespaces = (
+        "val_text_only/",
+        "val_sentence_memory/",
+        "val_shuffled_sentence_memory/",
+        "val_motion_shuffled_sentence_memory/",
+    )
+    if any(not any(str(key).startswith(prefix) for key in metrics) for prefix in required_namespaces):
+        raise RuntimeError("Selected checkpoint lacks all four development modes")
+    parity = dict(checkpoint.get("v2_to_v3_text_only_parity", {}) or {})
+    if (
+        parity.get("passed") is not True
+        or float(parity.get("prediction_max_abs", math.inf)) > 1e-7
+        or float(parity.get("duration_max_abs", math.inf)) > 1e-7
+    ):
+        raise RuntimeError("Selected checkpoint lacks strict v2 text-only parity")
+
+    partition_cfg = dict(cfg.get("validation_text_partition", {}) or {})
+    partition_digest = partition_cfg.get("partition_digest")
+    resolved_partition = partition_cfg.get("resolved_artifact")
+    if not isinstance(partition_digest, str) or len(partition_digest) != 64:
+        raise RuntimeError("Selected checkpoint lacks a locked partition digest")
+    if not isinstance(resolved_partition, dict):
+        raise RuntimeError("Selected checkpoint lacks resolved partition provenance")
+    resolved_without_digest = {
+        key: value for key, value in resolved_partition.items() if key != "partition_digest"
+    }
+    if _digest_json(resolved_without_digest) != resolved_partition.get(
+        "partition_digest"
+    ) or resolved_partition.get("partition_digest") != partition_digest:
+        raise RuntimeError("Selected checkpoint partition provenance is invalid")
+    counts = dict(resolved_partition.get("counts", {}) or {})
+    expected_counts = {
+        "rows": 1_077,
+        "novel_unique_texts": 796,
+        "development_unique_texts": 256,
+        "confirmation_unique_texts": 540,
+        "development_rows": 347,
+        "confirmation_rows": 728,
+    }
+    if any(int(counts.get(name, -1)) != value for name, value in expected_counts.items()):
+        raise RuntimeError("Selected checkpoint partition counts are incomplete")
+    if partition_cfg.get("confirmation_evaluated_during_training") is not False:
+        raise RuntimeError("Checkpoint does not attest that confirmation stayed locked")
+
+    for name, compute in (
+        ("objective", sentence_memory_objective_identity),
+        ("behavior", sentence_memory_behavior_identity),
+        ("resume", sentence_memory_resume_identity),
+    ):
+        actual = checkpoint.get(f"sentence_memory_{name}_identity")
+        if actual != compute(cfg) or actual != compute(expected_cfg):
+            raise RuntimeError(f"Selected checkpoint has an invalid {name} identity")
+    neighbor_tables = dict(
+        dict(checkpoint.get("sentence_memory_identity", {}) or {}).get(
+            "neighbor_tables", {}
+        )
+        or {}
+    )
+    if set(neighbor_tables) != {"train", "val"}:
+        raise RuntimeError(
+            "Selected checkpoint must contain exactly train/val neighbor identities"
+        )
+    rng_state = dict(checkpoint.get("rng_state", {}) or {})
+    rank_states = list(rng_state.get("rank_states", []) or [])
+    if int(rng_state.get("world_size", -1)) != 4 or sorted(
+        int(row.get("rank", -1)) for row in rank_states if isinstance(row, dict)
+    ) != [0, 1, 2, 3]:
+        raise RuntimeError("Selected checkpoint lacks four-rank full-run RNG state")
+
+    summary_path = run_dir / "selection_summary.json"
+    metrics_path = run_dir / "metrics.jsonl"
+    resolved_config_path = run_dir / "config.resolved.json"
+    summary = _read_json_object(summary_path)
+    rows = _read_jsonl_objects(metrics_path)
+    resolved_cfg = _read_json_object(resolved_config_path)
+    if _static_phase_a_prime_config(resolved_cfg) != _static_phase_a_prime_config(
+        expected_cfg
+    ):
+        raise RuntimeError("Resolved run config differs from the approved full config")
+    if summary.get("has_feasible_checkpoint") is not True or summary.get(
+        "required"
+    ) is not True:
+        raise RuntimeError("Full run did not terminate with a required feasible checkpoint")
+    early_state = summary.get("early_stopping")
+    if not isinstance(early_state, dict) or int(
+        early_state.get("validation_count", -1)
+    ) < 2:
+        raise RuntimeError("Full run has fewer than two development validations")
+    completed = [
+        row
+        for row in rows
+        if float(row.get("validation_pending", 1.0)) == 0.0
+        and "selection_feasible" in row
+    ]
+    if len(completed) < 2 or len(completed) != len(rows):
+        raise RuntimeError("Full run has incomplete development-validation evidence")
+    epochs = [int(row.get("epoch", -1)) for row in completed]
+    if epochs != list(range(1, max(epochs) + 1)) or max(epochs) < 2:
+        raise RuntimeError("Full-run epoch history is incomplete or noncanonical")
+    if not bool(early_state.get("stopped", False)) and max(epochs) != 4:
+        raise RuntimeError("Run has neither early-stop nor four-epoch completion evidence")
+    for row in completed:
+        if any(not any(str(key).startswith(prefix) for key in row) for prefix in required_namespaces):
+            raise RuntimeError("A completed epoch lacks a development evaluation mode")
+    feasible_rows = [
+        row for row in completed if float(row.get("selection_feasible", 0.0)) == 1.0
+    ]
+    if not feasible_rows:
+        raise RuntimeError("Full-run metrics contain no feasible checkpoint")
+    best_score = float(summary.get("best_feasible_score", math.nan))
+    checkpoint_score = float(metrics.get("selection_score", math.nan))
+    metric_best = min(float(row["selection_score"]) for row in feasible_rows)
+    if not all(math.isfinite(value) for value in (best_score, checkpoint_score, metric_best)):
+        raise RuntimeError("Selected checkpoint score evidence is non-finite")
+    if best_score != metric_best or checkpoint_score != best_score:
+        raise RuntimeError("Selected checkpoint score disagrees with full-run evidence")
+    checkpoint_selection = dict(checkpoint.get("selection_state", {}) or {})
+    if float(checkpoint_selection.get("best_feasible_score", math.nan)) != best_score:
+        raise RuntimeError("Selected checkpoint lacks matching feasible-selection state")
+    selected_rows = [
+        row
+        for row in feasible_rows
+        if int(row.get("epoch", -1)) == epoch
+        and float(row.get("selection_score", math.nan)) == best_score
+    ]
+    if len(selected_rows) != 1:
+        raise RuntimeError("best.pt is not the unique selected metrics row")
+
+    return {
+        "schema_name": "phase_a_motion_contrast_locked_run",
+        "schema_version": 1,
+        "run_dir": str(run_dir),
+        "checkpoint_epoch": epoch,
+        "partition_digest": partition_digest,
+        "complete_validation_events": len(completed),
+        "terminal_epoch": max(epochs),
+        "best_feasible_score": best_score,
+        "selection_summary_sha256": _sha256(summary_path),
+        "metrics_jsonl_sha256": _sha256(metrics_path),
+        "resolved_config_sha256": _sha256(resolved_config_path),
+        "objective_identity": checkpoint["sentence_memory_objective_identity"],
+        "behavior_identity": checkpoint["sentence_memory_behavior_identity"],
+        "resume_identity": checkpoint["sentence_memory_resume_identity"],
+    }
 
 
 def _validate_checkpoint_identity_without_test(
@@ -1084,10 +1459,22 @@ def _ready_identity(
         return None
     if expected.get("git_head") != _git_head():
         return None
-    if _sha256(EXPECTED_CONFIG) != expected.get("config_sha256"):
+    try:
+        profile = DIAGNOSTIC_PROFILES[str(expected.get("profile"))]
+        config_path = Path(str(expected.get("config_path"))).resolve(strict=True)
+        checkpoint_path = Path(str(expected.get("checkpoint_path"))).resolve(
+            strict=True
+        )
+    except (KeyError, OSError):
         return None
-    current_cfg = load_config(EXPECTED_CONFIG)
-    _validate_config(current_cfg)
+    if config_path != profile.config.resolve() or checkpoint_path != profile.checkpoint.resolve():
+        return None
+    if _sha256(config_path) != expected.get("config_sha256"):
+        return None
+    if _sha256(checkpoint_path) != expected.get("checkpoint_sha256"):
+        return None
+    current_cfg = load_config(config_path)
+    _validate_config(current_cfg, profile)
     current_cfg.setdefault("data", {})["random_crop"] = False
     current_cfg.setdefault("text", {})["device"] = "cpu"
     current_cfg["device"] = "cuda"
@@ -1110,6 +1497,10 @@ def _ready_identity(
         marker.get("schema_name") != SCHEMA_NAME
         or int(marker.get("schema_version", -1)) != SCHEMA_VERSION
         or marker.get("provenance_sha256") != _sha256(identity_path)
+        or marker.get("profile") != expected.get("profile")
+        or marker.get("checkpoint_sha256") != expected.get("checkpoint_sha256")
+        or int(marker.get("checkpoint_epoch", -1))
+        != int(expected.get("checkpoint_epoch", -2))
     ):
         return None
     if any(not (out_dir / relative).is_file() for relative in READY_REQUIRED_FILES):
@@ -1122,9 +1513,13 @@ def _ready_identity(
         return None
     actual_bank = (value.get("bank_identity") or {}).get("bank_id")
     comparisons = {
+        "profile": value.get("profile"),
         "stage": value.get("stage"),
         "split": value.get("split"),
+        "checkpoint_path": value.get("checkpoint"),
         "checkpoint_sha256": value.get("checkpoint_sha256"),
+        "checkpoint_epoch": value.get("checkpoint_epoch"),
+        "config_path": value.get("config"),
         "config_sha256": value.get("config_sha256"),
         "resolved_config_sha256": value.get("resolved_config_sha256"),
         "bank_id": actual_bank,
@@ -1134,6 +1529,7 @@ def _ready_identity(
         "git_head": value.get("git_head"),
         "neighbor_table_sha256": value.get("neighbor_table_sha256"),
         "validation_manifest": value.get("validation_manifest"),
+        "locked_run_evidence": value.get("locked_run_evidence"),
     }
     if comparisons != dict(expected):
         return None
@@ -1229,6 +1625,13 @@ def _atomic_output(
                 {
                     "schema_name": SCHEMA_NAME,
                     "schema_version": SCHEMA_VERSION,
+                    "profile": expected_identity.get("profile"),
+                    "checkpoint_sha256": expected_identity.get(
+                        "checkpoint_sha256"
+                    ),
+                    "checkpoint_epoch": expected_identity.get(
+                        "checkpoint_epoch"
+                    ),
                     "provenance_sha256": _sha256(provenance_path),
                 },
             )
@@ -1293,34 +1696,16 @@ def _motion_only_shuffle(
     memory: SentenceMemoryBatch,
     query_ids: Sequence[str],
     *,
+    epoch: int,
     seed: int,
 ) -> tuple[SentenceMemoryBatch, torch.Tensor]:
-    batch, candidates = memory.candidate_mask.shape
-    permutations = torch.arange(candidates, device=memory.tokens.device)[None].repeat(
-        batch, 1
-    )
-    for row, query_id in enumerate(query_ids):
-        valid = torch.nonzero(memory.candidate_mask[row], as_tuple=False).flatten()
-        if len(valid) > 1:
-            shift = 1 + stable_int_seed(
-                "motion-only", query_id, base_seed=seed
-            ) % (len(valid) - 1)
-            permutations[row, valid] = torch.roll(valid, shifts=int(shift))
-
-    def gather(value: torch.Tensor) -> torch.Tensor:
-        index = permutations.reshape(batch, candidates, *([1] * (value.ndim - 2)))
-        return torch.gather(value, 1, index.expand_as(value))
-
-    provenance = dict(memory.provenance)
-    provenance["mode"] = "motion_only_shuffle"
-    provenance["motion_candidate_permutation"] = permutations.detach().cpu().tolist()
-    shuffled = _replace_memory(
-        memory,
-        tokens=gather(memory.tokens),
-        token_mask=gather(memory.token_mask),
-        token_tau=gather(memory.token_tau),
-        part_validity=gather(memory.part_validity),
-        provenance=provenance,
+    shuffled, permutations, _informative = (
+        motion_only_shuffle_sentence_memory_batch(
+            memory,
+            query_ids=query_ids,
+            epoch=epoch,
+            seed=seed,
+        )
     )
     return shuffled, permutations
 
@@ -1336,11 +1721,7 @@ def _all_null(memory: SentenceMemoryBatch) -> SentenceMemoryBatch:
 
 
 def _query_ids(batch: Mapping[str, Any]) -> list[str]:
-    indices = batch["index"].detach().cpu().long().tolist()
-    return [
-        f"{index}:{name}:{path}"
-        for index, name, path in zip(indices, batch["name"], batch["motion_path"])
-    ]
+    return sentence_memory_query_ids(batch)
 
 
 def _first_unique_novel_indices(dataset, provider, count: int) -> list[int]:
@@ -2034,6 +2415,7 @@ def _passive_sweep(
     indices: Sequence[int],
     cfg,
     device: torch.device,
+    checkpoint_epoch: int,
     args,
     store: ArrayStore,
     workspace: _ResumeWorkspace,
@@ -2112,7 +2494,10 @@ def _passive_sweep(
                 mode="shuffled",
             )
             motion_only, motion_permutation = _motion_only_shuffle(
-                correct, query_ids, seed=args.seed
+                correct,
+                query_ids,
+                epoch=checkpoint_epoch,
+                seed=args.seed,
             )
             store["motion_source_permutation"][destination] = (
                 motion_permutation.detach().cpu().numpy().astype(np.int16)
@@ -4240,13 +4625,26 @@ def _write_report(
 
 
 def run(args: argparse.Namespace) -> Path:
-    _validate_arguments(args)
+    profile = _selected_profile(args)
+    _validate_arguments(args, profile)
     cfg = load_config(args.config)
-    _validate_config(cfg)
+    _validate_config(cfg, profile)
     cfg.setdefault("data", {})["random_crop"] = False
     cfg.setdefault("text", {})["device"] = "cpu"
     cfg["device"] = "cuda"
     resolved_config_sha256 = _digest_json(cfg)
+    checkpoint_sha256 = _sha256(args.checkpoint)
+    checkpoint = _load_checkpoint(
+        args.checkpoint, expected_epoch=profile.fixed_epoch
+    )
+    checkpoint_epoch = int(checkpoint["epoch"])
+    locked_run_evidence: dict[str, Any] | None = None
+    if profile.require_locked_full_run:
+        locked_run_evidence = _validate_phase_a_prime_locked_run(
+            checkpoint,
+            checkpoint_path=args.checkpoint,
+            config_path=args.config,
+        )
     validation_manifest_sha256 = _sha256(EXPECTED_VALIDATION_MANIFEST)
     if validation_manifest_sha256 != EXPECTED_VALIDATION_MANIFEST_SHA256:
         raise RuntimeError(
@@ -4313,12 +4711,17 @@ def run(args: argparse.Namespace) -> Path:
         "duration_weight": EXPECTED_DURATION_WEIGHT,
         "score_temperature": EXPECTED_SCORE_TEMPERATURE,
         "k": EXPECTED_K,
+        "motion_shuffle_epoch": checkpoint_epoch,
         "verify_hashes": bool(args.verify_hashes),
     }
     expected_ready_identity = {
+        "profile": profile.name,
         "stage": args.stage,
         "split": "val",
-        "checkpoint_sha256": EXPECTED_CHECKPOINT_SHA256,
+        "checkpoint_path": str(args.checkpoint.resolve()),
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_epoch": checkpoint_epoch,
+        "config_path": str(args.config.resolve()),
         "config_sha256": _sha256(args.config),
         "resolved_config_sha256": resolved_config_sha256,
         "bank_id": str(bank_metadata.get("bank_id")),
@@ -4333,6 +4736,7 @@ def run(args: argparse.Namespace) -> Path:
         },
         "source_sha256": source_sha256,
         "git_head": git_head,
+        "locked_run_evidence": locked_run_evidence,
     }
 
     with _atomic_output(
@@ -4346,7 +4750,6 @@ def run(args: argparse.Namespace) -> Path:
             print(f"READY diagnostic already exists: {args.out_dir}")
             return args.out_dir
         building = workspace.root
-        checkpoint = _load_checkpoint(args.checkpoint)
         validate_checkpoint_contract(checkpoint, cfg, source=str(args.checkpoint))
 
         dataset = ContinuousSignDataset(
@@ -4364,10 +4767,10 @@ def run(args: argparse.Namespace) -> Path:
         text_encoder = build_text_encoder(cfg, torch.device("cpu"))
         provider = build_sentence_memory_provider(cfg, text_encoder, dataset=dataset)
         provider.validate_query_dataset(dataset, require_neighbors=True)
-        checkpoint_epoch = set_sentence_memory_provider_epoch_from_checkpoint(
+        provider_epoch = set_sentence_memory_provider_epoch_from_checkpoint(
             provider, checkpoint
         )
-        if checkpoint_epoch != EXPECTED_EPOCH:
+        if provider_epoch != checkpoint_epoch:
             raise RuntimeError("Provider epoch differs from the pinned checkpoint")
         _validate_checkpoint_identity_without_test(
             checkpoint,
@@ -4452,6 +4855,7 @@ def run(args: argparse.Namespace) -> Path:
                 indices=passive_indices,
                 cfg=cfg,
                 device=device,
+                checkpoint_epoch=checkpoint_epoch,
                 args=args,
                 store=store,
                 workspace=workspace,
@@ -4624,6 +5028,7 @@ def run(args: argparse.Namespace) -> Path:
         summary = {
             "schema_name": SCHEMA_NAME,
             "schema_version": SCHEMA_VERSION,
+            "profile": profile.name,
             "stage": args.stage,
             "validation_only": True,
             "diagnostic_only": True,
@@ -4665,16 +5070,27 @@ def run(args: argparse.Namespace) -> Path:
             findings=findings,
         )
         artifact_manifest_sha256 = _write_artifact_manifest(building)
+        if _sha256(args.checkpoint) != checkpoint_sha256:
+            raise RuntimeError("Selected checkpoint changed during the diagnostic")
+        if profile.require_locked_full_run:
+            final_locked_evidence = _validate_phase_a_prime_locked_run(
+                checkpoint,
+                checkpoint_path=args.checkpoint,
+                config_path=args.config,
+            )
+            if final_locked_evidence != locked_run_evidence:
+                raise RuntimeError("Locked full-run provenance changed during the audit")
         provenance = {
             "schema_name": SCHEMA_NAME,
             "schema_version": SCHEMA_VERSION,
             "created_at": _utc_now(),
+            "profile": profile.name,
             "stage": args.stage,
             "validation_only": True,
             "split": "val",
             "checkpoint": str(args.checkpoint.resolve()),
-            "checkpoint_sha256": EXPECTED_CHECKPOINT_SHA256,
-            "checkpoint_epoch": EXPECTED_EPOCH,
+            "checkpoint_sha256": checkpoint_sha256,
+            "checkpoint_epoch": checkpoint_epoch,
             "config": str(args.config.resolve()),
             "config_sha256": _sha256(args.config),
             "resolved_config_sha256": resolved_config_sha256,
@@ -4684,6 +5100,7 @@ def run(args: argparse.Namespace) -> Path:
                 "neighbor_table_sha256"
             ],
             "validation_manifest": validation_manifest_identity,
+            "locked_run_evidence": locked_run_evidence,
             "bank_identity": provider.identity,
             "git": _git_identity(),
             "runtime": {

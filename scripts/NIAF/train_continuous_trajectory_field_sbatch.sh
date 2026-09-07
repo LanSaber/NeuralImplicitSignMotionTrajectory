@@ -58,6 +58,8 @@ RESET_LOCAL_BRANCH="${RESET_LOCAL_BRANCH:-0}"
 OUT_DIR="${OUT_DIR:-}"
 SENTENCE_MEMORY_DIR="${SENTENCE_MEMORY_DIR:-}"
 STAGE_SENTENCE_MEMORY="${STAGE_SENTENCE_MEMORY:-0}"
+STAGE_ONLY_REQUESTED_NEIGHBORS="${STAGE_ONLY_REQUESTED_NEIGHBORS:-0}"
+SPLITS="${SPLITS:-train val}"
 LOCAL_SENTENCE_MEMORY_DIR=""
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
@@ -197,6 +199,13 @@ case "$STAGE_SENTENCE_MEMORY" in
     exit 1
     ;;
 esac
+case "$STAGE_ONLY_REQUESTED_NEIGHBORS" in
+  0|1) ;;
+  *)
+    echo "ERROR: STAGE_ONLY_REQUESTED_NEIGHBORS must be 0 or 1; got $STAGE_ONLY_REQUESTED_NEIGHBORS" >&2
+    exit 1
+    ;;
+esac
 if [[ "$STAGE_SENTENCE_MEMORY" == "1" ]]; then
   if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     echo "ERROR: sentence-memory staging requires a Slurm allocation" >&2
@@ -208,23 +217,11 @@ if [[ "$STAGE_SENTENCE_MEMORY" == "1" ]]; then
   fi
   LOCAL_SENTENCE_MEMORY_DIR="/tmp/signtraj_sentence_memory_${SLURM_JOB_ID}"
   if [[ "$DRY_RUN" != "1" ]]; then
-    export SENTENCE_MEMORY_DIR LOCAL_SENTENCE_MEMORY_DIR PROJECT_DIR PYTHON_BIN CFG
+    export STAGE_ONLY_REQUESTED_NEIGHBORS
     srun --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 \
-      bash -c 'set -euo pipefail
-        source_dir="$SENTENCE_MEMORY_DIR"
-        target_dir="$LOCAL_SENTENCE_MEMORY_DIR"
-        expected="/tmp/signtraj_sentence_memory_${SLURM_JOB_ID}"
-        [[ "$target_dir" == "$expected" ]]
-        if [[ -e "$target_dir" ]]; then rm -rf -- "$target_dir"; fi
-        mkdir -p -- "$target_dir"
-        cp -a -- "$source_dir"/. "$target_dir"/
-        [[ -f "$target_dir/READY" ]] || {
-          echo "ERROR: staged sentence bank has no READY marker: $target_dir" >&2
-          exit 1
-        }
-        cd "$PROJECT_DIR"
-        "$PYTHON_BIN" -m NIAF.continuous_trajectory_field.scripts.audit_sentence_memory \
-          --config "$CFG" --bank_dir "$target_dir" --splits train val --verify_hashes'
+      bash "$PROJECT_DIR/scripts/NIAF/stage_sentence_memory_node.sh" \
+      stage "$LOCAL_SENTENCE_MEMORY_DIR" "$SENTENCE_MEMORY_DIR" \
+      "$PROJECT_DIR" "$PYTHON_BIN" "$CFG" "$SPLITS"
   fi
   export SIGNTRAJ_SENTENCE_MEMORY_DIR="$LOCAL_SENTENCE_MEMORY_DIR"
 elif [[ -n "$SENTENCE_MEMORY_DIR" ]]; then
@@ -320,7 +317,7 @@ echo "Batch override: ${BATCH_SIZE:-config value}"
 echo "Sentence-memory K override: ${SENTENCE_MEMORY_K:-config value}"
 echo "DDP: $DISTRIBUTED/$DDP_BACKEND master=${MASTER_ADDR:-unset}:${MASTER_PORT:-unset}"
 echo "W&B: $WANDB/$WANDB_MODE username=$WANDB_USERNAME entity=$WANDB_ENTITY project=$WANDB_PROJECT run=$WANDB_RUN_NAME"
-echo "Sentence memory: ${SIGNTRAJ_SENTENCE_MEMORY_DIR:-config value} staged=$STAGE_SENTENCE_MEMORY"
+echo "Sentence memory: ${SIGNTRAJ_SENTENCE_MEMORY_DIR:-config value} staged=$STAGE_SENTENCE_MEMORY requested_only=$STAGE_ONLY_REQUESTED_NEIGHBORS splits=$SPLITS"
 echo "Phase-B gate report: ${PHASE_B_GATE_REPORT:-not supplied}"
 printf 'Command:'
 printf ' %q' "${TRAIN_CMD[@]}"

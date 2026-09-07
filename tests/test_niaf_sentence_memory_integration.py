@@ -20,48 +20,73 @@ from NIAF.continuous_trajectory_field.scripts.export_continuous_trajectory impor
     sentence_memory_diagnostics_row,
     sentence_memory_text_subset,
 )
+from NIAF.continuous_trajectory_field.scripts.evaluate_continuous_trajectory_field import (
+    reduce_external_evaluation_metrics,
+)
 from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field import (
     _sentence_memory_availability,
+    DatasetIndexView,
+    _fixed_batch_part_reduction,
+    build_development_validation_loader,
     checkpoint_selection_state,
     checkpoint_contract,
     checkpoint_selection_diagnostics,
+    compute_batch_losses,
     configure_sentence_memory_trainable_parameters,
     configured_sentence_memory_eval_modes,
     configured_sentence_memory_train_mode,
     deterministic_sentence_shuffle_mask,
     distributed_checkpoint_rng_state,
     distributed_sample_weighted_mean_scalars,
+    distributed_validation_metrics,
     evaluate_configured_modes,
+    initial_early_stopping_state,
     is_sentence_memory_model,
     is_sentence_memory_parameter,
     is_word_prior_model,
     load_sentence_memory_base_state,
     merge_sentence_memory_batches,
+    paired_sentence_memory_losses,
+    paired_sentence_memory_model_forward,
+    paired_sentence_memory_usage_moments,
+    pending_validation_resume_state,
     phase_b_combined_model_forward,
     phase_b_off_distillation,
     requires_scaffold_provider,
     requires_sentence_memory_provider,
     restore_checkpoint_rng_state,
     restore_checkpoint_selection_scores,
+    restore_best_infeasible_selection_key,
+    restore_early_stopping_state,
+    require_finite_training_gradients,
+    require_finite_training_losses,
     sentence_memory_behavior_identity,
     sentence_memory_enabled,
     sentence_memory_forward_kwargs,
     sentence_memory_off_baseline,
     sentence_memory_provider_required,
     sentence_memory_query_key,
+    sentence_memory_query_ids,
+    sentence_memory_objective_identity,
     sentence_memory_resume_identity,
     set_sentence_memory_provider_epoch_from_checkpoint,
+    update_early_stopping_state,
     validate_fresh_output_directory,
     validate_phase_b_launch,
     validate_phase_b_resume_checkpoint,
     validate_phase_b_scientific_gate,
     validate_phase_b_scientific_gate_settings,
     validate_phase_b_warm_start_checkpoint,
+    validate_paired_sentence_memory_training_contract,
     validate_sentence_memory_checkpoint_identity,
+    validate_sentence_memory_objective_identity,
     validate_sentence_memory_resume_identity,
     validate_v2_to_v3_text_only_parity,
 )
 from NIAF.continuous_trajectory_field.sentence_memory import SentenceMemoryBatch
+from NIAF.continuous_trajectory_field.sentence_memory import (
+    motion_only_shuffle_sentence_memory_batch,
+)
 
 
 def _model_cfg(model_type):
@@ -89,6 +114,46 @@ def _model_cfg(model_type):
             "attention_heads": 4,
         },
     }
+
+
+def _paired_phase_a_cfg():
+    cfg = _model_cfg("sentence_memory_continuous_trajectory_field")
+    cfg.update(
+        {
+            "seed": 1234,
+            "conditioning": {
+                **cfg["conditioning"],
+                "word_prior_train_mode": "off",
+                "sentence_memory_train_mode": "on",
+            },
+            "sentence_memory_safety": {
+                "enabled": True,
+                "paired_corruption": {
+                    "enabled": True,
+                    "full_shuffle_probability": 0.10,
+                    "benefit_margin_relative": 0.001,
+                    "ranking_margin_relative": 0.005,
+                    "detach_corrupt_ranking": True,
+                    "fallback_huber_beta": 0.10,
+                },
+                "phase_b": {"enabled": False},
+            },
+            "objective": {
+                "lambda_sentence_benefit": 1.0,
+                "lambda_sentence_motion_rank": 1.0,
+                "lambda_sentence_motion_fallback": 1.0,
+                "lambda_sentence_full_shuffle_rank": 1.0,
+                "lambda_sentence_full_shuffle_fallback": 1.0,
+            },
+            "train": {
+                "freeze_base": True,
+                "unfreeze_base_prefixes": [],
+                "early_stopping_patience": 2,
+                "early_stopping_min_epochs": 2,
+            },
+        }
+    )
+    return cfg
 
 
 def _canonical_phase_b_gate_settings():
@@ -263,6 +328,26 @@ def test_sentence_memory_dropout_is_sample_stable_across_batch_order():
     assert torch.equal(reordered, forward[order])
 
 
+def test_sentence_memory_query_ids_survive_subset_reindexing_and_reordering():
+    canonical = {
+        "name": ["alpha", "beta", "gamma"],
+        "motion_path": ["a.npz", "b.npz", "c.npz"],
+        "index": torch.tensor([10, 11, 12]),
+    }
+    identifiers = sentence_memory_query_ids(canonical)
+    order = [2, 0]
+    subset = {
+        "name": [canonical["name"][index] for index in order],
+        "motion_path": [canonical["motion_path"][index] for index in order],
+        # A standalone subset manifest may reindex these rows locally.
+        "index": torch.tensor([0, 1]),
+    }
+    assert sentence_memory_query_ids(subset) == [identifiers[index] for index in order]
+    assert sentence_memory_query_ids({"index": torch.tensor([7])}) == [
+        "index_v1:7"
+    ]
+
+
 def test_sentence_shuffle_mask_is_sample_stable_and_merge_preserves_rows():
     available = torch.tensor([True, False, True])
     batch = {"name": ["alpha", "beta", "gamma"]}
@@ -315,6 +400,250 @@ def test_sentence_shuffle_mask_is_sample_stable_and_merge_preserves_rows():
     assert not merged.token_mask[0, :, 2].any()
     assert torch.equal(merged.tokens[1:], shuffled.tokens[1:])
     assert merged.provenance["sentence_memory_shuffled_mask"] == [False, True, True]
+
+
+def test_paired_sentence_memory_losses_use_exact_fixed_b_by_four_formulas():
+    cfg = _paired_phase_a_cfg()
+    target = torch.zeros(2, 1, 256)
+    correct = torch.stack(
+        (torch.full((1, 256), 1.0), torch.full((1, 256), 5.0))
+    ).requires_grad_()
+    corrupt = torch.stack(
+        (torch.full((1, 256), 3.0), torch.full((1, 256), 1.0))
+    ).requires_grad_()
+    off = torch.stack(
+        (torch.full((1, 256), 2.0), torch.full((1, 256), 4.0))
+    ).requires_grad_()
+    losses, diagnostics = paired_sentence_memory_losses(
+        correct_prediction=correct,
+        corrupt_prediction=corrupt,
+        off_prediction=off,
+        target=target,
+        frame_mask=torch.ones(2, 1, dtype=torch.bool),
+        correct_available=torch.tensor([True, True]),
+        motion_mask=torch.tensor([True, False]),
+        full_shuffle_mask=torch.tensor([False, True]),
+        cfg=cfg,
+    )
+    assert float(losses["loss_sentence_benefit"].detach()) == pytest.approx(0.1255)
+    assert float(losses["loss_sentence_motion_rank"].detach()) == pytest.approx(0.0)
+    assert float(losses["loss_sentence_full_shuffle_rank"].detach()) == pytest.approx(
+        0.5025
+    )
+    assert float(
+        losses["loss_sentence_motion_fallback"].detach()
+    ) == pytest.approx(0.475)
+    assert float(
+        losses["loss_sentence_full_shuffle_fallback"].detach()
+    ) == pytest.approx(1.475)
+    assert torch.allclose(
+        diagnostics["off_error"], torch.tensor([[2.0] * 4, [4.0] * 4])
+    )
+
+    # Ranking may improve the correct branch, but its comparator and text-off
+    # denominator are explicitly stop-gradient quantities.
+    losses["loss_sentence_full_shuffle_rank"].backward()
+    assert correct.grad is not None
+    assert corrupt.grad is None
+    assert off.grad is None
+    assert float(
+        _fixed_batch_part_reduction(
+            torch.ones(2, 4), torch.tensor([True, False])
+        )
+    ) == pytest.approx(0.5)
+
+
+def test_paired_forward_concatenates_variable_token_lengths_once():
+    class RecordingModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.0))
+            self.calls = []
+
+        def forward(self, text_tokens, query_times, **kwargs):
+            self.calls.append((text_tokens, query_times, kwargs))
+            evidence = kwargs["sentence_motion_tokens"].sum(dim=(1, 2, 3))
+            prediction = (
+                self.scale * evidence[:, None, None]
+            ).expand(-1, query_times.shape[1], 256)
+            return {"prediction": prediction}
+
+    def branch(batch_size, token_length, offset):
+        return {
+            "sentence_motion_tokens": torch.full(
+                (batch_size, 2, token_length, 3), float(offset)
+            ),
+            "sentence_motion_mask": torch.ones(
+                batch_size, 2, token_length, dtype=torch.bool
+            ),
+            "sentence_motion_tau": torch.zeros(batch_size, 2, token_length),
+            "sentence_text_keys": torch.ones(batch_size, 2, 4),
+            "sentence_scores": torch.ones(batch_size, 2),
+            "sentence_durations": torch.ones(batch_size, 2),
+            "sentence_candidate_mask": torch.ones(
+                batch_size, 2, dtype=torch.bool
+            ),
+            "sentence_part_validity": torch.ones(
+                batch_size, 2, token_length, 4
+            ),
+            "sentence_memory_available": torch.ones(
+                batch_size, dtype=torch.bool
+            ),
+        }
+
+    model = RecordingModel()
+    correct_kwargs = branch(2, 2, 1.0)
+    corrupt_kwargs = branch(2, 3, 2.0)
+    correct, corrupt = paired_sentence_memory_model_forward(
+        model,
+        text_tokens=torch.randn(2, 3, 4),
+        query_times=torch.linspace(-1.0, 1.0, 5).expand(2, -1),
+        text_mask=torch.ones(2, 3, dtype=torch.bool),
+        query_mask=torch.ones(2, 5, dtype=torch.bool),
+        word_kwargs={},
+        correct_sentence_kwargs=correct_kwargs,
+        corrupt_sentence_kwargs=corrupt_kwargs,
+    )
+    assert len(model.calls) == 1
+    _text, _times, forwarded = model.calls[0]
+    assert forwarded["sentence_motion_tokens"].shape == (4, 2, 3, 3)
+    assert not forwarded["sentence_motion_mask"][:2, :, 2].any()
+    assert forwarded["sentence_motion_mask"][2:, :, 2].all()
+    assert correct["prediction"].shape == corrupt["prediction"].shape == (
+        2,
+        5,
+        256,
+    )
+    (correct["prediction"].mean() + corrupt["prediction"].mean()).backward()
+    assert model.scale.grad is not None
+
+
+def test_corrupt_slice_cannot_change_ordinary_task_losses():
+    cfg = _paired_phase_a_cfg()
+    cfg["train"]["epochs"] = 4
+    cfg["objective"].update(
+        {
+            "lambda_sentence_benefit": 0.0,
+            "lambda_sentence_motion_rank": 0.0,
+            "lambda_sentence_motion_fallback": 0.0,
+            "lambda_sentence_full_shuffle_rank": 0.0,
+            "lambda_sentence_full_shuffle_fallback": 0.0,
+        }
+    )
+    batch = {
+        "mask": torch.ones(1, 2, dtype=torch.bool),
+        "length": torch.tensor([2]),
+        "duration": torch.tensor([2.0]),
+    }
+    correct_prediction = torch.ones(1, 2, 256)
+    target = torch.zeros_like(correct_prediction)
+
+    def prepared(corrupt_value):
+        trajectory = SimpleNamespace(
+            log_duration_seconds=torch.ones(1),
+            duration_seconds=torch.full((1,), 2.0),
+            local_mask=torch.zeros(1, 0, dtype=torch.bool),
+            num_local_fields=0,
+            sentence_memory_gates=torch.zeros(1, 4, 4),
+            sentence_memory_null_mass=None,
+            sentence_memory_candidate_mass=None,
+            word_prior_gates=torch.zeros(1, 4, 4),
+        )
+        return {
+            "target": target,
+            "adapter_context": None,
+            "word_prior_available": torch.zeros(1, dtype=torch.bool),
+            "outputs": {
+                "prediction": correct_prediction,
+                "trajectory": trajectory,
+                "correction_axis": torch.ones(1, 2, 133),
+                "local_correction_axis": torch.ones(1, 2, 133),
+                "global_correction_axis": torch.ones(1, 2, 133),
+                "local_coverage": torch.ones(1, 2),
+                "local_weights": torch.zeros(1, 2, 0),
+            },
+            "sentence_memory_corrupt_outputs": {
+                "prediction": torch.full_like(correct_prediction, corrupt_value)
+            },
+            "sentence_memory_available": torch.ones(1, dtype=torch.bool),
+            "sentence_memory_motion_mask": torch.ones(1, dtype=torch.bool),
+            "sentence_memory_full_shuffle_mask": torch.zeros(1, dtype=torch.bool),
+            "sentence_memory_shuffled_mask": torch.zeros(1, dtype=torch.bool),
+            "sentence_memory_batch": None,
+        }
+
+    def endpoint(prediction, *_args, **_kwargs):
+        value = prediction.mean()
+        return value, {"loss_endpoint": value}
+
+    def auxiliary(outputs, *_args, **_kwargs):
+        value = outputs["prediction"].mean()
+        return {"loss_coarse": 2.0 * value, "loss_residual": 3.0 * value}
+
+    def finite(prediction, *_args, **_kwargs):
+        value = 4.0 * prediction.mean()
+        return value, {"loss_dynamics": value}
+
+    patch_root = (
+        "NIAF.continuous_trajectory_field.scripts."
+        "train_continuous_trajectory_field"
+    )
+    results = []
+    for corrupt_value in (2.0, 9.0):
+        with (
+            patch(f"{patch_root}.prepare_field_batch", return_value=prepared(corrupt_value)),
+            patch(f"{patch_root}.endpoint_losses", side_effect=endpoint),
+            patch(f"{patch_root}.coarse_and_residual_losses", side_effect=auxiliary),
+            patch(
+                f"{patch_root}.duration_regression_loss",
+                return_value=torch.tensor(0.25),
+            ),
+            patch(
+                f"{patch_root}.local_field_regularization",
+                return_value={
+                    "loss_local_modulation": torch.tensor(0.0),
+                    "loss_local_width": torch.tensor(0.0),
+                },
+            ),
+            patch(f"{patch_root}.fk_temporal_dynamics_losses", side_effect=finite),
+            patch(
+                f"{patch_root}.analytic_fk_dynamics_losses",
+                return_value=(torch.tensor(0.5), {"loss_analytic": torch.tensor(0.5)}),
+            ),
+            patch(
+                f"{patch_root}.sentence_memory_off_baseline",
+                return_value=torch.zeros_like(correct_prediction),
+            ),
+        ):
+            total, losses, _prepared = compute_batch_losses(
+                object(),
+                None,
+                None,
+                None,
+                batch,
+                None,
+                cfg,
+                torch.device("cpu"),
+                training=True,
+            )
+        results.append((float(total), {name: float(value) for name, value in losses.items()}))
+
+    ordinary_names = (
+        "loss_endpoint",
+        "loss_coarse",
+        "loss_residual",
+        "loss_duration",
+        "loss_dynamics",
+        "loss_analytic",
+        "loss_sentence_gate_sparsity",
+        "loss_sentence_delta_sparsity",
+    )
+    assert results[0][0] == pytest.approx(results[1][0])
+    for name in ordinary_names:
+        assert results[0][1][name] == pytest.approx(results[1][1][name]), name
+    assert results[0][1]["loss_sentence_motion_fallback"] != pytest.approx(
+        results[1][1]["loss_sentence_motion_fallback"]
+    )
 
 
 def test_v2_to_v3_load_allows_only_sentence_memory_parameters():
@@ -451,6 +780,148 @@ def test_v3_selection_rejects_either_hand_path_regression():
     assert violation > 0
     assert not feasible
     assert details["dual_mode"]["hand_path_nonregression"]["rhand"]["violation"] > 0
+
+
+def _paired_selection_metrics(*, memory=0.8, motion=1.0, shuffled=1.1, rmotion=0.1):
+    values = {
+        "text_only/pred_loss_endpoint": 1.0,
+        "text_only/pred_loss_path_lhand": 0.5,
+        "text_only/pred_loss_path_rhand": 0.5,
+        "sentence_memory/pred_loss_endpoint": memory,
+        "sentence_memory/pred_loss_path_lhand": 0.5,
+        "sentence_memory/pred_loss_path_rhand": 0.5,
+        "motion_shuffled_sentence_memory/pred_loss_endpoint": motion,
+        "shuffled_sentence_memory/pred_loss_endpoint": shuffled,
+        "paired_sentence_memory/Rmotion": rmotion,
+    }
+    for part in ("body", "left_hand", "right_hand", "face"):
+        values[f"paired_sentence_memory/{part}_Rmotion"] = rmotion
+    return values
+
+
+def test_paired_selection_gates_off_motion_full_and_rmotion():
+    cfg = _paired_phase_a_cfg()
+    cfg["selection"] = {
+        "weights": {"pred_loss_endpoint": 1.0},
+        "constraints": None,
+        "require_sentence_memory_improvement": True,
+        "sentence_memory_min_relative_improvement": 0.001,
+        "require_sentence_memory_outperform_shuffled": True,
+        "sentence_memory_min_relative_improvement_over_shuffled": 0.001,
+        "require_sentence_memory_outperform_motion_shuffled": True,
+        "sentence_memory_min_relative_improvement_over_motion_shuffled": 0.001,
+        "require_hand_path_nonregression": True,
+        "hand_path_max_relative_degradation": 0.02,
+        "sentence_memory_min_Rmotion": 0.05,
+    }
+    _score, violation, feasible, details = checkpoint_selection_diagnostics(
+        _paired_selection_metrics(), cfg, return_details=True
+    )
+    assert feasible
+    assert violation == pytest.approx(0.0)
+    assert details["dual_mode"]["Rmotion"] == pytest.approx(0.1)
+
+    cases = (
+        (_paired_selection_metrics(memory=1.01), "text-only"),
+        (_paired_selection_metrics(memory=1.01, motion=0.9), "motion-shuffled"),
+        (_paired_selection_metrics(memory=1.01, shuffled=0.9), "shuffled-memory"),
+        (_paired_selection_metrics(rmotion=0.049), "Rmotion"),
+    )
+    for metrics, reason in cases:
+        _score, violation, feasible, details = checkpoint_selection_diagnostics(
+            metrics, cfg, return_details=True
+        )
+        assert not feasible
+        assert violation > 0
+        assert any(
+            reason in rejection
+            for rejection in details["rejection_reasons"]
+        )
+
+
+def test_paired_selection_rejects_nonfinite_unselected_diagnostic():
+    cfg = _paired_phase_a_cfg()
+    cfg["selection"] = {
+        "weights": {"pred_loss_endpoint": 1.0},
+        "constraints": None,
+    }
+    metrics = _paired_selection_metrics()
+    metrics["sentence_memory/sentence_memory_gate_mean_body"] = float("nan")
+    score, violation, feasible, details = checkpoint_selection_diagnostics(
+        metrics, cfg, return_details=True
+    )
+    assert math.isfinite(score)
+    assert math.isfinite(violation) and violation > 0
+    assert not feasible
+    assert "non-finite validation" in details["rejection_reasons"][-1]
+
+
+def test_training_finite_guards_cover_losses_and_frozen_base_gradients():
+    model = torch.nn.Linear(2, 1)
+    require_finite_training_losses(
+        torch.tensor(1.0),
+        {"diagnostic": torch.tensor(2.0)},
+        torch.device("cpu"),
+        {"enabled": False},
+    )
+    with pytest.raises(FloatingPointError, match="diagnostic"):
+        require_finite_training_losses(
+            torch.tensor(1.0),
+            {"diagnostic": torch.tensor(float("nan"))},
+            torch.device("cpu"),
+            {"enabled": False},
+        )
+    model.weight.grad = torch.full_like(model.weight, float("inf"))
+    with pytest.raises(FloatingPointError, match="weight"):
+        require_finite_training_gradients(
+            model, torch.device("cpu"), {"enabled": False}
+        )
+
+
+def test_rmotion_uses_additive_squares_counts_and_exact_shared_mask():
+    correct = torch.zeros(2, 3, 256)
+    motion = torch.full_like(correct, 2.0)
+    off = torch.full_like(correct, 4.0)
+    mask = torch.tensor([[True, True, False], [False, True, False]])
+    moments = paired_sentence_memory_usage_moments(correct, motion, off, mask)
+    assert moments["all/motion_square_sum"] == pytest.approx(3 * 256 * 4)
+    assert moments["all/motion_element_count"] == pytest.approx(3 * 256)
+    assert moments["all/off_square_sum"] == pytest.approx(3 * 256 * 16)
+    raw = {f"_paired_usage_raw/{name}": value for name, value in moments.items()}
+    reduced = distributed_validation_metrics(
+        {**raw, "sentence_memory/pred_loss_endpoint": 1.25},
+        local_sample_count=2,
+        device=torch.device("cpu"),
+        dist_info={"enabled": False, "world_size": 1},
+    )
+    assert reduced["paired_sentence_memory/Rmotion"] == pytest.approx(0.5)
+    assert reduced["paired_sentence_memory/body_Rmotion"] == pytest.approx(0.5)
+    assert reduced["paired_sentence_memory/all_motion_element_count"] == pytest.approx(
+        3 * 256
+    )
+
+
+def test_external_auto_evaluation_materializes_paired_rmotion():
+    correct = torch.zeros(2, 2, 256)
+    motion = torch.full_like(correct, 1.0)
+    off = torch.full_like(correct, 2.0)
+    moments = paired_sentence_memory_usage_moments(
+        correct,
+        motion,
+        off,
+        torch.ones(2, 2, dtype=torch.bool),
+    )
+    raw = {f"_paired_usage_raw/{name}": value for name, value in moments.items()}
+    reduced = reduce_external_evaluation_metrics(
+        {**raw, "sentence_memory/pred_loss_endpoint": 0.75},
+        SimpleNamespace(sampler=None, dataset=[0, 1], batch_size=2),
+        0,
+        torch.device("cpu"),
+        {"enabled": False, "world_size": 1},
+    )
+    assert reduced["paired_sentence_memory/Rmotion"] == pytest.approx(0.5)
+    assert reduced["paired_sentence_memory/body_Rmotion"] == pytest.approx(0.5)
+    assert not any(name.startswith("_paired_usage_raw/") for name in reduced)
 
 
 def test_phase_b_selection_enforces_frozen_teacher_text_guard():
@@ -884,6 +1355,169 @@ def test_two_rank_gloo_phase_b_uses_one_ddp_forward_graph(tmp_path):
     )
 
 
+def _gloo_paired_corruption_single_forward_worker(rank, world_size, init_file):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        class PairedModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale = torch.nn.Parameter(torch.tensor(0.5))
+                self.base = torch.nn.Parameter(
+                    torch.tensor(0.25), requires_grad=False
+                )
+                self.forward_calls = 0
+
+            def forward(self, text_tokens, query_times, **kwargs):
+                self.forward_calls += 1
+                evidence = kwargs["sentence_motion_tokens"].mean(
+                    dim=(1, 2, 3)
+                )
+                prediction = (
+                    self.base + self.scale * evidence[:, None, None]
+                ).expand(-1, query_times.shape[1], 256)
+                return {"prediction": prediction}
+
+        module = PairedModule()
+        model = DistributedDataParallel(module)
+        optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+        token_value = float(rank + 1)
+        frozen_before = module.base.detach().clone()
+
+        def branch(value):
+            return {
+                "sentence_motion_tokens": torch.full((1, 2, 2, 2), value),
+                "sentence_motion_mask": torch.ones(1, 2, 2, dtype=torch.bool),
+                "sentence_motion_tau": torch.zeros(1, 2, 2),
+                "sentence_text_keys": torch.ones(1, 2, 3),
+                "sentence_scores": torch.ones(1, 2),
+                "sentence_durations": torch.ones(1, 2),
+                "sentence_candidate_mask": torch.ones(1, 2, dtype=torch.bool),
+                "sentence_part_validity": torch.ones(1, 2, 2, 4),
+                "sentence_memory_available": torch.ones(1, dtype=torch.bool),
+            }
+
+        memory = SentenceMemoryBatch(
+            tokens=torch.arange(12, dtype=torch.float32).view(1, 3, 2, 2),
+            token_mask=torch.ones(1, 3, 2, dtype=torch.bool),
+            token_tau=torch.zeros(1, 3, 2),
+            candidate_mask=torch.ones(1, 3, dtype=torch.bool),
+            candidate_keys=torch.ones(1, 3, 3),
+            scores=torch.tensor([[0.9, 0.8, 0.7]]),
+            durations=torch.ones(1, 3),
+            duration_log_gap=torch.zeros(1, 3),
+            part_validity=torch.ones(1, 3, 2, 4),
+            ids=torch.tensor([[10, 11, 12]]),
+            available=torch.ones(1, dtype=torch.bool),
+            provenance={"mode": "on"},
+        )
+        _shuffled, permutation_before, informative = (
+            motion_only_shuffle_sentence_memory_batch(
+                memory,
+                query_ids=["stable-query"],
+                epoch=3,
+                seed=1234,
+            )
+        )
+        random.seed(10_000 + rank)
+        np.random.seed(20_000 + rank)
+        torch.manual_seed(30_000 + rank)
+        _resumed, permutation_after, resumed_informative = (
+            motion_only_shuffle_sentence_memory_batch(
+                memory,
+                query_ids=["stable-query"],
+                epoch=3,
+                seed=1234,
+            )
+        )
+        assert torch.equal(permutation_before, permutation_after)
+        assert torch.equal(informative, resumed_informative)
+        gathered_permutations = [
+            torch.empty_like(permutation_before) for _ in range(world_size)
+        ]
+        dist.all_gather(gathered_permutations, permutation_before)
+        assert all(
+            torch.equal(permutation_before, other)
+            for other in gathered_permutations
+        )
+
+        optimizer.zero_grad(set_to_none=True)
+        correct, corrupt = paired_sentence_memory_model_forward(
+            model,
+            text_tokens=torch.ones(1, 2, 3),
+            query_times=torch.linspace(-1.0, 1.0, 3).view(1, -1),
+            text_mask=torch.ones(1, 2, dtype=torch.bool),
+            query_mask=torch.ones(1, 3, dtype=torch.bool),
+            word_kwargs={},
+            correct_sentence_kwargs=branch(token_value),
+            corrupt_sentence_kwargs=branch(token_value + 1.0),
+        )
+        losses, _diagnostics = paired_sentence_memory_losses(
+            correct_prediction=correct["prediction"],
+            corrupt_prediction=corrupt["prediction"],
+            off_prediction=torch.zeros_like(correct["prediction"]),
+            target=torch.zeros_like(correct["prediction"]),
+            frame_mask=torch.ones(1, 3, dtype=torch.bool),
+            correct_available=torch.ones(1, dtype=torch.bool),
+            motion_mask=torch.tensor([rank == 0]),
+            full_shuffle_mask=torch.tensor([rank == 1]),
+            cfg=_paired_phase_a_cfg(),
+        )
+        local_counts = torch.tensor(
+            [
+                float(rank == 0),
+                float(rank == 1),
+                float(losses["loss_sentence_motion_fallback"].detach()),
+                float(losses["loss_sentence_full_shuffle_fallback"].detach()),
+            ]
+        )
+        gathered_counts = [
+            torch.empty_like(local_counts) for _ in range(world_size)
+        ]
+        dist.all_gather(gathered_counts, local_counts)
+        assert gathered_counts[0][0] == 1 and gathered_counts[0][1] == 0
+        assert gathered_counts[1][0] == 0 and gathered_counts[1][1] == 1
+        # With B=1 and all four parts selected, the fixed Bx4 reduction is
+        # exactly the per-element Smooth-L1 value (|delta|-beta/2).
+        assert float(gathered_counts[0][2]) == pytest.approx(1.2)
+        assert gathered_counts[0][3] == 0
+        assert gathered_counts[1][2] == 0
+        assert float(gathered_counts[1][3]) == pytest.approx(1.7)
+        sum(losses.values()).backward()
+        assert module.forward_calls == 1
+        assert module.scale.grad is not None
+        assert torch.isfinite(module.scale.grad)
+        assert module.base.grad is None
+        optimizer.step()
+        assert torch.equal(module.base.detach(), frozen_before)
+        gathered = [torch.empty_like(module.scale) for _ in range(world_size)]
+        dist.all_gather(gathered, module.scale.detach())
+        assert all(torch.equal(module.scale.detach(), value) for value in gathered)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="PyTorch Gloo distributed backend is unavailable",
+)
+def test_two_rank_gloo_paired_corruption_uses_one_ddp_forward(tmp_path):
+    init_file = (tmp_path / "paired_corruption_gloo_init").resolve()
+    mp.spawn(
+        _gloo_paired_corruption_single_forward_worker,
+        args=(2, str(init_file)),
+        nprocs=2,
+        join=True,
+    )
+
+
 def test_sentence_memory_behavior_identity_covers_non_state_factory_options():
     cfg = _model_cfg("sentence_memory_continuous_trajectory_field")
     cfg["duration"] = {
@@ -971,6 +1605,228 @@ def test_exact_resume_restores_historical_selection_minima():
     assert math.isinf(best) and math.isinf(infeasible)
     with pytest.raises(RuntimeError, match="historical selection_state"):
         restore_checkpoint_selection_scores({}, require=True)
+
+
+def test_paired_objective_identity_rejects_any_loss_or_corruption_drift():
+    cfg = _paired_phase_a_cfg()
+    baseline = sentence_memory_objective_identity(cfg)
+    validate_sentence_memory_objective_identity(
+        {"sentence_memory_objective_identity": baseline}, cfg
+    )
+    changes = (
+        ("sentence_memory_safety", "benefit_margin_relative", 0.002),
+        ("sentence_memory_safety", "full_shuffle_probability", 0.2),
+        ("objective", "lambda_sentence_motion_rank", 0.5),
+        ("objective", "lambda_sentence_sparsity", 0.0002),
+    )
+    for section, name, value in changes:
+        changed = copy.deepcopy(cfg)
+        if section == "sentence_memory_safety":
+            changed[section]["paired_corruption"][name] = value
+        else:
+            changed[section][name] = value
+        assert sentence_memory_objective_identity(changed)["digest"] != baseline[
+            "digest"
+        ]
+        with pytest.raises(RuntimeError, match="objective differs"):
+            validate_sentence_memory_objective_identity(
+                {"sentence_memory_objective_identity": baseline}, changed
+            )
+    with pytest.raises(RuntimeError, match="no persisted.*objective identity"):
+        validate_sentence_memory_objective_identity(
+            {"config": copy.deepcopy(cfg)},
+            cfg,
+            source="old paired checkpoint",
+        )
+
+    legacy_cfg = _model_cfg("sentence_memory_continuous_trajectory_field")
+    reconstructed = validate_sentence_memory_objective_identity(
+        {"config": copy.deepcopy(legacy_cfg)}, legacy_cfg
+    )
+    assert reconstructed["mode"] == "legacy_replacement_v1"
+
+
+def test_lexicographic_early_stopping_and_exact_restore():
+    state = initial_early_stopping_state()
+    state, improved, stopped = update_early_stopping_state(
+        state,
+        feasible=False,
+        normalized_constraint_violation=0.5,
+        selection_score_value=1.0,
+        epoch=1,
+        patience=2,
+        minimum_epoch=2,
+    )
+    assert improved and not stopped
+    # Lower score cannot compensate for a worse normalized violation.
+    state, improved, stopped = update_early_stopping_state(
+        state,
+        feasible=False,
+        normalized_constraint_violation=0.6,
+        selection_score_value=0.1,
+        epoch=2,
+        patience=2,
+        minimum_epoch=2,
+    )
+    assert not improved and not stopped
+    # Any feasible point lexicographically improves over every infeasible one.
+    state, improved, stopped = update_early_stopping_state(
+        state,
+        feasible=True,
+        normalized_constraint_violation=0.0,
+        selection_score_value=10.0,
+        epoch=3,
+        patience=2,
+        minimum_epoch=2,
+    )
+    assert improved and not stopped
+    for epoch in (4, 5):
+        state, improved, stopped = update_early_stopping_state(
+            state,
+            feasible=True,
+            normalized_constraint_violation=0.0,
+            selection_score_value=11.0,
+            epoch=epoch,
+            patience=2,
+            minimum_epoch=2,
+        )
+    assert not improved and stopped
+    checkpoint = {
+        "selection_state": checkpoint_selection_state(
+            10.0, 1.0, early_stopping_state=state
+        )
+    }
+    assert restore_early_stopping_state(checkpoint, require=True) == state
+
+    selection_state = checkpoint_selection_state(
+        float("inf"),
+        0.25,
+        early_stopping_state=initial_early_stopping_state(),
+        best_infeasible_key=(0.05, 0.25),
+    )
+    assert restore_best_infeasible_selection_key(
+        {"selection_state": selection_state}, require=True
+    ) == pytest.approx((0.05, 0.25))
+    corrupted = copy.deepcopy(selection_state)
+    corrupted["best_infeasible_key"][1] = 0.3
+    with pytest.raises(RuntimeError, match="disagrees"):
+        restore_best_infeasible_selection_key(
+            {"selection_state": corrupted}, require=True
+        )
+
+
+def test_pending_validation_resume_does_not_advance_or_retrain_epoch():
+    checkpoint = {
+        "epoch": 2,
+        "metrics": {
+            "epoch": 2,
+            "global_step": 37,
+            "train_loss_total": 1.25,
+            "validation_pending": 1.0,
+        },
+    }
+    epoch, row = pending_validation_resume_state(
+        checkpoint, paired_objective_enabled=True
+    )
+    assert epoch == 2
+    assert row == checkpoint["metrics"]
+    row["validation_pending"] = 0.0
+    assert checkpoint["metrics"]["validation_pending"] == 1.0
+    checkpoint["selection_state"] = checkpoint_selection_state(
+        float("inf"),
+        float("inf"),
+        early_stopping_state=initial_early_stopping_state(),
+    )
+    assert restore_best_infeasible_selection_key(
+        checkpoint, require=True
+    ) is None
+    assert pending_validation_resume_state(
+        {"epoch": 2, "metrics": {"validation_pending": 0.0}},
+        paired_objective_enabled=True,
+    ) == (None, None)
+    with pytest.raises(RuntimeError, match="only for paired Phase A"):
+        pending_validation_resume_state(
+            checkpoint, paired_objective_enabled=False
+        )
+
+
+def test_development_loader_keeps_canonical_indices_and_never_reads_confirmation():
+    class SourceDataset(torch.utils.data.Dataset):
+        def __init__(self):
+            self.base = SimpleNamespace(
+                items=[
+                    {"text": "alpha"},
+                    {"text": "beta"},
+                    {"text": "alpha"},
+                    {"text": "gamma"},
+                    {"text": "seen"},
+                ]
+            )
+            self.split = "val"
+            self.estimated_lengths = [2, 3, 2, 4, 2]
+            self.read_indices = []
+
+        def __len__(self):
+            return len(self.base.items)
+
+        def __getitem__(self, index):
+            self.read_indices.append(int(index))
+            return {"index": int(index), "text": self.base.items[index]["text"]}
+
+    dataset = SourceDataset()
+    source_loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=2,
+        shuffle=False,
+        collate_fn=lambda rows: rows,
+    )
+    provider = SimpleNamespace(
+        identity={
+            "bank_id": "bank",
+            "neighbor_tables": {
+                "val": {"query_manifest_sha256": "manifest"}
+            },
+        },
+        is_seen_text=lambda text: text == "seen",
+    )
+    cfg = _paired_phase_a_cfg()
+    cfg["train"]["epochs"] = 4
+    cfg["eval"] = {"num_workers": 0}
+    cfg["validation_text_partition"] = {
+        "enabled": True,
+        "development_text_count": 1,
+        "expected_novel_text_count": 3,
+        "expected_validation_rows": 5,
+        "expected_validation_manifest_sha256": "manifest",
+        "expected_bank_id": "bank",
+        # Unsalted SHA256 ordering selects the repeated ``alpha`` cluster.
+        "expected_development_rows": 2,
+        "expected_confirmation_rows": 2,
+    }
+    loader, sampler, partition = build_development_validation_loader(
+        cfg,
+        dataset,
+        source_loader,
+        provider,
+        {"enabled": False, "world_size": 1, "rank": 0},
+    )
+    assert sampler is None
+    assert isinstance(loader.dataset, DatasetIndexView)
+    assert loader.dataset.base is dataset.base
+    expected_indices = [
+        index
+        for index, label in enumerate(partition.labels)
+        if label == "development"
+    ]
+    loaded_indices = [row["index"] for batch in loader for row in batch]
+    assert loaded_indices == expected_indices
+    assert dataset.read_indices == expected_indices
+    assert all(
+        partition.labels[index] == "development" for index in dataset.read_indices
+    )
+    assert cfg["validation_text_partition"]["confirmation_evaluated_during_training"] is False
+    assert cfg["validation_text_partition"]["exact_seen_evaluated_during_training"] is False
+    assert cfg["validation_text_partition"]["exact_seen_row_count"] == 1
 
 
 def test_exact_resume_identity_rejects_behavior_drift_but_allows_relocation():
@@ -1211,3 +2067,27 @@ def test_csl_sentence_memory_phase_configs_are_explicit():
         == 0.005
     )
     assert phase_b["sentence_memory_safety"]["phase_b"]["gate_report"] is None
+
+
+def test_motion_contrast_config_is_strict_paired_phase_a_with_four_epoch_cap():
+    path = Path(
+        "NIAF/continuous_trajectory_field/configs/"
+        "csl_daily_signtrajfield_v3_sentence_memory_phase_a_motion_contrast_v1.yaml"
+    )
+    cfg = load_config(path)
+    resolved = validate_paired_sentence_memory_training_contract(cfg)
+    assert resolved["enabled"]
+    assert resolved["full_shuffle_probability"] == pytest.approx(0.10)
+    assert cfg["train"]["epochs"] == 4
+    assert cfg["train"]["early_stopping_patience"] == 2
+    assert cfg["train"]["early_stopping_min_epochs"] == 2
+    assert cfg["eval"]["sentence_memory_modes"] == [
+        "off",
+        "on",
+        "shuffled",
+        "motion_shuffled",
+    ]
+    extended = copy.deepcopy(cfg)
+    extended["train"]["epochs"] = 5
+    with pytest.raises(ValueError, match="never train after epoch 4"):
+        validate_paired_sentence_memory_training_contract(extended)

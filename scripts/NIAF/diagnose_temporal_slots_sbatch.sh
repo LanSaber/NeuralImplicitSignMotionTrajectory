@@ -16,10 +16,27 @@ trap 'echo "ERROR: diagnose_temporal_slots_sbatch.sh failed at line $LINENO with
 PROJECT_DIR="${PROJECT_DIR:-/media/cvpr/haomian/NeuralImplicitSignMotionTrajectory}"
 PYTHON_ENV="${PYTHON_ENV:-/media/cvpr/haomian/python_envs/SOKE}"
 PYTHON_BIN="${PYTHON_BIN:-$PYTHON_ENV/bin/python}"
-CFG="${CFG:-$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v3_sentence_memory_phase_a_dw005_pilot2.yaml}"
-CHECKPOINT="${CHECKPOINT:-$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_dw005_pilot2/checkpoints/epoch0002.pt}"
+DIAGNOSTIC_PROFILE="${DIAGNOSTIC_PROFILE:-dw005_epoch2}"
 SENTENCE_MEMORY_DIR="${SENTENCE_MEMORY_DIR:-/media/cvpr/haomian/data/SOKE_FLOW/csl_daily_upper_smplx/meta/niaf_sentence_memory/mt5_vae_mu_train_v1}"
-OUT_DIR="${OUT_DIR:-$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_dw005_pilot2/evaluation/epoch0002_validation_slot_diagnostics}"
+case "$DIAGNOSTIC_PROFILE" in
+  dw005_epoch2)
+    PROFILE_EXPERIMENT="csl_daily_signtrajfield_v3_sentence_memory_phase_a_dw005_pilot2"
+    PROFILE_CHECKPOINT="epoch0002.pt"
+    PROFILE_EVALUATION="epoch0002_validation_slot_diagnostics"
+    ;;
+  phase_a_motion_contrast_v1)
+    PROFILE_EXPERIMENT="csl_daily_signtrajfield_v3_sentence_memory_phase_a_motion_contrast_v1"
+    PROFILE_CHECKPOINT="best.pt"
+    PROFILE_EVALUATION="locked_validation_slot_diagnostics"
+    ;;
+  *)
+    echo "ERROR: unsupported DIAGNOSTIC_PROFILE=$DIAGNOSTIC_PROFILE" >&2
+    exit 1
+    ;;
+esac
+CFG="${CFG:-$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/${PROFILE_EXPERIMENT}.yaml}"
+CHECKPOINT="${CHECKPOINT:-$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/${PROFILE_EXPERIMENT}/checkpoints/${PROFILE_CHECKPOINT}}"
+OUT_DIR="${OUT_DIR:-$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/${PROFILE_EXPERIMENT}/evaluation/${PROFILE_EVALUATION}}"
 SMOKE_OUT_DIR="${SMOKE_OUT_DIR:-${OUT_DIR}_smoke}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 PERTURB_BATCH_SIZE="${PERTURB_BATCH_SIZE:-128}"
@@ -111,6 +128,7 @@ run_stage() {
   local command=(
     srun --kill-on-bad-exit=1
     "$PYTHON_BIN" -m NIAF.continuous_trajectory_field.scripts.diagnose_temporal_slots
+    --profile "$DIAGNOSTIC_PROFILE"
     --config "$CFG"
     --checkpoint "$CHECKPOINT"
     --out_dir "$destination"
@@ -133,6 +151,7 @@ run_stage() {
 }
 
 echo "Job ID: $SLURM_JOB_ID node=${SLURMD_NODENAME:-unknown}"
+echo "Diagnostic profile: $DIAGNOSTIC_PROFILE"
 echo "Checkpoint: $CHECKPOINT"
 echo "Validation-only output: $OUT_DIR"
 echo "Sentence-memory bank: $SENTENCE_MEMORY_DIR (staged to node-local storage)"

@@ -29,6 +29,10 @@ from NIAF.continuous_sign_field.scripts.train_residual_flow import (
     prepare_motion,
 )
 from NIAF.continuous_trajectory_field.models import build_continuous_trajectory_field
+from NIAF.continuous_trajectory_field.sentence_memory import (
+    SentenceMemoryBatch,
+    motion_only_shuffle_sentence_memory_batch,
+)
 from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field import (
     _sentence_memory_field,
     build_sentence_memory_provider,
@@ -39,6 +43,7 @@ from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field 
     sentence_memory_enabled,
     sentence_memory_forward_kwargs,
     sentence_memory_provider_required,
+    sentence_memory_query_ids,
     set_sentence_memory_provider_epoch_from_checkpoint,
     validate_checkpoint_contract,
     validate_sentence_memory_checkpoint_identity,
@@ -99,11 +104,19 @@ def parse_args():
     parser.add_argument(
         "--sentence_memory",
         default="auto",
-        choices=("auto", "off", "on", "shuffled"),
+        choices=(
+            "auto",
+            "off",
+            "on",
+            "shuffled",
+            "motion_shuffled",
+            "all_null",
+        ),
         help=(
             "For v3, export with memory off, retrieved memory on, or the "
-            "deterministic shuffled-memory control. auto uses the configured "
-            "export mode (on by default)."
+            "deterministic full- or motion-only-shuffled controls, or the "
+            "all-null integrity control. auto uses the configured export mode "
+            "(on by default)."
         ),
     )
     parser.add_argument("--context_fps", type=float, default=20.0)
@@ -221,6 +234,49 @@ def sentence_memory_text_subset(memory_batch, provider, index, text):
     return "not_available"
 
 
+def all_null_sentence_memory_batch(batch, cfg, device):
+    """Create an enabled, candidate-free memory input without payload reads."""
+
+    batch_size = len(batch.get("name", ()))
+    candidate_count = int(cfg.get("sentence_memory", {}).get("k", 8))
+    motion_dim = int(cfg.get("sentence_memory", {}).get("motion_dim", 256))
+    key_dim = int(cfg.get("sentence_memory", {}).get("key_dim", 768))
+    if batch_size < 1 or candidate_count < 1 or motion_dim < 1 or key_dim < 1:
+        raise ValueError("Invalid all-null sentence-memory shape")
+    return SentenceMemoryBatch(
+        tokens=torch.zeros(batch_size, candidate_count, 1, motion_dim, device=device),
+        token_mask=torch.zeros(
+            batch_size, candidate_count, 1, dtype=torch.bool, device=device
+        ),
+        token_tau=torch.zeros(batch_size, candidate_count, 1, device=device),
+        candidate_mask=torch.zeros(
+            batch_size, candidate_count, dtype=torch.bool, device=device
+        ),
+        candidate_keys=torch.zeros(
+            batch_size, candidate_count, key_dim, device=device
+        ),
+        scores=torch.zeros(batch_size, candidate_count, device=device),
+        durations=torch.zeros(batch_size, candidate_count, device=device),
+        duration_log_gap=torch.zeros(batch_size, candidate_count, device=device),
+        part_validity=torch.zeros(
+            batch_size, candidate_count, 1, 4, device=device
+        ),
+        ids=torch.full(
+            (batch_size, candidate_count), -1, dtype=torch.int64, device=device
+        ),
+        available=torch.ones(batch_size, dtype=torch.bool, device=device),
+        provenance={
+            "mode": "all_null",
+            "payload_reads": 0,
+            "query_seen_text": [False] * batch_size,
+            "candidate_group_ids": [[-1] * candidate_count for _ in range(batch_size)],
+            "candidate_exact_text": [
+                [False] * candidate_count for _ in range(batch_size)
+            ],
+        },
+    )
+
+
 @torch.no_grad()
 def prepare_inference_batch(
     model,
@@ -235,6 +291,7 @@ def prepare_inference_batch(
     word_prior_mode="auto",
     sentence_memory_provider=None,
     sentence_memory_mode="auto",
+    sentence_memory_epoch=0,
 ):
     text_tokens, text_mask = encode_batch_text(text_encoder, batch, cfg, device)
     predicted_log_duration, predicted_duration = model.predict_duration(
@@ -289,8 +346,13 @@ def prepare_inference_batch(
         "off",
         "on",
         "shuffled",
+        "motion_shuffled",
+        "all_null",
     }:
-        raise ValueError("v3 sentence_memory_mode must be 'off', 'on', or 'shuffled'")
+        raise ValueError(
+            "v3 sentence_memory_mode must be 'off', 'on', 'shuffled', or "
+            "'motion_shuffled', or 'all_null'"
+        )
 
     adapter_context = None
     retrieval_features = None
@@ -342,22 +404,41 @@ def prepare_inference_batch(
         )
         sentence_kwargs = {"sentence_memory_available": sentence_available}
         if bool(sentence_available.any()):
-            if sentence_memory_provider is None:
-                raise ValueError(
-                    "Memory-enabled inference requires a SentenceMemoryProvider"
+            if resolved_sentence_mode == "all_null":
+                sentence_memory_batch = all_null_sentence_memory_batch(
+                    batch, cfg, device
                 )
-            sentence_memory_batch = retrieve_sentence_memory(
-                sentence_memory_provider,
-                dataset=dataset,
-                batch=batch,
-                text_tokens=text_tokens,
-                text_mask=text_mask,
-                predicted_duration=predicted_duration.detach(),
-                available=sentence_available,
-                training=False,
-                device=device,
-                mode=resolved_sentence_mode,
-            )
+            else:
+                if sentence_memory_provider is None:
+                    raise ValueError(
+                        "Retrieval-backed inference requires a "
+                        "SentenceMemoryProvider"
+                    )
+                sentence_memory_batch = retrieve_sentence_memory(
+                    sentence_memory_provider,
+                    dataset=dataset,
+                    batch=batch,
+                    text_tokens=text_tokens,
+                    text_mask=text_mask,
+                    predicted_duration=predicted_duration.detach(),
+                    available=sentence_available,
+                    training=False,
+                    device=device,
+                    mode=(
+                        "on"
+                        if resolved_sentence_mode == "motion_shuffled"
+                        else resolved_sentence_mode
+                    ),
+                )
+            if resolved_sentence_mode == "motion_shuffled":
+                sentence_memory_batch, _permutation, _informative = (
+                    motion_only_shuffle_sentence_memory_batch(
+                        sentence_memory_batch,
+                        query_ids=sentence_memory_query_ids(batch),
+                        epoch=int(sentence_memory_epoch),
+                        seed=int(cfg.get("seed", 1234)),
+                    )
+                )
             sentence_kwargs = sentence_memory_forward_kwargs(sentence_memory_batch)
     if dual_mode:
         trajectory = model.encode_trajectory(
@@ -384,6 +465,16 @@ def prepare_inference_batch(
             resolved_sentence_mode if sentence_memory_model else "not_applicable"
         ),
         "sentence_memory_batch": sentence_memory_batch,
+        "sentence_memory_motion_shuffle_epoch": (
+            int(sentence_memory_epoch)
+            if resolved_sentence_mode == "motion_shuffled"
+            else None
+        ),
+        "sentence_memory_motion_shuffle_seed": (
+            int(cfg.get("seed", 1234))
+            if resolved_sentence_mode == "motion_shuffled"
+            else None
+        ),
     }
 
 
@@ -553,7 +644,7 @@ def main():
             else None
         ),
     )
-    set_sentence_memory_provider_epoch_from_checkpoint(
+    checkpoint_epoch = set_sentence_memory_provider_epoch_from_checkpoint(
         sentence_memory_provider, checkpoint
     )
     model_type, contract_version = checkpoint_contract(cfg)
@@ -579,6 +670,7 @@ def main():
             word_prior_mode=resolved_word_prior_mode,
             sentence_memory_provider=sentence_memory_provider,
             sentence_memory_mode=resolved_sentence_memory_mode,
+            sentence_memory_epoch=checkpoint_epoch,
         )
         sampled = sample_trajectory_fps(
             model,
@@ -718,6 +810,37 @@ def main():
                 bank_id = memory_provenance.get("bank_id")
                 if bank_id:
                     extra["sentence_memory_bank_id"] = np.asarray(str(bank_id))
+                for provenance_name, output_name in (
+                    (
+                        "motion_candidate_permutation",
+                        "sentence_memory_motion_candidate_permutation",
+                    ),
+                    ("motion_source_ids", "sentence_memory_motion_source_ids"),
+                    (
+                        "motion_only_shuffle_informative",
+                        "sentence_memory_motion_shuffle_informative",
+                    ),
+                ):
+                    provenance_rows = memory_provenance.get(provenance_name, [])
+                    if local_index < len(provenance_rows):
+                        extra[output_name] = np.asarray(
+                            provenance_rows[local_index]
+                        )
+                for provenance_name, output_name in (
+                    (
+                        "motion_only_shuffle_epoch",
+                        "sentence_memory_motion_shuffle_epoch",
+                    ),
+                    (
+                        "motion_only_shuffle_seed",
+                        "sentence_memory_motion_shuffle_seed",
+                    ),
+                    ("payload_reads", "sentence_memory_payload_reads"),
+                ):
+                    if provenance_name in memory_provenance:
+                        extra[output_name] = np.asarray(
+                            memory_provenance[provenance_name]
+                        )
             extra.update(_trajectory_numpy(inference["trajectory"], local_index))
             for branch_name, branch_prediction in branch_samples.items():
                 branch_rot6d, branch_axis, branch_smplx = rot6d_to_axis_and_smplx(
@@ -812,6 +935,18 @@ def main():
         "word_prior_mode": resolved_word_prior_mode if dual_mode else "v1_required",
         "sentence_memory_mode": (
             resolved_sentence_memory_mode if sentence_memory_model else "not_applicable"
+        ),
+        "sentence_memory_motion_shuffle_epoch": (
+            int(checkpoint_epoch)
+            if sentence_memory_model
+            and resolved_sentence_memory_mode == "motion_shuffled"
+            else None
+        ),
+        "sentence_memory_motion_shuffle_seed": (
+            int(cfg.get("seed", 1234))
+            if sentence_memory_model
+            and resolved_sentence_memory_mode == "motion_shuffled"
+            else None
         ),
         "sentence_memory": (
             getattr(sentence_memory_provider, "config_summary", None)

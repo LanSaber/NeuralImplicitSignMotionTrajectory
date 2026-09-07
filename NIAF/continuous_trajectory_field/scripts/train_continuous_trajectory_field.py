@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from flow.distributed import (
@@ -30,6 +31,7 @@ from flow.distributed import (
     wrap_model,
 )
 from NIAF.continuous_sign_field.config import load_config
+from NIAF.continuous_sign_field.data import ExactDistributedEvalSampler
 from NIAF.continuous_sign_field.losses import (
     endpoint_losses,
     fk_temporal_dynamics_losses,
@@ -72,7 +74,7 @@ TRAJECTORY_CONTRACT_VERSIONS = {
 }
 WORD_PRIOR_MODES = {"dropout", "off", "on"}
 SENTENCE_MEMORY_TRAIN_MODES = {"dropout", "off", "on"}
-SENTENCE_MEMORY_EVAL_MODES = {"off", "on", "shuffled"}
+SENTENCE_MEMORY_EVAL_MODES = {"off", "on", "shuffled", "motion_shuffled"}
 WORD_PRIOR_PART_NAMES = ("body", "left_hand", "right_hand", "face")
 
 
@@ -194,7 +196,10 @@ def sentence_memory_provider_required(modes):
 
     if isinstance(modes, str):
         modes = (modes,)
-    return any(str(mode).lower() in {"on", "shuffled"} for mode in modes)
+    return any(
+        str(mode).lower() in {"on", "shuffled", "motion_shuffled"}
+        for mode in modes
+    )
 
 
 def requires_sentence_memory_provider(cfg):
@@ -390,6 +395,208 @@ def sentence_memory_behavior_identity(cfg):
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     return {**payload, "digest": digest}
+
+
+_PAIRED_SENTENCE_OBJECTIVE_WEIGHTS = (
+    "lambda_sentence_benefit",
+    "lambda_sentence_motion_rank",
+    "lambda_sentence_motion_fallback",
+    "lambda_sentence_full_shuffle_rank",
+    "lambda_sentence_full_shuffle_fallback",
+)
+
+
+def paired_sentence_memory_corruption_config(cfg):
+    """Resolve and validate the opt-in paired Phase-A objective contract."""
+
+    safety_cfg = cfg.get("sentence_memory_safety", {})
+    paired_cfg = safety_cfg.get("paired_corruption", {})
+    if paired_cfg is None:
+        paired_cfg = {}
+    if not isinstance(paired_cfg, dict):
+        raise ValueError("sentence_memory_safety.paired_corruption must be a mapping")
+    enabled = bool(paired_cfg.get("enabled", False))
+    resolved = {
+        "enabled": enabled,
+        "full_shuffle_probability": float(
+            paired_cfg.get("full_shuffle_probability", 0.10)
+        ),
+        "benefit_margin_relative": float(
+            paired_cfg.get("benefit_margin_relative", 0.001)
+        ),
+        "ranking_margin_relative": float(
+            paired_cfg.get("ranking_margin_relative", 0.005)
+        ),
+        "detach_corrupt_ranking": bool(
+            paired_cfg.get("detach_corrupt_ranking", True)
+        ),
+        "fallback_huber_beta": float(
+            paired_cfg.get("fallback_huber_beta", 0.10)
+        ),
+    }
+    for name in ("benefit_margin_relative", "ranking_margin_relative"):
+        if not math.isfinite(resolved[name]) or resolved[name] < 0.0:
+            raise ValueError(
+                f"sentence_memory_safety.paired_corruption.{name} must be "
+                "finite and non-negative"
+            )
+    probability = resolved["full_shuffle_probability"]
+    if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+        raise ValueError(
+            "sentence_memory_safety.paired_corruption."
+            "full_shuffle_probability must be in [0, 1]"
+        )
+    if (
+        not math.isfinite(resolved["fallback_huber_beta"])
+        or resolved["fallback_huber_beta"] <= 0.0
+    ):
+        raise ValueError(
+            "sentence_memory_safety.paired_corruption.fallback_huber_beta "
+            "must be finite and positive"
+        )
+    if enabled and not resolved["detach_corrupt_ranking"]:
+        raise ValueError(
+            "The paired sentence-memory objective requires "
+            "detach_corrupt_ranking=true so ranking cannot reward corrupt-output "
+            "degradation"
+        )
+    return resolved
+
+
+def validate_paired_sentence_memory_training_contract(cfg):
+    """Fail closed unless paired corruption is a frozen, text-only Phase-A run."""
+
+    paired_cfg = paired_sentence_memory_corruption_config(cfg)
+    if not paired_cfg["enabled"]:
+        return paired_cfg
+    if not is_sentence_memory_model(cfg) or not sentence_memory_enabled(cfg):
+        raise ValueError("Paired corruption requires an enabled v3 sentence-memory model")
+    if not bool(cfg.get("sentence_memory_safety", {}).get("enabled", False)):
+        raise ValueError("Paired corruption requires sentence_memory_safety.enabled=true")
+    if configured_sentence_memory_train_mode(cfg) != "on":
+        raise ValueError(
+            "Paired corruption requires conditioning.sentence_memory_train_mode='on' "
+            "so every usable row has a correct retrieval"
+        )
+    if configured_word_prior_train_mode(cfg) != "off":
+        raise ValueError(
+            "Paired corruption requires conditioning.word_prior_train_mode='off' "
+            "for a strict text-only teacher"
+        )
+    train_cfg = cfg.get("train", {})
+    if not bool(train_cfg.get("freeze_base", False)):
+        raise ValueError("Paired corruption Phase A requires train.freeze_base=true")
+    if train_cfg.get("unfreeze_base_prefixes"):
+        raise ValueError(
+            "Paired corruption Phase A requires train.unfreeze_base_prefixes=[]"
+        )
+    if bool(
+        cfg.get("sentence_memory_safety", {})
+        .get("phase_b", {})
+        .get("enabled", False)
+    ):
+        raise ValueError("Paired corruption is a Phase-A-only training objective")
+    if float(cfg.get("model", {}).get("dropout", 0.0)) != 0.0:
+        raise ValueError(
+            "Paired corruption requires model.dropout=0 for a deterministic "
+            "memory-off teacher"
+        )
+    epochs = int(train_cfg.get("epochs", 0))
+    if epochs < 1 or epochs > 4:
+        raise ValueError(
+            "Paired corruption requires an explicit train.epochs in [1, 4]; "
+            "this mechanism experiment must never train after epoch 4"
+        )
+    objective_cfg = cfg.get("objective", {})
+    for name in _PAIRED_SENTENCE_OBJECTIVE_WEIGHTS:
+        value = float(objective_cfg.get(name, 1.0))
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"objective.{name} must be finite and non-negative")
+    sparsity_weight = float(
+        objective_cfg.get("lambda_sentence_sparsity", 1e-4)
+    )
+    if not math.isfinite(sparsity_weight) or sparsity_weight < 0.0:
+        raise ValueError(
+            "objective.lambda_sentence_sparsity must be finite and non-negative"
+        )
+    return paired_cfg
+
+
+def sentence_memory_objective_identity(cfg):
+    """Describe the training-only sentence-memory objective independently."""
+
+    paired_cfg = paired_sentence_memory_corruption_config(cfg)
+    if paired_cfg["enabled"]:
+        objective_cfg = cfg.get("objective", {})
+        payload = {
+            "schema_version": 1,
+            "mode": "paired_correct_motion_or_full_v1",
+            "paired_corruption": paired_cfg,
+            "weights": {
+                **{
+                    name: float(objective_cfg.get(name, 1.0))
+                    for name in _PAIRED_SENTENCE_OBJECTIVE_WEIGHTS
+                },
+                "lambda_sentence_sparsity": float(
+                    objective_cfg.get("lambda_sentence_sparsity", 1e-4)
+                ),
+            },
+            "formula": {
+                "part_error": "masked_compact_l1_body_left_hand_right_hand_face",
+                "denominator": "stop_gradient(text_off_error).clamp_min(1e-6)",
+                "benefit": "relu((correct-text_off)/denominator+margin)",
+                "ranking": "relu((correct-stop_gradient(corrupt))/denominator+margin)",
+                "fallback": "partwise_masked_smooth_l1(corrupt,text_off)",
+                "reduction": "masked_sum_divided_by_batch_times_four_parts",
+                "ordinary_losses": "correct_only",
+                "motion_shuffle_query_identity": "name_and_motion_path_index_fallback_v1",
+                "evaluation_motion_shuffle_epoch": "checkpoint_epoch",
+            },
+        }
+    else:
+        payload = {
+            "schema_version": 1,
+            "mode": "legacy_replacement_v1",
+        }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return {
+        **payload,
+        "digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
+
+
+def validate_sentence_memory_objective_identity(checkpoint, cfg, source="checkpoint"):
+    """Bind exact resume to the implemented training-objective semantics."""
+
+    expected = sentence_memory_objective_identity(cfg)
+    actual = checkpoint.get("sentence_memory_objective_identity")
+    if actual is None and expected["mode"] == "paired_correct_motion_or_full_v1":
+        raise RuntimeError(
+            f"{source} has no persisted sentence-memory objective identity; "
+            "paired Phase-A resume requires the named schema produced by the "
+            "same trainer implementation"
+        )
+    if actual is None and isinstance(checkpoint.get("config"), dict):
+        # Pre-identity legacy checkpoints can be reconstructed without weakening
+        # a paired resume: reconstruction is permitted only for the original,
+        # paired-disabled objective.
+        actual = sentence_memory_objective_identity(checkpoint["config"])
+    if not isinstance(actual, dict):
+        raise RuntimeError(f"{source} has no sentence-memory objective identity")
+    actual_payload = {key: value for key, value in actual.items() if key != "digest"}
+    actual_digest = hashlib.sha256(
+        json.dumps(actual_payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    if actual.get("digest") != actual_digest:
+        raise RuntimeError(f"{source} has an invalid sentence-memory objective digest")
+    if actual_digest != expected["digest"]:
+        raise RuntimeError(
+            f"{source} sentence-memory objective differs from the active config: "
+            f"checkpoint={actual_digest}, active={expected['digest']}"
+        )
+    return expected
 
 
 def sentence_memory_resume_identity(cfg):
@@ -898,6 +1105,164 @@ def evaluated_loader_sample_count(loader, max_batches=0):
     return int(total)
 
 
+class DatasetIndexView(Dataset):
+    """Load selected rows while retaining the canonical source manifest."""
+
+    def __init__(self, source, indices):
+        self.source = source
+        self.indices = tuple(int(index) for index in indices)
+        self.split = source.split
+        # Provider validation must continue to see the complete canonical
+        # manifest, never a synthesized development-only manifest.
+        self.base = source.base
+        self.estimated_lengths = tuple(
+            source.estimated_lengths[index] for index in self.indices
+        )
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        return self.source[self.indices[int(index)]]
+
+
+def build_development_validation_loader(
+    cfg,
+    dataset,
+    loader,
+    sentence_memory_provider,
+    dist_info,
+):
+    """Restrict paired-objective checkpoint selection to fixed novel dev texts."""
+
+    if not paired_sentence_memory_corruption_config(cfg)["enabled"]:
+        return loader, getattr(loader, "sampler", None), None
+    partition_cfg = cfg.get("validation_text_partition")
+    if not isinstance(partition_cfg, dict) or not bool(
+        partition_cfg.get("enabled", False)
+    ):
+        raise ValueError(
+            "Paired corruption requires validation_text_partition.enabled=true"
+        )
+    if sentence_memory_provider is None:
+        raise ValueError("Development validation partition requires a memory provider")
+    rows = list(dataset.base.items)
+    expected_rows = partition_cfg.get("expected_validation_rows")
+    if expected_rows is not None and len(rows) != int(expected_rows):
+        raise RuntimeError(
+            "Validation row count differs from validation_text_partition: "
+            f"actual={len(rows)}, expected={int(expected_rows)}"
+        )
+    expected_bank_id = partition_cfg.get("expected_bank_id")
+    actual_bank_id = sentence_memory_provider.identity.get("bank_id")
+    if expected_bank_id is not None and str(actual_bank_id) != str(expected_bank_id):
+        raise RuntimeError(
+            "Validation partition bank mismatch: "
+            f"actual={actual_bank_id!r}, expected={expected_bank_id!r}"
+        )
+    val_table = (
+        sentence_memory_provider.identity.get("neighbor_tables", {}).get("val", {})
+    )
+    expected_manifest = partition_cfg.get("expected_validation_manifest_sha256")
+    actual_manifest = val_table.get("query_manifest_sha256")
+    if expected_manifest is not None and str(actual_manifest) != str(expected_manifest):
+        raise RuntimeError(
+            "Validation partition manifest mismatch: "
+            f"actual={actual_manifest!r}, expected={expected_manifest!r}"
+        )
+
+    from NIAF.continuous_trajectory_field.validation_text_partitions import (
+        DEVELOPMENT,
+        EXACT_SEEN,
+        partition_validation_text_clusters,
+    )
+
+    texts = [str(row.get("text", "")) for row in rows]
+    partition = partition_validation_text_clusters(
+        texts,
+        exact_seen=[sentence_memory_provider.is_seen_text(text) for text in texts],
+        seed=int(partition_cfg.get("seed", 1234)),
+        development_text_count=int(
+            partition_cfg.get("development_text_count", 256)
+        ),
+        expected_novel_text_count=(
+            int(partition_cfg["expected_novel_text_count"])
+            if partition_cfg.get("expected_novel_text_count") is not None
+            else None
+        ),
+    )
+    development_indices = [
+        index for index, label in enumerate(partition.labels) if label == DEVELOPMENT
+    ]
+    if not development_indices:
+        raise RuntimeError("Validation development partition contains no rows")
+    resolved_counts = partition.artifact_payload["counts"]
+    for configured_name, resolved_name in (
+        ("expected_development_rows", "development_rows"),
+        ("expected_confirmation_rows", "confirmation_rows"),
+    ):
+        expected = partition_cfg.get(configured_name)
+        actual = int(resolved_counts[resolved_name])
+        if expected is not None and actual != int(expected):
+            raise RuntimeError(
+                f"Validation partition {resolved_name} mismatch: "
+                f"actual={actual}, expected={int(expected)}"
+            )
+    expected_digest = partition_cfg.get("expected_partition_digest")
+    if expected_digest is not None and str(expected_digest) != str(
+        partition.partition_digest
+    ):
+        raise RuntimeError(
+            "Validation partition digest mismatch: "
+            f"actual={partition.partition_digest}, expected={expected_digest}"
+        )
+    subset = DatasetIndexView(dataset, development_indices)
+    lengths = [dataset.estimated_lengths[index] for index in development_indices]
+    sampler = None
+    if dist_info.get("enabled", False):
+        sampler = ExactDistributedEvalSampler(
+            lengths,
+            num_replicas=int(dist_info.get("world_size", 1)),
+            rank=int(dist_info.get("rank", 0)),
+            sort_by_length=bool(
+                cfg.get("train", {}).get("length_bucketed_batches", False)
+            ),
+        )
+    num_workers = int(cfg.get("eval", {}).get("num_workers", 0))
+    loader_kwargs = {}
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(
+            cfg.get("train", {}).get("persistent_workers", True)
+        )
+        loader_kwargs["prefetch_factor"] = int(
+            cfg.get("train", {}).get("prefetch_factor", 2)
+        )
+    development_loader = DataLoader(
+        subset,
+        batch_size=int(getattr(loader, "batch_size", 1) or 1),
+        shuffle=False,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=bool(cfg.get("train", {}).get("pin_memory", True)),
+        collate_fn=loader.collate_fn,
+        drop_last=False,
+        **loader_kwargs,
+    )
+    partition_cfg["partition_digest"] = partition.partition_digest
+    partition_cfg["resolved_artifact"] = partition.artifact_payload
+    partition_cfg["development_row_count"] = len(development_indices)
+    partition_cfg["exact_seen_row_count"] = sum(
+        label == EXACT_SEEN for label in partition.labels
+    )
+    partition_cfg["exact_seen_text_count"] = len(partition.exact_seen_texts)
+    # Exact-seen rows are descriptive rather than development evidence.  They
+    # are intentionally deferred to the standalone confirmation report so the
+    # per-epoch trainer never lets them affect selection or patience.
+    partition_cfg["exact_seen_evaluated_during_training"] = False
+    partition_cfg["confirmation_evaluated_during_training"] = False
+    return development_loader, sampler, partition
+
+
 def distributed_sample_weighted_mean_scalars(
     values, local_sample_count, device, dist_info
 ):
@@ -1099,6 +1464,119 @@ def _per_sample_part_compact_l1(prediction, target, mask):
     return torch.stack(per_part, dim=-1)
 
 
+def _per_sample_part_compact_smooth_l1(prediction, target, mask, beta):
+    """Return masked Smooth-L1 values with the same four-part decomposition."""
+
+    part_slices = (
+        slice(0, 60),
+        slice(60, 150),
+        slice(150, 240),
+        slice(240, 256),
+    )
+    per_part = []
+    for part_slice in part_slices:
+        difference = F.smooth_l1_loss(
+            prediction[..., part_slice],
+            target[..., part_slice],
+            beta=float(beta),
+            reduction="none",
+        )
+        numerator = (difference * mask[..., None].to(difference.dtype)).sum(
+            dim=(1, 2)
+        )
+        denominator = (
+            mask.sum(dim=1).to(difference.dtype)
+            * max(part_slice.stop - part_slice.start, 1)
+        ).clamp_min(1.0)
+        per_part.append(numerator / denominator)
+    return torch.stack(per_part, dim=-1)
+
+
+def _fixed_batch_part_reduction(values, row_mask):
+    """Reduce Bx4 values without rank-dependent selected-row normalization."""
+
+    if values.ndim != 2 or values.shape[1] != len(WORD_PRIOR_PART_NAMES):
+        raise ValueError("Paired sentence-memory values must have shape [B,4]")
+    row_mask = row_mask.to(device=values.device).bool()
+    if row_mask.shape != (values.shape[0],):
+        raise ValueError("Paired sentence-memory row mask must have shape [B]")
+    selected = values * row_mask[:, None].to(values.dtype)
+    denominator = max(int(values.shape[0]) * int(values.shape[1]), 1)
+    return selected.sum() / denominator
+
+
+def paired_sentence_memory_losses(
+    *,
+    correct_prediction,
+    corrupt_prediction,
+    off_prediction,
+    target,
+    frame_mask,
+    correct_available,
+    motion_mask,
+    full_shuffle_mask,
+    cfg,
+):
+    """Compute the provenance-bound paired benefit/rank/fallback objective."""
+
+    paired_cfg = paired_sentence_memory_corruption_config(cfg)
+    if not paired_cfg["enabled"]:
+        raise ValueError("paired_sentence_memory_losses requires paired corruption")
+    correct_error = _per_sample_part_compact_l1(
+        correct_prediction, target, frame_mask
+    )
+    corrupt_error = _per_sample_part_compact_l1(
+        corrupt_prediction, target, frame_mask
+    )
+    off_error = _per_sample_part_compact_l1(off_prediction, target, frame_mask)
+    denominator = off_error.detach().clamp_min(1e-6)
+    benefit_values = F.relu(
+        (correct_error - off_error.detach()) / denominator
+        + paired_cfg["benefit_margin_relative"]
+    )
+    corrupt_comparator = (
+        corrupt_error.detach()
+        if paired_cfg["detach_corrupt_ranking"]
+        else corrupt_error
+    )
+    rank_values = F.relu(
+        (correct_error - corrupt_comparator) / denominator
+        + paired_cfg["ranking_margin_relative"]
+    )
+    fallback_values = _per_sample_part_compact_smooth_l1(
+        corrupt_prediction,
+        off_prediction.detach(),
+        frame_mask,
+        beta=paired_cfg["fallback_huber_beta"],
+    )
+    losses = {
+        "loss_sentence_benefit": _fixed_batch_part_reduction(
+            benefit_values, correct_available
+        ),
+        "loss_sentence_motion_rank": _fixed_batch_part_reduction(
+            rank_values, motion_mask
+        ),
+        "loss_sentence_motion_fallback": _fixed_batch_part_reduction(
+            fallback_values, motion_mask
+        ),
+        "loss_sentence_full_shuffle_rank": _fixed_batch_part_reduction(
+            rank_values, full_shuffle_mask
+        ),
+        "loss_sentence_full_shuffle_fallback": _fixed_batch_part_reduction(
+            fallback_values, full_shuffle_mask
+        ),
+    }
+    diagnostics = {
+        "correct_error": correct_error,
+        "corrupt_error": corrupt_error,
+        "off_error": off_error,
+        "benefit_values": benefit_values,
+        "rank_values": rank_values,
+        "fallback_values": fallback_values,
+    }
+    return losses, diagnostics
+
+
 def _prepared_word_forward_kwargs(prepared, batch, cfg):
     if not is_word_prior_model(cfg):
         return {}
@@ -1223,10 +1701,12 @@ def _sentence_memory_availability(
     if not sentence_memory_enabled(cfg):
         return torch.zeros(int(batch_size), dtype=torch.bool, device=device)
     mode = str(mode).lower()
-    if mode == "shuffled":
+    if mode in {"shuffled", "motion_shuffled"}:
         return torch.ones(int(batch_size), dtype=torch.bool, device=device)
     if mode not in SENTENCE_MEMORY_TRAIN_MODES:
-        allowed = sorted(SENTENCE_MEMORY_TRAIN_MODES | {"shuffled"})
+        allowed = sorted(
+            SENTENCE_MEMORY_TRAIN_MODES | {"shuffled", "motion_shuffled"}
+        )
         raise ValueError(
             f"sentence_memory_mode must be one of {allowed}, got {mode!r}"
         )
@@ -1342,14 +1822,19 @@ def retrieve_sentence_memory(
 
 
 def deterministic_sentence_shuffle_mask(batch, available, cfg, epoch):
-    probability = float(
-        cfg.get("sentence_memory_safety", {}).get(
-            "shuffle_probability", 0.25
+    paired_cfg = paired_sentence_memory_corruption_config(cfg)
+    probability = (
+        paired_cfg["full_shuffle_probability"]
+        if paired_cfg["enabled"]
+        else float(
+            cfg.get("sentence_memory_safety", {}).get(
+                "shuffle_probability", 0.25
+            )
         )
     )
     if not 0.0 <= probability <= 1.0:
         raise ValueError(
-            "sentence_memory_safety.shuffle_probability must be in [0, 1]"
+            "sentence-memory full-shuffle probability must be in [0, 1]"
         )
     names = list(batch.get("name", ()))
     paths = list(batch.get("motion_path", ()))
@@ -1440,6 +1925,90 @@ def merge_sentence_memory_batches(normal, shuffled, shuffled_mask):
     merged = dict(normal)
     merged.update(updates)
     return merged
+
+
+def sentence_memory_query_ids(batch):
+    """Return stable per-example IDs independent of batch order and DDP rank."""
+
+    names = list(batch.get("name", ()))
+    paths = list(batch.get("motion_path", ()))
+    indices = batch.get("index")
+    if torch.is_tensor(indices):
+        indices = indices.detach().cpu().view(-1).tolist()
+    elif indices is None:
+        indices = ()
+    else:
+        indices = list(indices)
+    batch_size = max(len(names), len(paths), len(indices))
+    identifiers = []
+    for index in range(batch_size):
+        name = str(names[index]) if index < len(names) else ""
+        path = str(paths[index]) if index < len(paths) else ""
+        if name or path:
+            # Dataset-local row indices change under a subset/reordered
+            # manifest. Name/path are immutable source identity; use an index
+            # only when neither is available.
+            identifiers.append(
+                json.dumps(
+                    ["source_v1", name, path],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+        else:
+            stable_index = indices[index] if index < len(indices) else index
+            identifiers.append(f"index_v1:{stable_index}")
+    return identifiers
+
+
+_SENTENCE_TOKEN_FIELDS = {
+    "sentence_motion_tokens",
+    "sentence_motion_mask",
+    "sentence_motion_tau",
+    "sentence_part_validity",
+}
+
+
+def _pad_sentence_token_length(value, token_length):
+    if int(value.shape[2]) == int(token_length):
+        return value
+    shape = list(value.shape)
+    shape[2] = int(token_length)
+    padded = value.new_zeros(shape)
+    slices = [slice(None)] * value.ndim
+    slices[2] = slice(0, value.shape[2])
+    padded[tuple(slices)] = value
+    return padded
+
+
+def _concatenate_sentence_forward_kwargs(*branches):
+    if len(branches) < 1:
+        raise ValueError("At least one sentence-memory branch is required")
+    keys = set(branches[0])
+    if any(set(branch) != keys for branch in branches[1:]):
+        raise ValueError("Sentence-memory branches have different forward fields")
+    combined = {}
+    for name in sorted(keys):
+        values = [branch[name] for branch in branches]
+        if not all(torch.is_tensor(value) for value in values):
+            if any(value is not values[0] for value in values[1:]):
+                raise ValueError(
+                    f"Non-tensor sentence-memory field {name!r} differs by branch"
+                )
+            combined[name] = values[0]
+            continue
+        if name in _SENTENCE_TOKEN_FIELDS:
+            token_length = max(int(value.shape[2]) for value in values)
+            values = [
+                _pad_sentence_token_length(value, token_length) for value in values
+            ]
+        reference = tuple(values[0].shape[1:])
+        if any(tuple(value.shape[1:]) != reference for value in values[1:]):
+            raise ValueError(
+                f"Sentence-memory field {name!r} has incompatible branch shapes"
+            )
+        combined[name] = torch.cat(values, dim=0)
+    return combined
 
 
 def _duplicate_optional_batch_kwargs(kwargs, batch_size):
@@ -1541,6 +2110,44 @@ def phase_b_combined_model_forward(
     return primary_outputs, student_off_prediction
 
 
+def paired_sentence_memory_model_forward(
+    model,
+    *,
+    text_tokens,
+    query_times,
+    text_mask,
+    query_mask,
+    word_kwargs,
+    correct_sentence_kwargs,
+    corrupt_sentence_kwargs,
+):
+    """Run paired correct and corrupt retrieval through one DDP forward graph."""
+
+    batch_size = int(text_tokens.shape[0])
+    combined_word = _duplicate_optional_batch_kwargs(word_kwargs, batch_size)
+    combined_sentence = _concatenate_sentence_forward_kwargs(
+        correct_sentence_kwargs,
+        corrupt_sentence_kwargs,
+    )
+    combined_outputs = model(
+        text_tokens=torch.cat((text_tokens, text_tokens), dim=0),
+        query_times=torch.cat((query_times, query_times), dim=0),
+        text_mask=torch.cat((text_mask, text_mask), dim=0),
+        time_domain="normalized",
+        query_mask=torch.cat((query_mask, query_mask), dim=0),
+        **combined_word,
+        **combined_sentence,
+    )
+    combined_batch_size = 2 * batch_size
+    correct_outputs = _slice_forward_output_batch(
+        combined_outputs, slice(0, batch_size), combined_batch_size
+    )
+    corrupt_outputs = _slice_forward_output_batch(
+        combined_outputs, slice(batch_size, combined_batch_size), combined_batch_size
+    )
+    return correct_outputs, corrupt_outputs
+
+
 def prepare_field_batch(
     model,
     text_encoder,
@@ -1568,6 +2175,15 @@ def prepare_field_batch(
     word_availability = None
     sentence_availability = None
     sentence_memory_batch = None
+    sentence_memory_corrupt_batch = None
+    sentence_memory_corrupt_outputs = None
+    sentence_memory_motion_permutation = None
+    sentence_memory_motion_mask = torch.zeros(
+        target.shape[0], dtype=torch.bool, device=device
+    )
+    sentence_memory_full_shuffle_mask = torch.zeros(
+        target.shape[0], dtype=torch.bool, device=device
+    )
     sentence_memory_shuffled_mask = torch.zeros(
         target.shape[0], dtype=torch.bool, device=device
     )
@@ -1643,6 +2259,25 @@ def prepare_field_batch(
                     else "on"
                 ),
             )
+            if resolved_sentence_mode == "motion_shuffled":
+                from NIAF.continuous_trajectory_field.sentence_memory import (
+                    motion_only_shuffle_sentence_memory_batch,
+                )
+
+                (
+                    sentence_memory_batch,
+                    sentence_memory_motion_permutation,
+                    motion_informative,
+                ) = motion_only_shuffle_sentence_memory_batch(
+                    sentence_memory_batch,
+                    query_ids=sentence_memory_query_ids(batch),
+                    epoch=int(epoch),
+                    seed=int(cfg.get("seed", 1234)),
+                )
+                sentence_memory_motion_mask = (
+                    _sentence_memory_field(sentence_memory_batch, "available").bool()
+                    & motion_informative.bool()
+                )
             if bool(
                 training
                 and cfg.get("sentence_memory_safety", {}).get("enabled", False)
@@ -1650,31 +2285,83 @@ def prepare_field_batch(
                 effective_available = _sentence_memory_field(
                     sentence_memory_batch, "available"
                 ).bool()
-                sentence_memory_shuffled_mask = deterministic_sentence_shuffle_mask(
+                requested_full_shuffle = deterministic_sentence_shuffle_mask(
                     batch, effective_available, cfg, epoch
                 )
-                if bool(sentence_memory_shuffled_mask.any()):
-                    shuffled_batch = retrieve_sentence_memory(
-                        sentence_memory_provider,
-                        dataset=dataset,
-                        batch=batch,
-                        text_tokens=text_tokens,
-                        text_mask=text_mask,
-                        predicted_duration=predicted_duration.detach(),
-                        # Only the rows selected for the corruption control
-                        # need a second lookup/payload gather.  Keeping other
-                        # rows unavailable avoids doubling sentence-bank I/O
-                        # for every training microbatch.
-                        available=sentence_memory_shuffled_mask,
-                        training=True,
-                        device=device,
-                        mode="shuffled",
+                if paired_sentence_memory_corruption_config(cfg)["enabled"]:
+                    from NIAF.continuous_trajectory_field.sentence_memory import (
+                        motion_only_shuffle_sentence_memory_batch,
                     )
-                    sentence_memory_batch = merge_sentence_memory_batches(
+
+                    (
+                        motion_corrupt_batch,
+                        sentence_memory_motion_permutation,
+                        motion_informative,
+                    ) = motion_only_shuffle_sentence_memory_batch(
                         sentence_memory_batch,
-                        shuffled_batch,
-                        sentence_memory_shuffled_mask,
+                        query_ids=sentence_memory_query_ids(batch),
+                        epoch=int(epoch),
+                        seed=int(cfg.get("seed", 1234)),
                     )
+                    sentence_memory_corrupt_batch = motion_corrupt_batch
+                    if bool(requested_full_shuffle.any()):
+                        shuffled_batch = retrieve_sentence_memory(
+                            sentence_memory_provider,
+                            dataset=dataset,
+                            batch=batch,
+                            text_tokens=text_tokens,
+                            text_mask=text_mask,
+                            predicted_duration=predicted_duration.detach(),
+                            # Full corruption retains its historical sparse
+                            # payload gather; motion-only corruption is in-memory.
+                            available=requested_full_shuffle,
+                            training=True,
+                            device=device,
+                            mode="shuffled",
+                        )
+                        sentence_memory_full_shuffle_mask = (
+                            requested_full_shuffle
+                            & _sentence_memory_field(
+                                shuffled_batch, "available"
+                            ).bool()
+                        )
+                        sentence_memory_corrupt_batch = merge_sentence_memory_batches(
+                            sentence_memory_corrupt_batch,
+                            shuffled_batch,
+                            sentence_memory_full_shuffle_mask,
+                        )
+                    sentence_memory_motion_mask = (
+                        effective_available
+                        & motion_informative.bool()
+                        & ~sentence_memory_full_shuffle_mask
+                    )
+                    sentence_memory_shuffled_mask = (
+                        sentence_memory_full_shuffle_mask
+                    )
+                else:
+                    sentence_memory_shuffled_mask = requested_full_shuffle
+                    if bool(sentence_memory_shuffled_mask.any()):
+                        shuffled_batch = retrieve_sentence_memory(
+                            sentence_memory_provider,
+                            dataset=dataset,
+                            batch=batch,
+                            text_tokens=text_tokens,
+                            text_mask=text_mask,
+                            predicted_duration=predicted_duration.detach(),
+                            # Only the rows selected for the corruption control
+                            # need a second lookup/payload gather.  Keeping other
+                            # rows unavailable avoids doubling sentence-bank I/O
+                            # for every training microbatch.
+                            available=sentence_memory_shuffled_mask,
+                            training=True,
+                            device=device,
+                            mode="shuffled",
+                        )
+                        sentence_memory_batch = merge_sentence_memory_batches(
+                            sentence_memory_batch,
+                            shuffled_batch,
+                            sentence_memory_shuffled_mask,
+                        )
             sentence_kwargs = sentence_memory_forward_kwargs(
                 sentence_memory_batch
             )
@@ -1686,6 +2373,12 @@ def prepare_field_batch(
             )
 
     if is_dual_mode(cfg):
+        paired_forward = bool(
+            training
+            and is_sentence_memory_model(cfg)
+            and paired_sentence_memory_corruption_config(cfg)["enabled"]
+            and sentence_memory_corrupt_batch is not None
+        )
         phase_b_combined_forward = bool(
             training
             and is_sentence_memory_model(cfg)
@@ -1693,7 +2386,22 @@ def prepare_field_batch(
             .get("phase_b", {})
             .get("enabled", False)
         )
-        if phase_b_combined_forward:
+        if paired_forward:
+            outputs, sentence_memory_corrupt_outputs = (
+                paired_sentence_memory_model_forward(
+                    model,
+                    text_tokens=text_tokens,
+                    query_times=tau,
+                    text_mask=text_mask,
+                    query_mask=batch["mask"],
+                    word_kwargs=word_kwargs,
+                    correct_sentence_kwargs=sentence_kwargs,
+                    corrupt_sentence_kwargs=sentence_memory_forward_kwargs(
+                        sentence_memory_corrupt_batch
+                    ),
+                )
+            )
+        elif phase_b_combined_forward:
             outputs, phase_b_student_off_prediction = (
                 phase_b_combined_model_forward(
                     model,
@@ -1741,6 +2449,11 @@ def prepare_field_batch(
         "word_prior_available": word_availability,
         "sentence_memory_available": sentence_availability,
         "sentence_memory_batch": sentence_memory_batch,
+        "sentence_memory_corrupt_batch": sentence_memory_corrupt_batch,
+        "sentence_memory_corrupt_outputs": sentence_memory_corrupt_outputs,
+        "sentence_memory_motion_permutation": sentence_memory_motion_permutation,
+        "sentence_memory_motion_mask": sentence_memory_motion_mask,
+        "sentence_memory_full_shuffle_mask": sentence_memory_full_shuffle_mask,
         "sentence_memory_shuffled_mask": sentence_memory_shuffled_mask,
         "phase_b_student_off_prediction": phase_b_student_off_prediction,
         "text_tokens": text_tokens,
@@ -1885,7 +2598,19 @@ def compute_batch_losses(
     sentence_off_distill = target.new_tensor(0.0)
     sentence_off_compact = target.new_tensor(0.0)
     sentence_off_sample_count = target.new_tensor(0.0)
+    paired_loss_values = {
+        name: target.new_tensor(0.0)
+        for name in (
+            "loss_sentence_benefit",
+            "loss_sentence_motion_rank",
+            "loss_sentence_motion_fallback",
+            "loss_sentence_full_shuffle_rank",
+            "loss_sentence_full_shuffle_fallback",
+        )
+    }
+    paired_diagnostics = None
     sentence_safety_cfg = cfg.get("sentence_memory_safety", {})
+    paired_cfg = paired_sentence_memory_corruption_config(cfg)
     phase_b_cfg = sentence_safety_cfg.get("phase_b", {})
     phase_b_enabled = bool(training and phase_b_cfg.get("enabled", False))
     phase_b_teacher_prediction = None
@@ -1917,21 +2642,43 @@ def compute_batch_losses(
             frozen_teacher_prediction=phase_b_teacher_prediction,
         )
         available = prepared["sentence_memory_available"].bool()
-        memory_error = _per_sample_part_compact_l1(
-            outputs["prediction"], target, mask
-        )
         off_error = _per_sample_part_compact_l1(off_prediction, target, mask)
         sentence_off_compact = off_error.mean()
         sentence_off_sample_count = off_error.new_tensor(float(len(off_error)))
-        safe_margin = float(sentence_safety_cfg.get("nonregression_margin", 0.0))
-        shuffled_mask = prepared["sentence_memory_shuffled_mask"].bool()
-        normal_available = available & ~shuffled_mask
-        if bool(normal_available.any()):
-            sentence_safe = F.relu(
-                memory_error[normal_available]
-                - off_error[normal_available]
-                + safe_margin
-            ).mean()
+        if paired_cfg["enabled"]:
+            corrupt_outputs = prepared["sentence_memory_corrupt_outputs"]
+            if corrupt_outputs is None:
+                raise RuntimeError(
+                    "Paired sentence-memory training produced no corrupt output"
+                )
+            paired_loss_values, paired_diagnostics = paired_sentence_memory_losses(
+                correct_prediction=outputs["prediction"],
+                corrupt_prediction=corrupt_outputs["prediction"],
+                off_prediction=off_prediction,
+                target=target,
+                frame_mask=mask,
+                correct_available=available,
+                motion_mask=prepared["sentence_memory_motion_mask"].bool(),
+                full_shuffle_mask=prepared[
+                    "sentence_memory_full_shuffle_mask"
+                ].bool(),
+                cfg=cfg,
+            )
+        else:
+            memory_error = _per_sample_part_compact_l1(
+                outputs["prediction"], target, mask
+            )
+            safe_margin = float(
+                sentence_safety_cfg.get("nonregression_margin", 0.0)
+            )
+            shuffled_mask = prepared["sentence_memory_shuffled_mask"].bool()
+            normal_available = available & ~shuffled_mask
+            if bool(normal_available.any()):
+                sentence_safe = F.relu(
+                    memory_error[normal_available]
+                    - off_error[normal_available]
+                    + safe_margin
+                ).mean()
 
         memory_gates = getattr(trajectory, "sentence_memory_gates", None)
         if memory_gates is not None:
@@ -1940,13 +2687,17 @@ def compute_batch_losses(
         available_mask = mask & available[:, None]
         if bool(available_mask.any()):
             sentence_delta_sparsity = delta[available_mask].abs().mean()
-        if bool(shuffled_mask.any()):
-            shuffled_frames = mask & shuffled_mask[:, None]
-            sentence_shuffle = F.smooth_l1_loss(
-                outputs["prediction"][shuffled_frames],
-                off_prediction[shuffled_frames],
-                beta=float(sentence_safety_cfg.get("shuffle_huber_beta", 0.1)),
-            )
+        if not paired_cfg["enabled"]:
+            shuffled_mask = prepared["sentence_memory_shuffled_mask"].bool()
+            if bool(shuffled_mask.any()):
+                shuffled_frames = mask & shuffled_mask[:, None]
+                sentence_shuffle = F.smooth_l1_loss(
+                    outputs["prediction"][shuffled_frames],
+                    off_prediction[shuffled_frames],
+                    beta=float(
+                        sentence_safety_cfg.get("shuffle_huber_beta", 0.1)
+                    ),
+                )
 
     total = float(objective_cfg.get("lambda_endpoint", 1.0)) * endpoint_total
     if is_dual_mode(cfg):
@@ -1964,8 +2715,33 @@ def compute_batch_losses(
         "loss_local_width"
     ]
     total = total + finite_total + analytic_total
-    total = total + float(objective_cfg.get("lambda_sentence_safe", 1.0)) * sentence_safe
-    total = total + float(objective_cfg.get("lambda_sentence_shuffle", 1.0)) * sentence_shuffle
+    if paired_cfg["enabled"] and training:
+        for loss_name, weight_name in (
+            ("loss_sentence_benefit", "lambda_sentence_benefit"),
+            ("loss_sentence_motion_rank", "lambda_sentence_motion_rank"),
+            (
+                "loss_sentence_motion_fallback",
+                "lambda_sentence_motion_fallback",
+            ),
+            (
+                "loss_sentence_full_shuffle_rank",
+                "lambda_sentence_full_shuffle_rank",
+            ),
+            (
+                "loss_sentence_full_shuffle_fallback",
+                "lambda_sentence_full_shuffle_fallback",
+            ),
+        ):
+            total = total + float(objective_cfg.get(weight_name, 1.0)) * (
+                paired_loss_values[loss_name]
+            )
+    else:
+        total = total + float(
+            objective_cfg.get("lambda_sentence_safe", 1.0)
+        ) * sentence_safe
+        total = total + float(
+            objective_cfg.get("lambda_sentence_shuffle", 1.0)
+        ) * sentence_shuffle
     sentence_sparsity_weight = float(
         objective_cfg.get("lambda_sentence_sparsity", 1e-4)
     )
@@ -1986,9 +2762,35 @@ def compute_batch_losses(
     if is_sentence_memory_model(cfg):
         losses["loss_sentence_safe"] = sentence_safe
         losses["loss_sentence_shuffle"] = sentence_shuffle
+        losses.update(paired_loss_values)
         losses["loss_sentence_gate_sparsity"] = sentence_gate_sparsity
         losses["loss_sentence_delta_sparsity"] = sentence_delta_sparsity
         losses["loss_sentence_off_distill"] = sentence_off_distill
+        if paired_diagnostics is not None:
+            motion_mask = prepared["sentence_memory_motion_mask"].bool()
+            full_mask = prepared["sentence_memory_full_shuffle_mask"].bool()
+            for part_index, part_name in enumerate(WORD_PRIOR_PART_NAMES):
+                for label, values in (
+                    ("correct", paired_diagnostics["correct_error"]),
+                    ("corrupt", paired_diagnostics["corrupt_error"]),
+                    ("text_off", paired_diagnostics["off_error"]),
+                ):
+                    losses[
+                        f"sentence_memory_{label}_compact_l1_{part_name}"
+                    ] = values[:, part_index].mean()
+                for label, row_selector in (
+                    ("motion", motion_mask),
+                    ("full_shuffle", full_mask),
+                ):
+                    selected_count = row_selector.float().sum().clamp_min(1.0)
+                    losses[
+                        f"sentence_memory_{label}_rank_violation_{part_name}"
+                    ] = (
+                        (
+                            paired_diagnostics["rank_values"][:, part_index] > 0
+                        ).to(target.dtype)
+                        * row_selector.to(target.dtype)
+                    ).sum() / selected_count
     losses["duration_pred_seconds"] = trajectory.duration_seconds.mean()
     losses["duration_target_seconds"] = batch["duration"].mean()
     losses["residual_rms"] = torch.sqrt(
@@ -2083,6 +2885,12 @@ def compute_batch_losses(
         )
         losses["sentence_memory_shuffled_fraction"] = prepared[
             "sentence_memory_shuffled_mask"
+        ].float().mean()
+        losses["sentence_memory_motion_corrupt_fraction"] = prepared[
+            "sentence_memory_motion_mask"
+        ].float().mean()
+        losses["sentence_memory_full_shuffle_fraction"] = prepared[
+            "sentence_memory_full_shuffle_mask"
         ].float().mean()
         for label, sample_selector in (("sentence_memory", memory_availability),):
             mode_mask = mask & sample_selector[:, None]
@@ -2634,9 +3442,16 @@ WANDB_BATCH_METRICS = (
     "sentence_memory_duration_gap",
     "loss_sentence_safe",
     "loss_sentence_shuffle",
+    "loss_sentence_benefit",
+    "loss_sentence_motion_rank",
+    "loss_sentence_motion_fallback",
+    "loss_sentence_full_shuffle_rank",
+    "loss_sentence_full_shuffle_fallback",
     "loss_sentence_gate_sparsity",
     "loss_sentence_delta_sparsity",
     "loss_sentence_off_distill",
+    "sentence_memory_motion_corrupt_fraction",
+    "sentence_memory_full_shuffle_fraction",
 )
 
 
@@ -2757,6 +3572,61 @@ def configure_wandb_metrics(wandb_run):
         wandb_run.define_metric(name, **kwargs)
 
 
+def _distributed_finite_flag(local_finite, device, dist_info):
+    if not dist_info.get("enabled", False):
+        return bool(local_finite)
+    backend = str(dist_info.get("backend") or dist.get_backend()).lower()
+    flag_device = device if backend == "nccl" else torch.device("cpu")
+    flag = torch.tensor(
+        int(bool(local_finite)), dtype=torch.int32, device=flag_device
+    )
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
+
+
+def require_finite_training_losses(total, losses, device, dist_info):
+    """Fail all ranks together before backward when any diagnostic is non-finite."""
+
+    nonfinite = []
+    for name, value in {"loss_total": total, **losses}.items():
+        if torch.is_tensor(value):
+            finite = bool(torch.isfinite(value.detach()).all())
+        else:
+            try:
+                finite = math.isfinite(float(value))
+            except (TypeError, ValueError):
+                finite = False
+        if not finite:
+            nonfinite.append(name)
+    globally_finite = _distributed_finite_flag(
+        not nonfinite, device, dist_info
+    )
+    if not globally_finite:
+        raise FloatingPointError(
+            "Non-finite training loss/diagnostic detected before backward; "
+            f"local_nonfinite={sorted(nonfinite)}"
+        )
+
+
+def require_finite_training_gradients(model, device, dist_info):
+    """Fail all ranks together before an optimizer can apply non-finite gradients."""
+
+    nonfinite = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+        and not bool(torch.isfinite(parameter.grad.detach()).all())
+    ]
+    globally_finite = _distributed_finite_flag(
+        not nonfinite, device, dist_info
+    )
+    if not globally_finite:
+        raise FloatingPointError(
+            "Non-finite training gradient detected before optimizer step; "
+            f"local_nonfinite={sorted(nonfinite)}"
+        )
+
+
 def run_train_epoch(
     model,
     fk,
@@ -2820,6 +3690,7 @@ def run_train_epoch(
             )
             microbatch_count = end - start
             gradient_weight = microbatch_count / logical_size
+            require_finite_training_losses(total, losses, device, dist_info)
             (total * gradient_weight / accumulation).backward()
             float_losses = tensor_dict_to_float(losses)
             average.update(float_losses, n=microbatch_count, prefix="train")
@@ -2831,6 +3702,7 @@ def run_train_epoch(
         last_batch_index = batch_index + 1
         step_average.update(batch_losses, n=logical_size)
         if pending == accumulation:
+            require_finite_training_gradients(model, device, dist_info)
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), float(cfg.get("train", {}).get("grad_clip", 1.0))
             )
@@ -2868,6 +3740,7 @@ def run_train_epoch(
         for parameter in model.parameters():
             if parameter.grad is not None:
                 parameter.grad.mul_(correction)
+        require_finite_training_gradients(model, device, dist_info)
         torch.nn.utils.clip_grad_norm_(
             model.parameters(), float(cfg.get("train", {}).get("grad_clip", 1.0))
         )
@@ -2948,6 +3821,7 @@ def evaluate_microbatch(
     word_prior_mode=None,
     sentence_memory_provider=None,
     sentence_memory_mode=None,
+    return_prepared=False,
 ):
     batch = move_batch_to_device(batch, device)
     metrics = {}
@@ -3052,6 +3926,8 @@ def evaluate_microbatch(
                 fk_chunk_size=int(cfg.get("metrics", {}).get("fk_batch_size", 128)),
             )
             add_metrics(label, ablation_losses)
+    if return_prepared:
+        return metrics, prepared
     return metrics
 
 
@@ -3113,6 +3989,217 @@ def evaluate(
     return average.mean()
 
 
+_PAIRED_USAGE_RAW_PREFIX = "_paired_usage_raw/"
+_PAIRED_USAGE_PART_SLICES = {
+    "all": slice(0, 256),
+    "body": slice(0, 60),
+    "left_hand": slice(60, 150),
+    "right_hand": slice(150, 240),
+    "face": slice(240, 256),
+}
+
+
+def paired_sentence_memory_usage_moments(
+    correct_prediction,
+    motion_prediction,
+    off_prediction,
+    frame_mask,
+):
+    """Return additive moments for exact cross-rank Rmotion reduction."""
+
+    if not (
+        correct_prediction.shape
+        == motion_prediction.shape
+        == off_prediction.shape
+    ):
+        raise ValueError("Rmotion predictions must have identical shapes")
+    if frame_mask.shape != correct_prediction.shape[:2]:
+        raise ValueError("Rmotion frame mask has an incompatible shape")
+    moments = {}
+    for part_name, part_slice in _PAIRED_USAGE_PART_SLICES.items():
+        expanded_mask = frame_mask[..., None].expand(
+            -1, -1, part_slice.stop - part_slice.start
+        )
+        for label, comparison in (
+            ("motion", motion_prediction),
+            ("off", off_prediction),
+        ):
+            difference = (
+                correct_prediction[..., part_slice] - comparison[..., part_slice]
+            ).double()
+            moments[f"{part_name}/{label}_square_sum"] = float(
+                difference[expanded_mask].square().sum().cpu()
+            )
+            moments[f"{part_name}/{label}_element_count"] = float(
+                expanded_mask.sum().cpu()
+            )
+    return moments
+
+
+@torch.no_grad()
+def evaluate_paired_sentence_memory_modes(
+    model,
+    fk,
+    text_encoder,
+    provider,
+    loader,
+    dataset,
+    cfg,
+    device,
+    *,
+    epoch,
+    max_batches,
+    show_progress,
+    sentence_memory_provider,
+):
+    """Evaluate all controls together so Rmotion uses exactly paired rows."""
+
+    modes = configured_sentence_memory_eval_modes(cfg)
+    required = {"off", "on", "motion_shuffled", "shuffled"}
+    missing = sorted(required - set(modes))
+    if missing:
+        raise ValueError(
+            "Paired corruption validation requires sentence-memory modes "
+            f"{sorted(required)}; missing={missing}"
+        )
+    namespaces = {
+        "off": "text_only",
+        "on": "sentence_memory",
+        "shuffled": "shuffled_sentence_memory",
+        "motion_shuffled": "motion_shuffled_sentence_memory",
+    }
+    fixed_word_mode = str(
+        cfg.get("eval", {}).get("sentence_memory_word_prior_mode", "off")
+    ).lower()
+    if fixed_word_mode != "off":
+        raise ValueError("Paired corruption validation requires the word prior off")
+    model.eval()
+    averages = {mode: ScalarAverager() for mode in modes}
+    raw_moments = {}
+    progress = tqdm(loader, desc="val", leave=False, disable=not show_progress)
+    for batch_index, batch in enumerate(progress):
+        if max_batches and batch_index >= int(max_batches):
+            break
+        logical_size = len(batch["name"])
+        microbatch_size = validation_microbatch_size(batch, cfg)
+        microbatch_count = (logical_size + microbatch_size - 1) // microbatch_size
+        for microbatch_index, start in enumerate(
+            range(0, logical_size, microbatch_size), start=1
+        ):
+            end = min(start + microbatch_size, logical_size)
+            microbatch = slice_batch(batch, start, end)
+            predictions = {}
+            moved_mask = None
+            for mode in modes:
+                metrics, prepared = evaluate_microbatch(
+                    model,
+                    fk,
+                    text_encoder,
+                    provider,
+                    microbatch,
+                    dataset,
+                    cfg,
+                    device,
+                    epoch=epoch,
+                    word_prior_mode=fixed_word_mode,
+                    sentence_memory_provider=sentence_memory_provider,
+                    sentence_memory_mode=mode,
+                    return_prepared=True,
+                )
+                averages[mode].update(metrics, n=end - start)
+                if mode in {"off", "on", "motion_shuffled"}:
+                    predictions[mode] = prepared["outputs"]["prediction"].detach()
+                    if mode == "motion_shuffled":
+                        # Both sides of Rmotion must use exactly the rows on
+                        # which a nontrivial motion permutation was possible.
+                        informative = prepared[
+                            "sentence_memory_motion_mask"
+                        ].bool()
+                        moved_mask = (
+                            microbatch["mask"].to(device).bool()
+                            & informative[:, None]
+                        )
+            moments = paired_sentence_memory_usage_moments(
+                predictions["on"],
+                predictions["motion_shuffled"],
+                predictions["off"],
+                moved_mask,
+            )
+            for name, value in moments.items():
+                raw_moments[name] = raw_moments.get(name, 0.0) + value
+            if show_progress:
+                progress.set_postfix(
+                    logical=f"{batch_index + 1}/{len(loader)}",
+                    micro=f"{microbatch_index}/{microbatch_count}",
+                )
+        if (
+            bool(cfg.get("eval", {}).get("empty_cache_between_batches", True))
+            and torch.device(device).type == "cuda"
+        ):
+            torch.cuda.empty_cache()
+    combined = {}
+    for mode, average in averages.items():
+        namespace = namespaces[mode]
+        combined.update(
+            {f"{namespace}/{name}": value for name, value in average.mean().items()}
+        )
+    combined.update(
+        {f"{_PAIRED_USAGE_RAW_PREFIX}{name}": value for name, value in raw_moments.items()}
+    )
+    return combined
+
+
+def distributed_validation_metrics(values, local_sample_count, device, dist_info):
+    """Reduce ordinary means and additive paired-usage moments correctly."""
+
+    raw = {
+        name.removeprefix(_PAIRED_USAGE_RAW_PREFIX): float(value)
+        for name, value in values.items()
+        if name.startswith(_PAIRED_USAGE_RAW_PREFIX)
+    }
+    ordinary = {
+        name: value
+        for name, value in values.items()
+        if not name.startswith(_PAIRED_USAGE_RAW_PREFIX)
+    }
+    ordinary = distributed_sample_weighted_mean_scalars(
+        ordinary, local_sample_count, device, dist_info
+    )
+    if not raw:
+        return ordinary
+    raw_names = sorted(raw)
+    additive = torch.tensor(
+        [raw[name] for name in raw_names], dtype=torch.float64, device=device
+    )
+    if dist_info.get("enabled", False):
+        dist.all_reduce(additive, op=dist.ReduceOp.SUM)
+    reduced_raw = {
+        name: float(value)
+        for name, value in zip(raw_names, additive.detach().cpu().tolist())
+    }
+    for part_name in _PAIRED_USAGE_PART_SLICES:
+        motion_sum = reduced_raw[f"{part_name}/motion_square_sum"]
+        motion_count = reduced_raw[f"{part_name}/motion_element_count"]
+        off_sum = reduced_raw[f"{part_name}/off_square_sum"]
+        off_count = reduced_raw[f"{part_name}/off_element_count"]
+        if motion_count <= 0.0 or off_count <= 0.0:
+            raise RuntimeError(f"Rmotion {part_name} has no valid elements")
+        motion_rms = math.sqrt(motion_sum / motion_count)
+        off_rms = math.sqrt(off_sum / off_count)
+        prefix = f"paired_sentence_memory/{part_name}"
+        ordinary[f"{prefix}_motion_square_sum"] = motion_sum
+        ordinary[f"{prefix}_motion_element_count"] = motion_count
+        ordinary[f"{prefix}_off_square_sum"] = off_sum
+        ordinary[f"{prefix}_off_element_count"] = off_count
+        ordinary[f"{prefix}_motion_rms"] = motion_rms
+        ordinary[f"{prefix}_off_rms"] = off_rms
+        ordinary[f"{prefix}_Rmotion"] = motion_rms / max(off_rms, 1e-12)
+    ordinary["paired_sentence_memory/Rmotion"] = ordinary[
+        "paired_sentence_memory/all_Rmotion"
+    ]
+    return ordinary
+
+
 def evaluate_configured_modes(
     model,
     fk,
@@ -3144,11 +4231,27 @@ def evaluate_configured_modes(
             show_progress=show_progress,
         )
     if is_sentence_memory_model(cfg):
+        if paired_sentence_memory_corruption_config(cfg)["enabled"]:
+            return evaluate_paired_sentence_memory_modes(
+                model,
+                fk,
+                text_encoder,
+                provider,
+                loader,
+                dataset,
+                cfg,
+                device,
+                epoch=epoch,
+                max_batches=max_batches,
+                show_progress=show_progress,
+                sentence_memory_provider=sentence_memory_provider,
+            )
         combined = {}
         namespaces = {
             "off": "text_only",
             "on": "sentence_memory",
             "shuffled": "shuffled_sentence_memory",
+            "motion_shuffled": "motion_shuffled_sentence_memory",
         }
         # v3 keeps the v2 word-prior branch. Phase A fixes it off, while this
         # explicit setting leaves future word+sentence experiments possible.
@@ -3324,6 +4427,9 @@ def checkpoint_selection_diagnostics(metrics, cfg, return_details=False):
         memory_metrics = _metrics_in_namespace(metrics, "sentence_memory")
         shuffled_metrics = _metrics_in_namespace(
             metrics, "shuffled_sentence_memory"
+        )
+        motion_shuffled_metrics = _metrics_in_namespace(
+            metrics, "motion_shuffled_sentence_memory"
         )
         selected_namespace = "sentence_memory" if memory_metrics else "text_only"
         selected_metrics = memory_metrics or text_metrics
@@ -3561,6 +4667,137 @@ def checkpoint_selection_diagnostics(metrics, cfg, return_details=False):
                 "required sentence_memory and shuffled_sentence_memory "
                 "validation metrics were not both produced"
             )
+        require_motion_improvement = bool(
+            cfg.get("selection", {}).get(
+                "require_sentence_memory_outperform_motion_shuffled",
+                paired_sentence_memory_corruption_config(cfg)["enabled"],
+            )
+        )
+        if memory_metrics and motion_shuffled_metrics:
+            memory_score = float(selection_diagnostics(memory_metrics, cfg)[0])
+            motion_score = float(
+                selection_diagnostics(motion_shuffled_metrics, cfg)[0]
+            )
+            motion_minimum_improvement = float(
+                cfg.get("selection", {}).get(
+                    "sentence_memory_min_relative_improvement_over_motion_shuffled",
+                    0.001,
+                )
+            )
+            if motion_minimum_improvement < 0:
+                raise ValueError(
+                    "sentence_memory_min_relative_improvement_over_motion_shuffled "
+                    "must be non-negative"
+                )
+            motion_scale = max(abs(motion_score), 1e-8)
+            allowed_memory_score = (
+                motion_score - motion_minimum_improvement * motion_scale
+            )
+            motion_violation = (
+                max(memory_score - allowed_memory_score, 0.0) / motion_scale
+                if math.isfinite(memory_score) and math.isfinite(motion_score)
+                else float("inf")
+            )
+            if require_motion_improvement:
+                violation = float(violation) + motion_violation
+                feasible = bool(feasible and motion_violation <= 1e-12)
+                if motion_violation > 0:
+                    details["rejection_reasons"].append(
+                        "sentence-memory score "
+                        f"{memory_score:.6g} did not outperform motion-shuffled "
+                        f"memory score {motion_score:.6g} by the required "
+                        f"{100.0 * motion_minimum_improvement:.2f}%"
+                    )
+            memory_details.update(
+                {
+                    "motion_shuffled_sentence_memory_score": motion_score,
+                    "sentence_memory_allowed_score_vs_motion_shuffled": (
+                        allowed_memory_score
+                    ),
+                    "sentence_memory_relative_improvement_over_motion_shuffled": (
+                        (motion_score - memory_score) / motion_scale
+                    ),
+                    "sentence_memory_min_relative_improvement_over_motion_shuffled": (
+                        motion_minimum_improvement
+                    ),
+                    "sentence_memory_motion_shuffled_improvement_violation": (
+                        motion_violation
+                    ),
+                    "require_sentence_memory_outperform_motion_shuffled": float(
+                        require_motion_improvement
+                    ),
+                }
+            )
+        elif require_motion_improvement:
+            violation = float("inf")
+            feasible = False
+            details["rejection_reasons"].append(
+                "required sentence_memory and motion_shuffled_sentence_memory "
+                "validation metrics were not both produced"
+            )
+
+        paired_objective = paired_sentence_memory_corruption_config(cfg)["enabled"]
+        if paired_objective:
+            minimum_rmotion = float(
+                cfg.get("selection", {}).get("sentence_memory_min_Rmotion", 0.05)
+            )
+            if not math.isfinite(minimum_rmotion) or minimum_rmotion < 0.0:
+                raise ValueError(
+                    "selection.sentence_memory_min_Rmotion must be finite and "
+                    "non-negative"
+                )
+            rmotion = float(
+                metrics.get("paired_sentence_memory/Rmotion", float("nan"))
+            )
+            rmotion_violation = (
+                max(minimum_rmotion - rmotion, 0.0) / max(minimum_rmotion, 1e-8)
+                if math.isfinite(rmotion)
+                else float("inf")
+            )
+            violation = float(violation) + rmotion_violation
+            feasible = bool(feasible and rmotion_violation <= 1e-12)
+            if rmotion_violation > 0:
+                details["rejection_reasons"].append(
+                    f"paired compact-output Rmotion={rmotion:.6g} is below the "
+                    f"required {minimum_rmotion:.6g}"
+                )
+            memory_details.update(
+                {
+                    "Rmotion": rmotion,
+                    "minimum_Rmotion": minimum_rmotion,
+                    "Rmotion_violation": rmotion_violation,
+                }
+            )
+            for part_name in ("body", "left_hand", "right_hand", "face"):
+                memory_details[f"Rmotion_{part_name}"] = float(
+                    metrics.get(
+                        f"paired_sentence_memory/{part_name}_Rmotion",
+                        float("nan"),
+                    )
+                )
+            nonfinite_metrics = sorted(
+                name
+                for name, value in metrics.items()
+                if not math.isfinite(float(value))
+            )
+            if nonfinite_metrics:
+                # A diagnostic that is not part of the scalar selection score
+                # must still make the checkpoint scientifically infeasible.
+                # Use a finite normalized penalty so lexicographic patience and
+                # exact checkpoint state remain serializable.
+                if not math.isfinite(float(violation)):
+                    violation = 0.0
+                violation = float(violation) + float(len(nonfinite_metrics))
+                if not math.isfinite(float(score)):
+                    score = float(np.finfo(np.float64).max)
+                feasible = False
+                details["rejection_reasons"].append(
+                    "non-finite validation losses/diagnostics: "
+                    + ", ".join(nonfinite_metrics)
+                )
+                memory_details["nonfinite_metric_count"] = len(
+                    nonfinite_metrics
+                )
         details["dual_mode"] = memory_details
         result = (float(score), float(violation), bool(feasible))
         return (*result, details) if return_details else result
@@ -3743,11 +4980,35 @@ def validate_sentence_memory_checkpoint_identity(
         )
 
 
-def checkpoint_selection_state(best_score, best_infeasible_score):
+def checkpoint_selection_state(
+    best_score,
+    best_infeasible_score,
+    *,
+    early_stopping_state=None,
+    best_infeasible_key=None,
+):
     """Serialize historical checkpoint-selection minima without infinities."""
 
-    return {
-        "schema_version": 1,
+    serialized_infeasible_key = None
+    if best_infeasible_key is not None:
+        if not isinstance(best_infeasible_key, (list, tuple)) or len(
+            best_infeasible_key
+        ) != 2:
+            raise RuntimeError(
+                "best_infeasible_key must contain constraint violation and score"
+            )
+        serialized_infeasible_key = [
+            float(best_infeasible_key[0]),
+            float(best_infeasible_key[1]),
+        ]
+        if not all(math.isfinite(value) for value in serialized_infeasible_key):
+            raise RuntimeError("best_infeasible_key must contain finite values")
+    state = {
+        "schema_version": (
+            3
+            if best_infeasible_key is not None
+            else (2 if early_stopping_state is not None else 1)
+        ),
         "best_feasible_score": (
             float(best_score) if math.isfinite(float(best_score)) else None
         ),
@@ -3757,11 +5018,20 @@ def checkpoint_selection_state(best_score, best_infeasible_score):
             else None
         ),
     }
+    if early_stopping_state is not None:
+        state["early_stopping"] = copy.deepcopy(early_stopping_state)
+    if serialized_infeasible_key is not None:
+        state["best_infeasible_key"] = serialized_infeasible_key
+    return state
 
 
 def restore_checkpoint_selection_scores(checkpoint, *, require=False, source="checkpoint"):
     state = checkpoint.get("selection_state")
-    if not isinstance(state, dict) or int(state.get("schema_version", -1)) != 1:
+    if not isinstance(state, dict) or int(state.get("schema_version", -1)) not in {
+        1,
+        2,
+        3,
+    }:
         if require:
             raise RuntimeError(
                 f"{source} has no exact historical selection_state"
@@ -3782,6 +5052,181 @@ def restore_checkpoint_selection_scores(checkpoint, *, require=False, source="ch
         return value
 
     return parse("best_feasible_score"), parse("best_infeasible_score")
+
+
+def restore_best_infeasible_selection_key(
+    checkpoint,
+    *,
+    require=False,
+    source="checkpoint",
+):
+    """Restore the lexicographic infeasible (violation, score) artifact key."""
+
+    state = checkpoint.get("selection_state")
+    value = state.get("best_infeasible_key") if isinstance(state, dict) else None
+    best_score = (
+        state.get("best_infeasible_score") if isinstance(state, dict) else None
+    )
+    if value is None:
+        if require and best_score is not None:
+            raise RuntimeError(
+                f"{source} has no exact best-infeasible lexicographic key"
+            )
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise RuntimeError(f"{source} has a malformed best_infeasible_key")
+    restored = (float(value[0]), float(value[1]))
+    if not all(math.isfinite(item) for item in restored):
+        raise RuntimeError(f"{source} has a non-finite best_infeasible_key")
+    if best_score is None or float(best_score) != restored[1]:
+        raise RuntimeError(
+            f"{source} best_infeasible_key disagrees with best_infeasible_score"
+        )
+    return restored
+
+
+def initial_early_stopping_state():
+    return {
+        "schema_version": 1,
+        "best_key": None,
+        "last_key": None,
+        "bad_validation_count": 0,
+        "validation_count": 0,
+        "last_validation_epoch": None,
+        "stopped": False,
+        "stop_epoch": None,
+    }
+
+
+def _validate_early_stopping_key(value, source):
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise RuntimeError(f"{source} must contain a three-value lexicographic key")
+    feasibility_rank = int(value[0])
+    if feasibility_rank not in {0, 1} or float(value[0]) != feasibility_rank:
+        raise RuntimeError(f"{source} has an invalid feasibility rank")
+    violation = float(value[1])
+    score = float(value[2])
+    if not math.isfinite(violation) or not math.isfinite(score):
+        raise RuntimeError(f"{source} contains a non-finite value")
+    return (feasibility_rank, violation, score)
+
+
+def restore_early_stopping_state(
+    checkpoint,
+    *,
+    require=False,
+    source="checkpoint",
+):
+    selection_state = checkpoint.get("selection_state")
+    payload = (
+        selection_state.get("early_stopping")
+        if isinstance(selection_state, dict)
+        else None
+    )
+    if not isinstance(payload, dict) or int(payload.get("schema_version", -1)) != 1:
+        if require:
+            raise RuntimeError(f"{source} has no exact early-stopping state")
+        return initial_early_stopping_state()
+    restored = copy.deepcopy(payload)
+    for name in ("bad_validation_count", "validation_count"):
+        value = restored.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError(f"{source} early_stopping.{name} is invalid")
+    for name in ("best_key", "last_key"):
+        value = restored.get(name)
+        if value is not None:
+            restored[name] = list(
+                _validate_early_stopping_key(
+                    value, f"{source} early_stopping.{name}"
+                )
+            )
+    for name in ("last_validation_epoch", "stop_epoch"):
+        value = restored.get(name)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+        ):
+            raise RuntimeError(f"{source} early_stopping.{name} is invalid")
+    restored["stopped"] = bool(restored.get("stopped", False))
+    if restored["stopped"] != (restored.get("stop_epoch") is not None):
+        raise RuntimeError(f"{source} has inconsistent early-stopping terminal state")
+    return restored
+
+
+def update_early_stopping_state(
+    state,
+    *,
+    feasible,
+    normalized_constraint_violation,
+    selection_score_value,
+    epoch,
+    patience,
+    minimum_epoch=2,
+):
+    """Update strict lexicographic validation patience without hidden state."""
+
+    state = copy.deepcopy(state)
+    if bool(state.get("stopped", False)):
+        raise RuntimeError("Cannot update an early-stopping state after it stopped")
+    key = (
+        0 if bool(feasible) else 1,
+        float(normalized_constraint_violation),
+        float(selection_score_value),
+    )
+    key = _validate_early_stopping_key(key, "active early-stopping key")
+    previous = state.get("best_key")
+    previous_key = (
+        _validate_early_stopping_key(previous, "early-stopping best_key")
+        if previous is not None
+        else None
+    )
+    improved = previous_key is None or key < previous_key
+    state["validation_count"] = int(state.get("validation_count", 0)) + 1
+    state["last_validation_epoch"] = int(epoch)
+    state["last_key"] = list(key)
+    if improved:
+        state["best_key"] = list(key)
+        state["bad_validation_count"] = 0
+    else:
+        state["bad_validation_count"] = int(
+            state.get("bad_validation_count", 0)
+        ) + 1
+    patience = int(patience)
+    minimum_epoch = int(minimum_epoch)
+    should_stop = bool(
+        patience > 0
+        and int(epoch) >= minimum_epoch
+        and int(state["bad_validation_count"]) >= patience
+    )
+    state["stopped"] = should_stop
+    state["stop_epoch"] = int(epoch) if should_stop else None
+    return state, improved, should_stop
+
+
+def pending_validation_resume_state(checkpoint, *, paired_objective_enabled):
+    """Resolve an interrupted post-train/pre-validation epoch exactly."""
+
+    metrics = checkpoint.get("metrics") or {}
+    try:
+        validation_pending = float(metrics.get("validation_pending", 0.0)) == 1.0
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            "checkpoint metrics.validation_pending is malformed"
+        ) from error
+    if not validation_pending:
+        return None, None
+    if not paired_objective_enabled:
+        raise RuntimeError(
+            "checkpoint ended before validation; exact recovery of pending "
+            "validation is implemented only for paired Phase A"
+        )
+    epoch = int(checkpoint.get("epoch", 0))
+    if epoch < 1:
+        raise RuntimeError("checkpoint has an invalid pending-validation epoch")
+    if int(metrics.get("epoch", epoch)) != epoch:
+        raise RuntimeError(
+            "checkpoint pending-validation metric epoch does not match its epoch"
+        )
+    return epoch, copy.deepcopy(metrics)
 
 
 def capture_local_rng_state():
@@ -3906,6 +5351,11 @@ def save_checkpoint(
                 if is_sentence_memory_model(cfg)
                 else None
             ),
+            "sentence_memory_objective_identity": (
+                sentence_memory_objective_identity(cfg)
+                if is_sentence_memory_model(cfg)
+                else None
+            ),
             "v2_to_v3_text_only_parity": cfg.get(
                 "sentence_memory_safety", {}
             ).get("v2_to_v3_text_only_parity"),
@@ -3982,6 +5432,7 @@ def main():
             "--resume, --warm_start, and --base_checkpoint are mutually exclusive"
         )
     cfg = apply_overrides(load_config(args.config), args)
+    validate_paired_sentence_memory_training_contract(cfg)
     validate_phase_b_launch(
         cfg,
         warm_start=args.warm_start,
@@ -4093,6 +5544,41 @@ def main():
             ),
             "neighbor_tables": {},
         }
+    validation_text_partition = None
+    if paired_sentence_memory_corruption_config(cfg)["enabled"]:
+        val_loader, val_sampler, validation_text_partition = (
+            build_development_validation_loader(
+                cfg,
+                val_dataset,
+                val_loader,
+                sentence_memory_provider,
+                dist_info,
+            )
+        )
+        rank_zero_print(
+            dist_info,
+            "Validation text partition: "
+            f"digest={validation_text_partition.partition_digest} "
+            f"development_texts={len(validation_text_partition.development_texts)} "
+            f"confirmation_texts={len(validation_text_partition.confirmation_texts)} "
+            "training_evaluates=development_only",
+        )
+        if dist_info["is_main"]:
+            partition_path = out_dir / "validation_text_partition.json"
+            partial_path = partition_path.with_suffix(".json.tmp")
+            partial_path.write_text(
+                json.dumps(
+                    validation_text_partition.artifact_payload,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.replace(partial_path, partition_path)
+            (out_dir / "config.resolved.json").write_text(
+                json.dumps(cfg, indent=2, sort_keys=True), encoding="utf-8"
+            )
     retrieval_bank = (
         validate_train_only_retrieval_bank(cfg, provider)
         if provider is not None
@@ -4102,6 +5588,25 @@ def main():
     model = build_continuous_trajectory_field(cfg, text_dim=text_encoder.text_dim).to(device)
     fk = build_fk(cfg, device)
     train_cfg = cfg.get("train", {})
+    paired_objective_enabled = paired_sentence_memory_corruption_config(cfg)[
+        "enabled"
+    ]
+    early_stopping_patience = int(train_cfg.get("early_stopping_patience", 0))
+    early_stopping_min_epochs = int(
+        train_cfg.get(
+            "early_stopping_min_epochs",
+            train_cfg.get("early_stopping_min_epoch", 2),
+        )
+    )
+    if early_stopping_patience < 0:
+        raise ValueError("train.early_stopping_patience must be non-negative")
+    if early_stopping_min_epochs < 1:
+        raise ValueError("train.early_stopping_min_epochs must be at least one")
+    early_stopping_state = (
+        initial_early_stopping_state()
+        if early_stopping_patience > 0
+        else None
+    )
     base_checkpoint_path = None
     if args.resume is None:
         configured_base = train_cfg.get("base_checkpoint")
@@ -4127,8 +5632,11 @@ def main():
     global_step = 0
     optimizer_state = None
     resume_rng_checkpoint = None
+    resume_pending_validation_epoch = None
+    resume_pending_validation_row = None
     best_score = float("inf")
     best_infeasible_score = float("inf")
+    best_infeasible_key = None
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu")
         validate_phase_b_resume_checkpoint(
@@ -4137,6 +5645,9 @@ def main():
         validate_checkpoint_contract(checkpoint, cfg, source=str(args.resume))
         if is_sentence_memory_model(cfg):
             validate_sentence_memory_resume_identity(
+                checkpoint, cfg, source=str(args.resume)
+            )
+            validate_sentence_memory_objective_identity(
                 checkpoint, cfg, source=str(args.resume)
             )
         validate_sentence_memory_checkpoint_identity(
@@ -4174,6 +5685,32 @@ def main():
             require=is_sentence_memory_model(cfg),
             source=str(args.resume),
         )
+        if paired_objective_enabled:
+            best_infeasible_key = restore_best_infeasible_selection_key(
+                checkpoint,
+                require=True,
+                source=str(args.resume),
+            )
+        if early_stopping_state is not None:
+            early_stopping_state = restore_early_stopping_state(
+                checkpoint,
+                require=True,
+                source=str(args.resume),
+            )
+            if early_stopping_state["stopped"]:
+                raise RuntimeError(
+                    f"{args.resume} already reached its configured early-stopping "
+                    f"condition at epoch {early_stopping_state['stop_epoch']}"
+                )
+        (
+            resume_pending_validation_epoch,
+            resume_pending_validation_row,
+        ) = pending_validation_resume_state(
+            checkpoint,
+            paired_objective_enabled=paired_objective_enabled,
+        )
+        if resume_pending_validation_epoch is not None:
+            start_epoch = resume_pending_validation_epoch
         if is_sentence_memory_model(cfg):
             # Restore only after model/teacher/DDP/W&B initialization has
             # finished, so those setup steps cannot consume continuation RNG.
@@ -4311,72 +5848,98 @@ def main():
             source=str(args.resume),
         )
     for epoch in range(start_epoch, epochs + 1):
-        optimizer_lrs = configure_optimizer_epoch(optimizer, cfg, epoch)
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
+        resume_validation_only = bool(
+            resume_pending_validation_epoch is not None
+            and int(resume_pending_validation_epoch) == int(epoch)
+        )
         if val_sampler is not None:
             val_sampler.set_epoch(epoch)
         if sentence_memory_provider is not None:
             sentence_memory_provider.set_epoch(epoch)
-            sentence_memory_provider.validate_query_dataset(
-                train_dataset,
-                require_neighbors=(
-                    configured_sentence_memory_train_mode(cfg) != "off"
-                ),
+        if resume_validation_only:
+            if resume_pending_validation_row is None:
+                raise RuntimeError("Pending-validation resume has no saved epoch row")
+            row = copy.deepcopy(resume_pending_validation_row)
+            row["validation_pending"] = 1.0
+            row["resumed_pending_validation"] = 1.0
+            rank_zero_print(
+                dist_info,
+                f"Resuming pending validation for completed epoch {epoch}; "
+                "the training epoch will not be replayed.",
             )
-        train_metrics, optimizer_steps = run_train_epoch(
-            model,
-            fk,
-            text_encoder,
-            provider,
-            train_loader,
-            train_dataset,
-            optimizer,
-            cfg,
-            device,
-            epoch,
-            dist_info,
-            sentence_memory_provider=sentence_memory_provider,
-            sentence_off_teacher=sentence_off_teacher,
-            wandb_run=wandb_run,
-            global_step_start=global_step,
-        )
-        global_step += optimizer_steps
-        row = {
-            "epoch": epoch,
-            "global_step": global_step,
-            "elapsed_sec": round(time.time() - start_time, 3),
-            **{f"lr_{name}": value for name, value in optimizer_lrs.items()},
-        }
-        row.update(distributed_mean_scalars(train_metrics, device, dist_info))
-        if dist_info["is_main"] and wandb_run is not None:
-            wandb_run.log(wandb_train_epoch_payload(row))
+        else:
+            optimizer_lrs = configure_optimizer_epoch(optimizer, cfg, epoch)
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            if sentence_memory_provider is not None:
+                sentence_memory_provider.validate_query_dataset(
+                    train_dataset,
+                    require_neighbors=(
+                        configured_sentence_memory_train_mode(cfg) != "off"
+                    ),
+                )
+            train_metrics, optimizer_steps = run_train_epoch(
+                model,
+                fk,
+                text_encoder,
+                provider,
+                train_loader,
+                train_dataset,
+                optimizer,
+                cfg,
+                device,
+                epoch,
+                dist_info,
+                sentence_memory_provider=sentence_memory_provider,
+                sentence_off_teacher=sentence_off_teacher,
+                wandb_run=wandb_run,
+                global_step_start=global_step,
+            )
+            global_step += optimizer_steps
+            row = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "elapsed_sec": round(time.time() - start_time, 3),
+                **{
+                    f"lr_{name}": value
+                    for name, value in optimizer_lrs.items()
+                },
+            }
+            row.update(distributed_mean_scalars(train_metrics, device, dist_info))
+            if dist_info["is_main"] and wandb_run is not None:
+                wandb_run.log(wandb_train_epoch_payload(row))
 
-        validation_due = epoch % val_every == 0
+        validation_due = resume_validation_only or epoch % val_every == 0
         epoch_checkpoint_rng = None
         if validation_due:
             # Persist the completed training epoch before entering the much
             # heavier dense-JVP validation path. Successful validation
             # overwrites this recovery snapshot with complete metrics below.
-            row["validation_pending"] = 1.0
-            pending_rng = distributed_checkpoint_rng_state(dist_info)
-            if dist_info["is_main"]:
-                save_checkpoint(
-                    out_dir / "checkpoints" / "last.pt",
-                    unwrap_model(model),
-                    optimizer,
-                    epoch,
-                    global_step,
-                    cfg,
-                    row,
-                    selection_state=checkpoint_selection_state(
-                        best_score, best_infeasible_score
-                    ),
-                    rng_state=pending_rng,
-                )
-            barrier(dist_info)
-            if dist_info["is_main"] and wandb_run is not None:
-                wandb_run.log(wandb_validation_pending_payload(epoch, global_step))
+            if not resume_validation_only:
+                row["validation_pending"] = 1.0
+                pending_rng = distributed_checkpoint_rng_state(dist_info)
+                if dist_info["is_main"]:
+                    save_checkpoint(
+                        out_dir / "checkpoints" / "last.pt",
+                        unwrap_model(model),
+                        optimizer,
+                        epoch,
+                        global_step,
+                        cfg,
+                        row,
+                        selection_state=checkpoint_selection_state(
+                            best_score,
+                            best_infeasible_score,
+                            early_stopping_state=early_stopping_state,
+                            best_infeasible_key=best_infeasible_key,
+                        ),
+                        rng_state=pending_rng,
+                    )
+                barrier(dist_info)
+                if dist_info["is_main"] and wandb_run is not None:
+                    wandb_run.log(
+                        wandb_validation_pending_payload(epoch, global_step)
+                    )
             if sentence_memory_provider is not None:
                 sentence_memory_provider.validate_query_dataset(
                     val_dataset,
@@ -4399,7 +5962,7 @@ def main():
                 show_progress=dist_info["is_main"],
                 sentence_memory_provider=sentence_memory_provider,
             )
-            val_metrics = distributed_sample_weighted_mean_scalars(
+            val_metrics = distributed_validation_metrics(
                 val_metrics,
                 evaluated_loader_sample_count(
                     val_loader, int(cfg.get("eval", {}).get("max_batches", 0))
@@ -4424,19 +5987,56 @@ def main():
             for name, value in selection_details.get("dual_mode", {}).items():
                 if isinstance(value, (int, float)):
                     row[f"selection_{name}"] = value
+            early_stop_requested = False
+            if early_stopping_state is not None:
+                (
+                    early_stopping_state,
+                    early_stopping_improved,
+                    early_stop_requested,
+                ) = update_early_stopping_state(
+                    early_stopping_state,
+                    feasible=selection_feasible,
+                    normalized_constraint_violation=constraint_violation,
+                    selection_score_value=score,
+                    epoch=epoch,
+                    patience=early_stopping_patience,
+                    minimum_epoch=early_stopping_min_epochs,
+                )
+                row["early_stopping_improved"] = float(
+                    early_stopping_improved
+                )
+                row["early_stopping_bad_validation_count"] = float(
+                    early_stopping_state["bad_validation_count"]
+                )
+                row["early_stopping_validation_count"] = float(
+                    early_stopping_state["validation_count"]
+                )
+                row["early_stopping_requested"] = float(
+                    early_stop_requested
+                )
             if dist_info["is_main"] and wandb_run is not None:
                 wandb_run.log(wandb_validation_payload(row))
             keep_validation_checkpoint = bool(
                 cfg.get("selection", {}).get("keep_validation_checkpoints", False)
             )
             improved_feasible = bool(selection_feasible and score < best_score)
+            current_infeasible_key = (
+                (float(constraint_violation), float(score))
+                if not selection_feasible
+                else None
+            )
             improved_infeasible = bool(
-                not selection_feasible and score < best_infeasible_score
+                current_infeasible_key is not None
+                and (
+                    best_infeasible_key is None
+                    or current_infeasible_key < best_infeasible_key
+                )
             )
             if selection_feasible and score < best_score:
                 best_score = score
-            elif not selection_feasible and score < best_infeasible_score:
+            elif improved_infeasible:
                 best_infeasible_score = score
+                best_infeasible_key = current_infeasible_key
             if (
                 keep_validation_checkpoint
                 or improved_feasible
@@ -4445,7 +6045,10 @@ def main():
             ):
                 epoch_checkpoint_rng = distributed_checkpoint_rng_state(dist_info)
             current_selection_state = checkpoint_selection_state(
-                best_score, best_infeasible_score
+                best_score,
+                best_infeasible_score,
+                early_stopping_state=early_stopping_state,
+                best_infeasible_key=best_infeasible_key,
             )
             if dist_info["is_main"] and keep_validation_checkpoint:
                 save_checkpoint(
@@ -4497,7 +6100,10 @@ def main():
                     cfg,
                     row,
                     selection_state=checkpoint_selection_state(
-                        best_score, best_infeasible_score
+                        best_score,
+                        best_infeasible_score,
+                        early_stopping_state=early_stopping_state,
+                        best_infeasible_key=best_infeasible_key,
                     ),
                     rng_state=epoch_checkpoint_rng,
                 )
@@ -4505,6 +6111,12 @@ def main():
             append_jsonl(out_dir / "metrics.jsonl", row)
             print(json.dumps(row, sort_keys=True))
         barrier(dist_info)
+        if resume_validation_only:
+            resume_pending_validation_epoch = None
+            resume_pending_validation_row = None
+        if validation_due and early_stopping_state is not None:
+            if bool(early_stopping_state["stopped"]):
+                break
 
     has_feasible_checkpoint = math.isfinite(best_score)
     if dist_info["is_main"]:
@@ -4517,6 +6129,12 @@ def main():
                 else None
             ),
             "required": bool(cfg.get("selection", {}).get("require_feasible", False)),
+            "best_infeasible_key": (
+                list(best_infeasible_key)
+                if best_infeasible_key is not None
+                else None
+            ),
+            "early_stopping": copy.deepcopy(early_stopping_state),
         }
         (out_dir / "selection_summary.json").write_text(
             json.dumps(selection_summary, indent=2, sort_keys=True) + "\n",

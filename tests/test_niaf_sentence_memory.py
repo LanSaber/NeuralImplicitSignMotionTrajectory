@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from NIAF.continuous_trajectory_field.scripts.build_sentence_neighbors import (
 )
 from NIAF.continuous_trajectory_field.sentence_memory import (
     DEFAULT_ARTIFACT_FILES,
+    SentenceMemoryBatch,
     SentenceMemoryProvider,
     SentenceMemoryValidationError,
     artifact_record,
@@ -29,6 +31,7 @@ from NIAF.continuous_trajectory_field.sentence_memory import (
     complete_text_encoder_identity,
     exclusion_policy,
     load_bank_manifest,
+    motion_only_shuffle_sentence_memory_batch,
     sentence_text_hash,
     sentence_memory_preprocessing_contract,
     sha256_file,
@@ -39,6 +42,259 @@ from NIAF.continuous_trajectory_field.sentence_memory import (
     write_ready_marker,
     _validate_finite_array_chunked,
 )
+
+
+def _motion_shuffle_batch(
+    candidate_mask: torch.Tensor,
+    *,
+    token_lengths: torch.Tensor | None = None,
+) -> SentenceMemoryBatch:
+    batch_size, candidate_count = candidate_mask.shape
+    token_count = 4
+    if token_lengths is None:
+        token_lengths = candidate_mask.long() * token_count
+    token_index = torch.arange(token_count).view(1, 1, token_count)
+    token_mask = token_index < token_lengths.unsqueeze(-1)
+    rank_value = (
+        torch.arange(batch_size).view(batch_size, 1, 1) * 100
+        + torch.arange(candidate_count).view(1, candidate_count, 1) * 10
+        + token_index
+    )
+    tokens = torch.stack((rank_value, -rank_value), dim=-1).float()
+    token_tau = rank_value.float() / 100.0
+    part_validity = torch.stack(
+        tuple(token_mask.float() * float(index + 1) / 4.0 for index in range(4)),
+        dim=-1,
+    )
+    candidate_keys = torch.arange(
+        batch_size * candidate_count * 3, dtype=torch.float32
+    ).reshape(batch_size, candidate_count, 3)
+    scores = torch.arange(batch_size * candidate_count, dtype=torch.float32).reshape(
+        batch_size, candidate_count
+    )
+    ids = torch.arange(batch_size * candidate_count, dtype=torch.int64).reshape(
+        batch_size, candidate_count
+    )
+    ids = torch.where(candidate_mask, ids, torch.full_like(ids, -1))
+    return SentenceMemoryBatch(
+        tokens=tokens,
+        token_mask=token_mask,
+        token_tau=token_tau,
+        candidate_mask=candidate_mask.clone(),
+        candidate_keys=candidate_keys,
+        scores=scores,
+        durations=scores + 1.0,
+        duration_log_gap=scores / 10.0,
+        part_validity=part_validity,
+        ids=ids,
+        available=candidate_mask.any(dim=-1),
+        provenance={
+            "mode": "on",
+            "candidate_names": [
+                [f"row-{row}-rank-{rank}" for rank in range(candidate_count)]
+                for row in range(batch_size)
+            ],
+            "nested": {"unchanged": [1, 2, 3]},
+        },
+    )
+
+
+def _index_memory_batch(
+    memory: SentenceMemoryBatch, order: torch.Tensor
+) -> SentenceMemoryBatch:
+    updates = {}
+    for name in (
+        "tokens",
+        "token_mask",
+        "token_tau",
+        "candidate_mask",
+        "candidate_keys",
+        "scores",
+        "durations",
+        "duration_log_gap",
+        "part_validity",
+        "ids",
+        "available",
+    ):
+        updates[name] = getattr(memory, name).index_select(0, order)
+    return replace(memory, **updates)
+
+
+def test_motion_only_shuffle_deranges_only_motion_payload_and_records_sources():
+    candidate_mask = torch.tensor(
+        [
+            [True, False, True, True, False],
+            [False, True, False, False, False],
+            [False, False, False, False, False],
+        ]
+    )
+    token_lengths = torch.tensor(
+        [
+            [4, 0, 2, 1, 0],
+            [0, 3, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+        ]
+    )
+    memory = _motion_shuffle_batch(candidate_mask, token_lengths=token_lengths)
+    original_provenance = json.loads(json.dumps(memory.provenance))
+
+    corrupted, permutation, informative = (
+        motion_only_shuffle_sentence_memory_batch(
+            memory,
+            query_ids=("three-valid", "one-valid", "zero-valid"),
+            epoch=4,
+            seed=1234,
+        )
+    )
+
+    assert informative.tolist() == [True, False, False]
+    valid_ranks = torch.tensor([0, 2, 3])
+    assert torch.all(permutation[0, valid_ranks] != valid_ranks)
+    assert permutation[0, [1, 4]].tolist() == [1, 4]
+    assert torch.equal(permutation[1], torch.arange(5))
+    assert torch.equal(permutation[2], torch.arange(5))
+
+    for name in ("tokens", "token_mask", "token_tau", "part_validity"):
+        original = getattr(memory, name)
+        actual = getattr(corrupted, name)
+        for destination, source in enumerate(permutation[0].tolist()):
+            assert torch.equal(actual[0, destination], original[0, source])
+        assert torch.equal(actual[1:], original[1:])
+
+    for name in (
+        "candidate_mask",
+        "candidate_keys",
+        "scores",
+        "durations",
+        "duration_log_gap",
+        "ids",
+        "available",
+    ):
+        assert getattr(corrupted, name) is getattr(memory, name)
+        assert torch.equal(getattr(corrupted, name), getattr(memory, name))
+    assert memory.provenance == original_provenance
+    for key, value in original_provenance.items():
+        if key != "mode":
+            assert corrupted.provenance[key] == value
+    assert corrupted.provenance["mode"] == "motion_only_shuffle"
+    assert corrupted.provenance["motion_only_shuffle_source_mode"] == "on"
+    assert corrupted.provenance["motion_only_shuffle_epoch"] == 4
+    assert corrupted.provenance["motion_only_shuffle_seed"] == 1234
+    assert corrupted.provenance["motion_candidate_permutation"] == permutation.tolist()
+    assert corrupted.provenance["motion_only_shuffle_informative"] == [
+        True,
+        False,
+        False,
+    ]
+    expected_source_ids = torch.gather(memory.ids, 1, permutation)
+    assert corrupted.provenance["motion_source_ids"] == expected_source_ids.tolist()
+
+
+def test_motion_only_shuffle_is_independent_of_batch_order_rank_and_runtime_rng(
+    monkeypatch,
+):
+    memory = _motion_shuffle_batch(torch.ones(4, 5, dtype=torch.bool))
+    query_ids = ("query-a", "query-b", "query-c", "query-d")
+    monkeypatch.setenv("RANK", "0")
+    first, first_permutation, first_informative = (
+        motion_only_shuffle_sentence_memory_batch(
+            memory,
+            query_ids=query_ids,
+            epoch=7,
+            seed=81,
+        )
+    )
+    torch.manual_seed(987654)
+    _ = torch.randn(29)
+    monkeypatch.setenv("RANK", "17")
+    resumed, resumed_permutation, resumed_informative = (
+        motion_only_shuffle_sentence_memory_batch(
+            memory,
+            query_ids=query_ids,
+            epoch=7,
+            seed=81,
+        )
+    )
+    assert torch.equal(resumed_permutation, first_permutation)
+    assert torch.equal(resumed_informative, first_informative)
+    assert torch.equal(resumed.tokens, first.tokens)
+
+    order = torch.tensor([2, 0, 3, 1])
+    inverse = torch.argsort(order)
+    reordered, reordered_permutation, reordered_informative = (
+        motion_only_shuffle_sentence_memory_batch(
+            _index_memory_batch(memory, order),
+            query_ids=tuple(query_ids[index] for index in order.tolist()),
+            epoch=7,
+            seed=81,
+        )
+    )
+    assert torch.equal(reordered_permutation.index_select(0, inverse), first_permutation)
+    assert torch.equal(reordered_informative.index_select(0, inverse), first_informative)
+    assert torch.equal(reordered.tokens.index_select(0, inverse), first.tokens)
+
+    epoch_permutations = {
+        tuple(
+            motion_only_shuffle_sentence_memory_batch(
+                memory,
+                query_ids=query_ids,
+                epoch=epoch,
+                seed=81,
+            )[1][0].tolist()
+        )
+        for epoch in range(8)
+    }
+    assert len(epoch_permutations) >= 2
+
+
+def test_motion_only_shuffle_handles_padding_and_performs_no_file_io(monkeypatch):
+    candidate_mask = torch.tensor(
+        [
+            [True, True, False],
+            [True, False, False],
+            [False, False, False],
+        ]
+    )
+    memory = _motion_shuffle_batch(
+        candidate_mask,
+        token_lengths=torch.tensor([[3, 0, 0], [1, 0, 0], [0, 0, 0]]),
+    )
+
+    def reject_io(*_args, **_kwargs):
+        raise AssertionError("motion-only corruption must not touch the bank")
+
+    monkeypatch.setattr(Path, "open", reject_io)
+    corrupted, permutation, informative = (
+        motion_only_shuffle_sentence_memory_batch(
+            memory,
+            query_ids=("empty-second", "one", "zero"),
+            epoch=2,
+            seed=3,
+        )
+    )
+    assert not informative.any()
+    assert torch.equal(permutation, torch.arange(3).expand(3, -1))
+    for name in ("tokens", "token_mask", "token_tau", "part_validity"):
+        assert torch.equal(getattr(corrupted, name), getattr(memory, name))
+
+
+def test_motion_only_shuffle_rejects_inconsistent_batch_geometry():
+    memory = _motion_shuffle_batch(torch.ones(2, 3, dtype=torch.bool))
+    with pytest.raises(ValueError, match="one stable identity"):
+        motion_only_shuffle_sentence_memory_batch(
+            memory,
+            query_ids=("only-one",),
+            epoch=1,
+            seed=1,
+        )
+    malformed = replace(memory, token_tau=memory.token_tau[:, :, :-1])
+    with pytest.raises(ValueError, match="token_tau"):
+        motion_only_shuffle_sentence_memory_batch(
+            malformed,
+            query_ids=("first", "second"),
+            epoch=1,
+            seed=1,
+        )
 
 
 def _write_jsonl(path: Path, rows) -> None:

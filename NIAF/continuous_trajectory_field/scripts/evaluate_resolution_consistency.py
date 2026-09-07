@@ -61,7 +61,7 @@ def parse_args():
     parser.add_argument(
         "--sentence_memory",
         default="auto",
-        choices=("auto", "off", "on", "shuffled"),
+        choices=("auto", "off", "on", "shuffled", "motion_shuffled"),
     )
     parser.add_argument("--sample_fps", type=float, nargs="+", default=[20.0, 40.0, 80.0])
     parser.add_argument("--common_queries", type=int, default=31)
@@ -164,7 +164,7 @@ def main():
             else None
         ),
     )
-    set_sentence_memory_provider_epoch_from_checkpoint(
+    checkpoint_epoch = set_sentence_memory_provider_epoch_from_checkpoint(
         sentence_memory_provider, checkpoint
     )
     model.load_state_dict(checkpoint["model"], strict=True)
@@ -187,6 +187,7 @@ def main():
             word_prior_mode=resolved_word_prior_mode,
             sentence_memory_provider=sentence_memory_provider,
             sentence_memory_mode=resolved_sentence_memory_mode,
+            sentence_memory_epoch=checkpoint_epoch,
         )
         trajectory = inference["trajectory"]
         before_digest = trajectory_digest(trajectory)

@@ -13,6 +13,10 @@ from NIAF.continuous_trajectory_field.scripts import (
 from NIAF.continuous_trajectory_field.models import (
     build_continuous_trajectory_field,
 )
+from NIAF.continuous_trajectory_field.sentence_memory import (
+    SentenceMemoryBatch,
+    motion_only_shuffle_sentence_memory_batch,
+)
 from NIAF.continuous_trajectory_field.temporal_slot_diagnostics import (
     _average_ranks,
     DiagnosticCapture,
@@ -1202,3 +1206,173 @@ def test_git_head_rejects_invalid_submit_host_identity(monkeypatch):
     monkeypatch.setenv("SIGNTRAJ_SOURCE_GIT_HEAD", "not-a-commit")
     with pytest.raises(RuntimeError, match="Unexpected git HEAD identity"):
         diagnostic_cli._git_head()
+
+
+def _phase_a_prime_checkpoint_fixture(tmp_path):
+    experiment = diagnostic_cli.PHASE_A_PRIME_EXPERIMENT
+    run_dir = tmp_path / experiment
+    checkpoint_path = run_dir / "checkpoints/best.pt"
+    checkpoint_path.parent.mkdir(parents=True)
+    checkpoint_path.write_bytes(b"locked checkpoint placeholder")
+
+    cfg = diagnostic_cli.load_config(diagnostic_cli.PHASE_A_PRIME_CONFIG)
+    cfg["device"] = "cuda"
+    resolved_partition = {
+        "schema_name": "csl_daily_validation_text_partition",
+        "schema_version": 1,
+        "counts": {
+            "rows": 1_077,
+            "novel_unique_texts": 796,
+            "development_unique_texts": 256,
+            "confirmation_unique_texts": 540,
+            "development_rows": 347,
+            "confirmation_rows": 728,
+        },
+    }
+    resolved_partition["partition_digest"] = diagnostic_cli._digest_json(
+        resolved_partition
+    )
+    cfg["validation_text_partition"].update(
+        {
+            "partition_digest": resolved_partition["partition_digest"],
+            "resolved_artifact": resolved_partition,
+            "development_row_count": 347,
+            "exact_seen_row_count": 2,
+            "exact_seen_text_count": 1,
+            "exact_seen_evaluated_during_training": False,
+            "confirmation_evaluated_during_training": False,
+        }
+    )
+    cfg["sentence_memory"]["resolved_identity"] = {
+        "bank_id": "bank",
+        "neighbor_tables": {"train": {"sha256": "a"}, "val": {"sha256": "b"}},
+    }
+    cfg["sentence_memory"]["resolved_behavior_identity"] = (
+        diagnostic_cli.sentence_memory_behavior_identity(cfg)
+    )
+    parity = {
+        "passed": True,
+        "prediction_max_abs": 0.0,
+        "duration_max_abs": 0.0,
+    }
+    cfg["sentence_memory_safety"]["v2_to_v3_text_only_parity"] = parity
+
+    def metric_row(epoch, score):
+        return {
+            "epoch": epoch,
+            "validation_pending": 0.0,
+            "selection_feasible": 1.0,
+            "selection_score": score,
+            "val_text_only/composite": 1.0,
+            "val_sentence_memory/composite": score,
+            "val_shuffled_sentence_memory/composite": 1.1,
+            "val_motion_shuffled_sentence_memory/composite": 1.2,
+        }
+
+    rows = [metric_row(1, 0.8), metric_row(2, 0.9)]
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "metrics.jsonl").write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    (run_dir / "selection_summary.json").write_text(
+        json.dumps(
+            {
+                "has_feasible_checkpoint": True,
+                "best_feasible_score": 0.8,
+                "required": True,
+                "early_stopping": {"validation_count": 2, "stopped": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "config.resolved.json").write_text(
+        json.dumps(cfg, sort_keys=True), encoding="utf-8"
+    )
+    checkpoint = {
+        "epoch": 1,
+        "config": cfg,
+        "metrics": rows[0],
+        "selection_state": {"best_feasible_score": 0.8},
+        "v2_to_v3_text_only_parity": parity,
+        "sentence_memory_identity": cfg["sentence_memory"]["resolved_identity"],
+        "sentence_memory_objective_identity": (
+            diagnostic_cli.sentence_memory_objective_identity(cfg)
+        ),
+        "sentence_memory_behavior_identity": (
+            diagnostic_cli.sentence_memory_behavior_identity(cfg)
+        ),
+        "sentence_memory_resume_identity": (
+            diagnostic_cli.sentence_memory_resume_identity(cfg)
+        ),
+        "rng_state": {
+            "world_size": 4,
+            "rank_states": [{"rank": rank} for rank in range(4)],
+        },
+    }
+    return checkpoint, checkpoint_path, run_dir
+
+
+def test_phase_a_prime_profile_requires_locked_full_run_and_binds_identities(tmp_path):
+    checkpoint, checkpoint_path, run_dir = _phase_a_prime_checkpoint_fixture(tmp_path)
+    evidence = diagnostic_cli._validate_phase_a_prime_locked_run(
+        checkpoint,
+        checkpoint_path=checkpoint_path,
+        config_path=diagnostic_cli.PHASE_A_PRIME_CONFIG,
+        run_dir=run_dir,
+    )
+    assert evidence["checkpoint_epoch"] == 1
+    assert evidence["complete_validation_events"] == 2
+    assert evidence["terminal_epoch"] == 2
+    assert evidence["objective_identity"]["mode"] == (
+        "paired_correct_motion_or_full_v1"
+    )
+
+    checkpoint["sentence_memory_identity"]["neighbor_tables"]["test"] = {
+        "sha256": "forbidden"
+    }
+    with pytest.raises(RuntimeError, match="exactly train/val"):
+        diagnostic_cli._validate_phase_a_prime_locked_run(
+            checkpoint,
+            checkpoint_path=checkpoint_path,
+            config_path=diagnostic_cli.PHASE_A_PRIME_CONFIG,
+            run_dir=run_dir,
+        )
+
+
+def test_diagnostic_motion_shuffle_matches_canonical_epoch_salted_utility():
+    batch = {
+        "index": torch.tensor([91, 92]),
+        "name": ["sample-a", "sample-b"],
+        "motion_path": ["motion/a.npy", "motion/b.npy"],
+    }
+    query_ids = diagnostic_cli._query_ids(batch)
+    assert query_ids == diagnostic_cli.sentence_memory_query_ids(batch)
+    torch.manual_seed(91)
+    memory = SentenceMemoryBatch(
+        tokens=torch.randn(2, 3, 2, 4),
+        token_mask=torch.ones(2, 3, 2, dtype=torch.bool),
+        token_tau=torch.randn(2, 3, 2),
+        candidate_mask=torch.ones(2, 3, dtype=torch.bool),
+        candidate_keys=torch.randn(2, 3, 5),
+        scores=torch.randn(2, 3),
+        durations=torch.rand(2, 3),
+        duration_log_gap=torch.rand(2, 3),
+        part_validity=torch.ones(2, 3, 2, 4),
+        ids=torch.arange(6).view(2, 3),
+        available=torch.ones(2, dtype=torch.bool),
+        provenance={"mode": "on"},
+    )
+    observed, permutation = diagnostic_cli._motion_only_shuffle(
+        memory, query_ids, epoch=3, seed=1234
+    )
+    expected, expected_permutation, informative = (
+        motion_only_shuffle_sentence_memory_batch(
+            memory, query_ids=query_ids, epoch=3, seed=1234
+        )
+    )
+    assert informative.all()
+    assert torch.equal(permutation, expected_permutation)
+    assert torch.equal(observed.tokens, expected.tokens)
+    assert observed.provenance == expected.provenance
+    assert observed.provenance["motion_only_shuffle_epoch"] == 3

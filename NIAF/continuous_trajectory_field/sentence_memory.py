@@ -5,7 +5,7 @@ import json
 import math
 import os
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -1156,6 +1156,119 @@ class SentenceMemoryBatch:
             "sentence_part_validity": self.part_validity,
             "sentence_memory_available": self.available,
         }
+
+
+def motion_only_shuffle_sentence_memory_batch(
+    memory: SentenceMemoryBatch,
+    *,
+    query_ids: Sequence[str],
+    epoch: int,
+    seed: int,
+) -> tuple[SentenceMemoryBatch, torch.Tensor, torch.Tensor]:
+    """Derange motion payloads while preserving candidate metadata.
+
+    Each destination rank keeps its candidate text key, retrieval score,
+    duration, ID, mask, and other metadata, while receiving another valid
+    rank's complete motion package. The returned permutation maps destination
+    rank to source rank.
+
+    Rows with fewer than two candidates containing a valid motion token remain
+    bitwise unchanged and are false in the returned informative mask. The
+    cyclic shift depends only on query ID, epoch, and seed, so it is independent
+    of batch order, batch size, worker, and distributed rank.
+    """
+
+    if memory.candidate_mask.ndim != 2:
+        raise ValueError("sentence candidate_mask must have shape [B,K]")
+    batch_size, candidate_count = memory.candidate_mask.shape
+    if len(query_ids) != batch_size:
+        raise ValueError(
+            "query_ids must contain one stable identity per sentence-memory row"
+        )
+    if memory.token_mask.ndim != 3 or memory.token_mask.shape[:2] != (
+        batch_size,
+        candidate_count,
+    ):
+        raise ValueError("sentence token_mask must have shape [B,K,U]")
+    token_count = memory.token_mask.shape[2]
+    expected_prefix = (batch_size, candidate_count, token_count)
+    for name, value in (
+        ("tokens", memory.tokens),
+        ("token_tau", memory.token_tau),
+        ("part_validity", memory.part_validity),
+    ):
+        if value.ndim < 3 or value.shape[:3] != expected_prefix:
+            raise ValueError(f"sentence {name} must begin with shape [B,K,U]")
+    if memory.ids.shape != (batch_size, candidate_count):
+        raise ValueError("sentence ids must have shape [B,K]")
+
+    device = memory.candidate_mask.device
+    effective_valid = memory.candidate_mask.to(device=device).bool()
+    effective_valid = effective_valid & memory.token_mask.to(device=device).bool().any(
+        dim=-1
+    )
+    informative = effective_valid.sum(dim=-1) >= 2
+    permutation = torch.arange(
+        candidate_count,
+        dtype=torch.long,
+        device=device,
+    ).unsqueeze(0).expand(batch_size, -1).clone()
+
+    for row, query_id in enumerate(query_ids):
+        valid_ranks = torch.nonzero(
+            effective_valid[row], as_tuple=False
+        ).flatten()
+        valid_count = int(valid_ranks.numel())
+        if valid_count < 2:
+            continue
+        identity = canonical_json(
+            {
+                "epoch": int(epoch),
+                "query_id": str(query_id),
+                "seed": int(seed),
+            }
+        )
+        draw = int(hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16], 16)
+        shift = 1 + draw % (valid_count - 1)
+        permutation[row, valid_ranks] = torch.roll(
+            valid_ranks, shifts=int(shift)
+        )
+
+    def gather_motion(value: torch.Tensor) -> torch.Tensor:
+        source = permutation.to(device=value.device)
+        source = source.reshape(
+            batch_size,
+            candidate_count,
+            *([1] * (value.ndim - 2)),
+        )
+        return torch.gather(value, 1, source.expand_as(value))
+
+    motion_source_ids = torch.gather(
+        memory.ids,
+        1,
+        permutation.to(device=memory.ids.device),
+    )
+    provenance = dict(memory.provenance)
+    provenance.update(
+        {
+            "mode": "motion_only_shuffle",
+            "motion_only_shuffle_source_mode": memory.provenance.get("mode"),
+            "motion_only_shuffle_epoch": int(epoch),
+            "motion_only_shuffle_seed": int(seed),
+            "motion_candidate_permutation": permutation.detach().cpu().tolist(),
+            "motion_source_ids": motion_source_ids.detach().cpu().tolist(),
+            "motion_only_shuffle_informative": informative.detach().cpu().tolist(),
+        }
+    )
+    corrupted = replace(
+        memory,
+        tokens=gather_motion(memory.tokens),
+        token_mask=gather_motion(memory.token_mask),
+        token_tau=gather_motion(memory.token_tau),
+        part_validity=gather_motion(memory.part_validity),
+        provenance=provenance,
+    )
+    return corrupted, permutation, informative
 
 
 class SentenceMemoryProvider:

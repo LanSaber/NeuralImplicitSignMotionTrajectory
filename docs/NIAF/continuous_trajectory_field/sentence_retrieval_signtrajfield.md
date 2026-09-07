@@ -188,6 +188,12 @@ optional detail JSONL when investigating individual failures.
 
 ## 4. Smoke test Phase A
 
+For the paired motion-content follow-up, use the locked development/confirmation
+protocol and dedicated launchers in
+[phase_a_motion_contrast_v1.md](phase_a_motion_contrast_v1.md). Its smoke and
+four-epoch Phase-A contract supersede the generic commands in this section for
+that experiment only.
+
 The Phase-A configuration imports the clean CSL-Daily text-only v2 checkpoint
 through the dedicated v2-to-v3 base loader. It freezes every inherited
 parameter and trains only names below `hypernetwork.sentence_memory_`.

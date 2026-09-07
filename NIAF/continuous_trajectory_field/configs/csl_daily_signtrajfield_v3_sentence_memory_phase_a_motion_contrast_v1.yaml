@@ -1,0 +1,79 @@
+_base_: csl_daily_signtrajfield_v3_sentence_memory_phase_a.yaml
+
+# Frozen-backbone Phase-A mechanism test. Paired motion/full corruptions make
+# retrieval-motion use identifiable before any generator parameters are
+# considered for Phase B. All in-training validation and checkpoint selection
+# use only the deterministic development text clusters below.
+experiment_name: csl_daily_signtrajfield_v3_sentence_memory_phase_a_motion_contrast_v1
+
+sentence_memory:
+  duration_weight: 0.05
+
+sentence_memory_safety:
+  enabled: true
+  paired_corruption:
+    enabled: true
+    full_shuffle_probability: 0.10
+    benefit_margin_relative: 0.001
+    ranking_margin_relative: 0.005
+    detach_corrupt_ranking: true
+    fallback_huber_beta: 0.10
+
+objective:
+  lambda_sentence_benefit: 1.0
+  lambda_sentence_motion_rank: 1.0
+  lambda_sentence_motion_fallback: 1.0
+  lambda_sentence_full_shuffle_rank: 1.0
+  lambda_sentence_full_shuffle_fallback: 1.0
+  lambda_sentence_sparsity: 0.0001
+
+# Signers that realize the same normalized text remain in one statistical
+# cluster. Exact train-bank texts are excluded from both scientific subsets.
+# Confirmation clusters are never evaluated or logged during training.
+validation_text_partition:
+  enabled: true
+  split: val
+  development_text_count: 256
+  expected_novel_text_count: 796
+  expected_validation_rows: 1077
+  expected_development_rows: 347
+  expected_confirmation_rows: 728
+  expected_partition_digest: 80f9f5e9fe8414d66730ff0f19bd95fa9f8156922b7cd6f14f27b182cae7d74e
+  expected_validation_manifest_sha256: 2d443adf2cd489709e19d3e55b74128e7f4470b3413692e587e9dd2ed521dabe
+  expected_bank_id: a65661333c0f60aa65dc68d896f439a698e37832f04bb8834a378a2d5f068bcd
+
+train:
+  freeze_base: true
+  unfreeze_base_prefixes: []
+  epochs: 4
+  early_stopping_patience: 2
+  early_stopping_min_epochs: 2
+  max_samples_per_memory_batch: 8
+  max_frames_per_memory_batch: 2048
+  val_every: 1
+  save_every: 1
+
+eval:
+  sentence_memory_word_prior_mode: "off"
+  sentence_memory_modes:
+    - "off"
+    - "on"
+    - "shuffled"
+    - "motion_shuffled"
+  export_sentence_memory_mode: "on"
+
+selection:
+  require_feasible: true
+  require_sentence_memory_improvement: true
+  sentence_memory_min_relative_improvement: 0.001
+  require_sentence_memory_outperform_shuffled: true
+  sentence_memory_min_relative_improvement_over_shuffled: 0.001
+  require_sentence_memory_outperform_motion_shuffled: true
+  sentence_memory_min_relative_improvement_over_motion_shuffled: 0.001
+  sentence_memory_min_Rmotion: 0.05
+  require_hand_path_nonregression: true
+  hand_path_max_relative_degradation: 0.02
+  keep_validation_checkpoints: true
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_motion_contrast_v1
