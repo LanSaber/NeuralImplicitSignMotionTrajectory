@@ -19,6 +19,7 @@ PYTHON_ENV="${PYTHON_ENV:-/media/cvpr/haomian/python_envs/SOKE}"
 PYTHON_BIN="${PYTHON_BIN:-$PYTHON_ENV/bin/python}"
 FACTORIZED_STAGE="${FACTORIZED_STAGE:?Set FACTORIZED_STAGE to stage1 or stage2}"
 SOURCE_GIT_HEAD="${SOURCE_GIT_HEAD:?Set SOURCE_GIT_HEAD to the training source commit}"
+SENTENCE_MEMORY_DIR="${SENTENCE_MEMORY_DIR:-/media/cvpr/haomian/data/SOKE_FLOW/csl_daily_upper_smplx/meta/niaf_sentence_memory/mt5_vae_mu_train_v1}"
 V2_CFG="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v2_mt5_text_only_full.yaml"
 V2_CHECKPOINT="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v2_mt5_text_only_full/checkpoints/best.pt"
 EXPECTED_V2_SHA256="06ca0a2613005b6e3949bab0e5d7ded999b212723debd3e7685a58c077e44c54"
@@ -51,6 +52,10 @@ if [[ -z "${SLURM_JOB_ID:-}" || "${SLURM_NNODES:-0}" != "1" ]]; then
 fi
 if [[ ! -x "$PYTHON_BIN" || ! -f "$CFG" || ! -f "$RUN_DIR/selection_summary.json" ]]; then
   echo "ERROR: decision prerequisites are missing" >&2
+  exit 1
+fi
+if [[ ! -d "$SENTENCE_MEMORY_DIR" || ! -f "$SENTENCE_MEMORY_DIR/READY" ]]; then
+  echo "ERROR: decision sentence-memory bank is not ready: $SENTENCE_MEMORY_DIR" >&2
   exit 1
 fi
 if [[ ! -f "$V2_CFG" || ! -f "$V2_CHECKPOINT" || "$(sha256sum -- "$V2_CHECKPOINT" | awk '{print $1}')" != "$EXPECTED_V2_SHA256" ]]; then
@@ -122,6 +127,26 @@ export SIGNTRAJ_ISOLATED_DEVELOPMENT_PARTITION_ARTIFACT_IDENTITY="$EXPECTED_PART
 
 LEASE_PATH="$RUN_DIR/evaluation/active_ordered_decision_lease"
 LEASE_ATTESTATION="$RUN_DIR/evaluation/ordered_decision_attempts/${SLURM_JOB_ID}.${SLURM_RESTART_COUNT:-0}.json"
+LOCAL_SENTENCE_MEMORY_DIR=""
+LEASE_HELD=0
+cleanup_decision() {
+  local exit_code=$?
+  trap - EXIT
+  if [[ -n "$LOCAL_SENTENCE_MEMORY_DIR" ]]; then
+    srun --nodes=1 --ntasks=1 bash \
+      "$PROJECT_DIR/scripts/NIAF/stage_sentence_memory_node.sh" \
+      cleanup "$LOCAL_SENTENCE_MEMORY_DIR" || true
+  fi
+  if [[ "$exit_code" == "0" && "$LEASE_HELD" == "1" ]]; then
+    "$PYTHON_BIN" -m \
+      NIAF.continuous_trajectory_field.scripts.decide_factorized_memory_stage \
+      release-execution-lease --lease "$LEASE_PATH" \
+      --attestation "$LEASE_ATTESTATION" || exit_code=$?
+  fi
+  exit "$exit_code"
+}
+trap cleanup_decision EXIT
+
 "$PYTHON_BIN" -m \
   NIAF.continuous_trajectory_field.scripts.decide_factorized_memory_stage \
   acquire-execution-lease \
@@ -130,18 +155,23 @@ LEASE_ATTESTATION="$RUN_DIR/evaluation/ordered_decision_attempts/${SLURM_JOB_ID}
   --source_git_head "$SOURCE_GIT_HEAD" --slurm_job_id "$SLURM_JOB_ID" \
   --binding_identity "$(sha256sum -- "$CHECKPOINT" | awk '{print $1}')"
 LEASE_HELD=1
-release_decision_lease_on_success() {
-  local exit_code=$?
-  trap - EXIT
-  if [[ "$exit_code" == "0" && "${LEASE_HELD:-0}" == "1" ]]; then
-    "$PYTHON_BIN" -m \
-      NIAF.continuous_trajectory_field.scripts.decide_factorized_memory_stage \
-      release-execution-lease --lease "$LEASE_PATH" \
-      --attestation "$LEASE_ATTESTATION" || exit_code=$?
-  fi
-  exit "$exit_code"
-}
-trap release_decision_lease_on_success EXIT
+
+# Factorized development exports must see exactly the train/validation table
+# identity persisted by training.  Never let provider startup discover the
+# unrelated test-neighbor table in the canonical shared bank.
+LOCAL_SENTENCE_MEMORY_DIR="/tmp/signtraj_sentence_memory_${SLURM_JOB_ID}"
+export STAGE_ONLY_REQUESTED_NEIGHBORS=1
+srun --nodes=1 --ntasks=1 bash \
+  "$PROJECT_DIR/scripts/NIAF/stage_sentence_memory_node.sh" \
+  stage "$LOCAL_SENTENCE_MEMORY_DIR" "$SENTENCE_MEMORY_DIR" \
+  "$PROJECT_DIR" "$PYTHON_BIN" "$CFG" "train val"
+if [[ ! -f "$LOCAL_SENTENCE_MEMORY_DIR/neighbors_train.npz" \
+      || ! -f "$LOCAL_SENTENCE_MEMORY_DIR/neighbors_val.npz" \
+      || -e "$LOCAL_SENTENCE_MEMORY_DIR/neighbors_test.npz" ]]; then
+  echo "ERROR: decision requires exactly staged train/validation neighbors" >&2
+  exit 1
+fi
+export SIGNTRAJ_SENTENCE_MEMORY_DIR="$LOCAL_SENTENCE_MEMORY_DIR"
 
 run_export() {
   local mode="$1"

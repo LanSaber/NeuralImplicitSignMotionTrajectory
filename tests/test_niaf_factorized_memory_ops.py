@@ -1195,6 +1195,21 @@ def test_factorized_launchers_are_validation_only_and_ordered():
         "SIGNTRAJ_ISOLATED_DEVELOPMENT_PARTITION_ARTIFACT_IDENTITY"
         in decision
     )
+    assert 'SENTENCE_MEMORY_DIR="${SENTENCE_MEMORY_DIR:-' in decision
+    assert 'LOCAL_SENTENCE_MEMORY_DIR="/tmp/signtraj_sentence_memory_${SLURM_JOB_ID}"' in decision
+    assert "STAGE_ONLY_REQUESTED_NEIGHBORS=1" in decision
+    assert "stage_sentence_memory_node.sh" in decision
+    assert '"$PROJECT_DIR" "$PYTHON_BIN" "$CFG" "train val"' in decision
+    assert 'neighbors_test.npz" ]]' in decision
+    assert 'SIGNTRAJ_SENTENCE_MEMORY_DIR="$LOCAL_SENTENCE_MEMORY_DIR"' in decision
+    assert 'SIGNTRAJ_SENTENCE_MEMORY_DIR="$SENTENCE_MEMORY_DIR"' not in decision
+    assert 'cleanup "$LOCAL_SENTENCE_MEMORY_DIR" || true' in decision
+    assert decision.index("STAGE_ONLY_REQUESTED_NEIGHBORS=1") < decision.index(
+        "run_export off"
+    )
+    assert decision.index(
+        'SIGNTRAJ_SENTENCE_MEMORY_DIR="$LOCAL_SENTENCE_MEMORY_DIR"'
+    ) < decision.index("run_export off")
     assert "acquire-execution-lease" in decision
     assert "original_v2_text_only" in decision
     assert "--v2_memory_off_dir" in decision
