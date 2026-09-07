@@ -1162,8 +1162,10 @@ def motion_only_shuffle_sentence_memory_batch(
     memory: SentenceMemoryBatch,
     *,
     query_ids: Sequence[str],
-    epoch: int,
+    epoch: int = 0,
     seed: int,
+    corruption_nonce: str | None = None,
+    corruption_condition: str = "motion_shuffled",
 ) -> tuple[SentenceMemoryBatch, torch.Tensor, torch.Tensor]:
     """Derange motion payloads while preserving candidate metadata.
 
@@ -1173,9 +1175,11 @@ def motion_only_shuffle_sentence_memory_batch(
     rank to source rank.
 
     Rows with fewer than two candidates containing a valid motion token remain
-    bitwise unchanged and are false in the returned informative mask. The
-    cyclic shift depends only on query ID, epoch, and seed, so it is independent
-    of batch order, batch size, worker, and distributed rank.
+    bitwise unchanged and are false in the returned informative mask. During
+    training, the cyclic shift depends only on query ID, epoch, and
+    seed.  For fixed evaluation, a non-empty ``corruption_nonce`` replaces the
+    epoch with an explicit versioned nonce and condition.  Both paths are
+    independent of batch order, batch size, worker, and distributed rank.
     """
 
     if memory.candidate_mask.ndim != 2:
@@ -1221,13 +1225,31 @@ def motion_only_shuffle_sentence_memory_batch(
         valid_count = int(valid_ranks.numel())
         if valid_count < 2:
             continue
-        identity = canonical_json(
-            {
-                "epoch": int(epoch),
-                "query_id": str(query_id),
-                "seed": int(seed),
-            }
-        )
+        if corruption_nonce is None:
+            # Preserve the Phase-A-prime training permutation bit-for-bit.
+            identity = canonical_json(
+                {
+                    "epoch": int(epoch),
+                    "query_id": str(query_id),
+                    "seed": int(seed),
+                }
+            )
+        else:
+            nonce = str(corruption_nonce)
+            condition = str(corruption_condition).lower()
+            if not nonce:
+                raise ValueError("corruption_nonce must be non-empty when provided")
+            if not condition:
+                raise ValueError("corruption_condition must be non-empty")
+            identity = canonical_json(
+                {
+                    "condition": condition,
+                    "mode": "fixed_query_condition_v1",
+                    "nonce": nonce,
+                    "query_id": str(query_id),
+                    "seed": int(seed),
+                }
+            )
         draw = int(hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16], 16)
         shift = 1 + draw % (valid_count - 1)
         permutation[row, valid_ranks] = torch.roll(
@@ -1249,17 +1271,27 @@ def motion_only_shuffle_sentence_memory_batch(
         permutation.to(device=memory.ids.device),
     )
     provenance = dict(memory.provenance)
-    provenance.update(
-        {
-            "mode": "motion_only_shuffle",
-            "motion_only_shuffle_source_mode": memory.provenance.get("mode"),
-            "motion_only_shuffle_epoch": int(epoch),
-            "motion_only_shuffle_seed": int(seed),
-            "motion_candidate_permutation": permutation.detach().cpu().tolist(),
-            "motion_source_ids": motion_source_ids.detach().cpu().tolist(),
-            "motion_only_shuffle_informative": informative.detach().cpu().tolist(),
-        }
-    )
+    provenance_update = {
+        "mode": "motion_only_shuffle",
+        "motion_only_shuffle_source_mode": memory.provenance.get("mode"),
+        "motion_only_shuffle_epoch": int(epoch),
+        "motion_only_shuffle_seed": int(seed),
+        "motion_candidate_permutation": permutation.detach().cpu().tolist(),
+        "motion_source_ids": motion_source_ids.detach().cpu().tolist(),
+        "motion_only_shuffle_informative": informative.detach().cpu().tolist(),
+    }
+    if corruption_nonce is not None:
+        provenance_update.update(
+            {
+                "motion_only_shuffle_epoch": None,
+                "evaluation_corruption_mode": "fixed_query_condition_v1",
+                "evaluation_corruption_nonce": str(corruption_nonce),
+                "evaluation_corruption_condition": str(
+                    corruption_condition
+                ).lower(),
+            }
+        )
+    provenance.update(provenance_update)
     corrupted = replace(
         memory,
         tokens=gather_motion(memory.tokens),
@@ -1561,6 +1593,132 @@ class SentenceMemoryProvider:
                 self.neighbor_table = None
         elif require_neighbors:
             raise FileNotFoundError(f"Required sentence-neighbor table does not exist: {neighbor_path}")
+        return self
+
+    def set_dataset_with_name_indexed_neighbor_subset(
+        self,
+        dataset,
+        *,
+        parent_manifest_sha256: str,
+        expected_subset_manifest_sha256: str,
+    ):
+        """Bind a compact manifest to exact rows of its canonical neighbor table.
+
+        Development-only validation must not open the canonical full validation
+        manifest merely to retain precomputed retrieval.  This method instead
+        loads the already identity-bound full neighbor table, requires globally
+        unique query names, and selects rows by exact name.  Positional lookup
+        then remains safe because the selected arrays use the compact dataset's
+        order.  No unverified online-retrieval fallback is permitted.
+        """
+
+        self.dataset = dataset
+        self.neighbor_table = None
+        manifest_path = self._dataset_manifest_path(dataset)
+        if manifest_path is None or not manifest_path.is_file():
+            raise SentenceMemoryValidationError(
+                "A readable development manifest is required for name-indexed "
+                "neighbor subsetting"
+            )
+        self._dataset_manifest_sha256 = sha256_file(manifest_path)
+        if self._dataset_manifest_sha256 != str(expected_subset_manifest_sha256):
+            raise SentenceMemoryValidationError(
+                "Development query manifest differs from its pinned identity: "
+                f"actual={self._dataset_manifest_sha256}, "
+                f"expected={expected_subset_manifest_sha256}"
+            )
+
+        split = str(getattr(dataset, "split", ""))
+        neighbor_path = self._neighbor_path(split)
+        if not neighbor_path.is_file():
+            raise FileNotFoundError(
+                f"Required canonical sentence-neighbor table does not exist: "
+                f"{neighbor_path}"
+            )
+        table_identity = self._neighbor_tables_identity.get(split)
+        if not isinstance(table_identity, Mapping):
+            raise SentenceMemoryValidationError(
+                f"No startup identity was recorded for neighbor split {split!r}"
+            )
+        current_table_sha256 = sha256_file(neighbor_path)
+        if current_table_sha256 != str(table_identity.get("sha256", "")):
+            raise SentenceMemoryValidationError(
+                "Canonical neighbor table changed after startup identity binding: "
+                f"{neighbor_path}"
+            )
+        table = load_neighbor_table(
+            neighbor_path,
+            bank_id=self.bank_id,
+            bank_size=self.group_count,
+            expected_manifest_sha256=str(parent_manifest_sha256),
+            expected_policy=self.policy,
+            expected_top_m=self.top_m,
+        )
+        table_split = str(table.get("query_split", ""))
+        if table_split != split:
+            raise SentenceMemoryValidationError(
+                "Canonical neighbor table split differs from the compact query "
+                f"dataset: table={table_split!r}, dataset={split!r}"
+            )
+
+        parent_names = [str(value) for value in table.get("query_names", ())]
+        parent_index = {}
+        for index, name in enumerate(parent_names):
+            if not name:
+                raise SentenceMemoryValidationError(
+                    "Canonical neighbor table contains an empty query name"
+                )
+            if name in parent_index:
+                raise SentenceMemoryValidationError(
+                    "Canonical neighbor table query names are not unique: "
+                    f"{name!r}"
+                )
+            parent_index[name] = int(index)
+
+        base = getattr(dataset, "base", dataset)
+        dataset_rows = getattr(base, "items", None)
+        if dataset_rows is None:
+            raise SentenceMemoryValidationError(
+                "Compact query dataset does not expose manifest rows"
+            )
+        subset_names = [str(row.get("name", "")) for row in dataset_rows]
+        if len(subset_names) != len(dataset):
+            raise SentenceMemoryValidationError(
+                "Compact query dataset length differs from its manifest rows"
+            )
+        if any(not name for name in subset_names):
+            raise SentenceMemoryValidationError(
+                "Compact query manifest contains an empty query name"
+            )
+        if len(set(subset_names)) != len(subset_names):
+            raise SentenceMemoryValidationError(
+                "Compact query manifest names must be unique for exact subsetting"
+            )
+        missing = [name for name in subset_names if name not in parent_index]
+        if missing:
+            raise SentenceMemoryValidationError(
+                "Compact query manifest is absent from the canonical neighbor "
+                f"table; first missing name={missing[0]!r}"
+            )
+        parent_rows = np.asarray(
+            [parent_index[name] for name in subset_names], dtype=np.int64
+        )
+        subset_table = dict(table)
+        subset_table.update(
+            {
+                "query_names": subset_names,
+                "query_order_sha256": digest_json(subset_names),
+                "query_manifest_sha256": self._dataset_manifest_sha256,
+                "ids": np.asarray(table["ids"])[parent_rows],
+                "scores": np.asarray(table["scores"])[parent_rows],
+                "parent_query_manifest_sha256": str(parent_manifest_sha256),
+                "parent_query_order_sha256": table["query_order_sha256"],
+                "parent_query_count": len(parent_names),
+                "parent_query_rows": parent_rows,
+                "lookup_mode": "exact_name_indexed_parent_subset_v1",
+            }
+        )
+        self.neighbor_table = subset_table
         return self
 
     def validate_query_dataset(self, dataset=None, *, require_neighbors: bool = False):
@@ -1877,12 +2035,26 @@ class SentenceMemoryProvider:
         output_ids = np.full((len(query_rows), self.k), -1, dtype=np.int64)
         output_scores = np.zeros((len(query_rows), self.k), dtype=np.float32)
         used_table = []
+        exact_name_indexed_subset = bool(
+            isinstance(self.neighbor_table, Mapping)
+            and self.neighbor_table.get("lookup_mode")
+            == "exact_name_indexed_parent_subset_v1"
+        )
         for row_index, (key, query, duration) in enumerate(
             zip(keys, query_rows, duration_values)
         ):
             candidates = self._table_candidates(query, training=training)
             from_table = candidates is not None
-            if candidates is None or len(candidates[0]) < self.k:
+            if candidates is None and exact_name_indexed_subset:
+                raise SentenceMemoryValidationError(
+                    "Exact name-indexed neighbor subset has no row for query "
+                    f"{query.get('name')!r} at local index "
+                    f"{query.get('query_index')!r}"
+                )
+            if candidates is None or (
+                len(candidates[0]) < self.k
+                and not exact_name_indexed_subset
+            ):
                 candidates = self._online_candidates(
                     key,
                     query,
@@ -1912,15 +2084,46 @@ class SentenceMemoryProvider:
         *,
         training: bool,
         salt: str,
+        corruption_nonce: str | None = None,
+        corruption_seed: int | None = None,
+        corruption_condition: str | None = None,
     ) -> list[int]:
         target = max(int(count), 0)
         if target == 0 or self.group_count <= 0:
             return []
-        token = (
-            f"{self.seed}|{self.epoch}|{salt}|{query.get('name')}|"
-            f"{query.get('motion_path')}|{query.get('semantic_group_id')}|"
-            f"{query.get('source_id')}|{query.get('source_group_id')}"
-        )
+        if corruption_nonce is None:
+            # Preserve legacy/training maps exactly.
+            token = (
+                f"{self.seed}|{self.epoch}|{salt}|{query.get('name')}|"
+                f"{query.get('motion_path')}|{query.get('semantic_group_id')}|"
+                f"{query.get('source_id')}|{query.get('source_group_id')}"
+            )
+        else:
+            nonce = str(corruption_nonce)
+            condition = str(corruption_condition or salt).lower()
+            if not nonce:
+                raise ValueError("corruption_nonce must be non-empty when provided")
+            if not condition:
+                raise ValueError("corruption_condition must be non-empty")
+            token = canonical_json(
+                {
+                    "condition": condition,
+                    "mode": "fixed_query_condition_v1",
+                    "nonce": nonce,
+                    "query_identity": {
+                        "motion_path": query.get("motion_path"),
+                        "name": query.get("name"),
+                        "semantic_group_id": query.get("semantic_group_id"),
+                        "source_group_id": query.get("source_group_id"),
+                        "source_id": query.get("source_id"),
+                    },
+                    "seed": int(
+                        self.seed
+                        if corruption_seed is None
+                        else corruption_seed
+                    ),
+                }
+            )
         seed = int(hashlib.sha256(token.encode("utf-8")).hexdigest()[:16], 16)
         start = seed % self.group_count
         if self.group_count == 1:
@@ -1954,6 +2157,9 @@ class SentenceMemoryProvider:
         query_rows: Sequence[Mapping[str, Any]],
         *,
         training: bool,
+        corruption_nonce: str | None = None,
+        corruption_seed: int | None = None,
+        corruption_condition: str = "shuffled",
     ) -> tuple[np.ndarray, np.ndarray, list[int], list[list[int]]]:
         batch_size = len(query_rows)
         shuffled = np.full_like(normal_ids, -1)
@@ -1970,6 +2176,9 @@ class SentenceMemoryProvider:
                 self.k,
                 training=training,
                 salt="shuffle",
+                corruption_nonce=corruption_nonce,
+                corruption_seed=corruption_seed,
+                corruption_condition=corruption_condition,
             )
             shuffled[query_index, : len(selected)] = selected
         scores = np.zeros_like(shuffled, dtype=np.float32)
@@ -2241,6 +2450,9 @@ class SentenceMemoryProvider:
         training: bool,
         device: torch.device | str,
         mode: str = "on",
+        corruption_nonce: str | None = None,
+        corruption_seed: int | None = None,
+        corruption_condition: str | None = None,
     ) -> SentenceMemoryBatch:
         mode = str(mode).lower()
         aliases = {"retrieval": "on", "normal": "on", "dropout": "on"}
@@ -2308,7 +2520,13 @@ class SentenceMemoryProvider:
                 source_rows,
                 source_rows_by_rank,
             ) = self._shuffle_candidate_groups(
-                normal_groups, query_keys, query_rows, training=bool(training)
+                normal_groups,
+                query_keys,
+                query_rows,
+                training=bool(training),
+                corruption_nonce=corruption_nonce,
+                corruption_seed=corruption_seed,
+                corruption_condition=str(corruption_condition or mode),
             )
         else:
             selected_groups, selected_scores = normal_groups, normal_scores
@@ -2372,6 +2590,19 @@ class SentenceMemoryProvider:
                     for row in query_rows
                 ],
                 "candidate_exact_text": exact_text,
+                **(
+                    {
+                        "evaluation_corruption_mode": (
+                            "fixed_query_condition_v1"
+                        ),
+                        "evaluation_corruption_nonce": str(corruption_nonce),
+                        "evaluation_corruption_condition": str(
+                            corruption_condition or mode
+                        ).lower(),
+                    }
+                    if corruption_nonce is not None
+                    else {}
+                ),
             },
         )
 

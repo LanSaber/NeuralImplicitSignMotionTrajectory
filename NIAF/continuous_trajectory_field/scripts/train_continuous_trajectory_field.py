@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import argparse
 import copy
+import errno
 import hashlib
 import json
 import inspect
 import math
 import os
 import random
+import tempfile
 import time
 from pathlib import Path
-from dataclasses import fields, is_dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 
 import numpy as np
 import torch
@@ -74,8 +76,25 @@ TRAJECTORY_CONTRACT_VERSIONS = {
 }
 WORD_PRIOR_MODES = {"dropout", "off", "on"}
 SENTENCE_MEMORY_TRAIN_MODES = {"dropout", "off", "on"}
-SENTENCE_MEMORY_EVAL_MODES = {"off", "on", "shuffled", "motion_shuffled"}
+SENTENCE_MEMORY_EVAL_MODES = {
+    "off",
+    "on",
+    "shuffled",
+    "motion_shuffled",
+    "analytic_prior",
+}
+LEGACY_EVALUATION_CORRUPTION_MODE = "checkpoint_epoch_v1"
+FIXED_EVALUATION_CORRUPTION_MODE = "fixed_query_condition_v1"
+LEGACY_SELECTION_AGGREGATION = "sample_weighted_rows_v1"
+CLUSTER_EQUAL_SELECTION_AGGREGATION = "normalized_text_cluster_equal_v1"
 WORD_PRIOR_PART_NAMES = ("body", "left_hand", "right_hand", "face")
+FACTORIZED_VALIDATION_PARTITION_ENV = (
+    "SIGNTRAJ_VALIDATION_TEXT_PARTITION_DIR"
+)
+DEVELOPMENT_VALIDATION_MANIFEST = "manifest_development.jsonl"
+DEVELOPMENT_VALIDATION_RUNTIME_SCHEMA = (
+    "signtrajfield_development_validation_runtime"
+)
 
 
 def configured_model_type(cfg):
@@ -197,9 +216,403 @@ def sentence_memory_provider_required(modes):
     if isinstance(modes, str):
         modes = (modes,)
     return any(
-        str(mode).lower() in {"on", "shuffled", "motion_shuffled"}
+        str(mode).lower()
+        in {"on", "shuffled", "motion_shuffled", "analytic_prior"}
         for mode in modes
     )
+
+
+def configured_evaluation_corruption(cfg):
+    """Resolve validation corruption without changing legacy configurations."""
+
+    configured = cfg.get("eval", {}).get("evaluation_corruption")
+    if configured is None:
+        return {
+            "mode": LEGACY_EVALUATION_CORRUPTION_MODE,
+            "seed": int(cfg.get("seed", 1234)),
+            "nonce": None,
+        }
+    if not isinstance(configured, dict):
+        raise ValueError("eval.evaluation_corruption must be a mapping")
+    unsupported = sorted(set(configured) - {"mode", "seed", "nonce"})
+    if unsupported:
+        raise ValueError(
+            "eval.evaluation_corruption has unsupported fields: "
+            f"{unsupported}"
+        )
+    mode = str(configured.get("mode", "")).lower()
+    if mode not in {
+        LEGACY_EVALUATION_CORRUPTION_MODE,
+        FIXED_EVALUATION_CORRUPTION_MODE,
+    }:
+        raise ValueError(
+            "eval.evaluation_corruption.mode must be one of "
+            f"{[LEGACY_EVALUATION_CORRUPTION_MODE, FIXED_EVALUATION_CORRUPTION_MODE]}, "
+            f"got {mode!r}"
+        )
+    seed = int(configured.get("seed", cfg.get("seed", 1234)))
+    nonce = configured.get("nonce")
+    if mode == FIXED_EVALUATION_CORRUPTION_MODE:
+        if seed != 1234:
+            raise ValueError(
+                "fixed validation corruption requires seed 1234"
+            )
+        if nonce is None or not str(nonce):
+            raise ValueError(
+                "fixed validation corruption requires a non-empty versioned nonce"
+            )
+        nonce = str(nonce)
+    elif nonce is not None:
+        raise ValueError(
+            "legacy checkpoint-epoch corruption must not configure a nonce"
+        )
+    return {"mode": mode, "seed": seed, "nonce": nonce}
+
+
+def configured_selection_aggregation(cfg):
+    configured = cfg.get("selection", {}).get("aggregation")
+    if configured is None:
+        return LEGACY_SELECTION_AGGREGATION
+    mode = str(configured).lower()
+    if mode not in {
+        LEGACY_SELECTION_AGGREGATION,
+        CLUSTER_EQUAL_SELECTION_AGGREGATION,
+    }:
+        raise ValueError(
+            "selection.aggregation must be one of "
+            f"{[LEGACY_SELECTION_AGGREGATION, CLUSTER_EQUAL_SELECTION_AGGREGATION]}, "
+            f"got {mode!r}"
+        )
+    return mode
+
+
+def _digest_named_identity(payload):
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return {
+        **payload,
+        "digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
+
+
+def sentence_memory_evaluation_control_identity(cfg):
+    control = configured_evaluation_corruption(cfg)
+    return _digest_named_identity(
+        {
+            "schema_name": "sentence_memory_evaluation_control",
+            "schema_version": 1,
+            "mode": control["mode"],
+            "seed": int(control["seed"]),
+            "nonce": control["nonce"],
+            "motion_query_identity": "source_name_motion_path_or_index_v1",
+            "full_query_identity": (
+                "name_motion_path_semantic_source_and_source_group_v1"
+            ),
+            "condition_separation": "explicit_condition_token_v1",
+            "motion_shuffle": "valid_rank_cyclic_derangement_v1",
+            "full_shuffle": "stable_query_alternative_groups_v1",
+            "training_corruption": "epoch_dependent_unchanged",
+        }
+    )
+
+
+def sentence_memory_validation_corruption_map_identity(
+    cfg, *, partition_digest, bank_id
+):
+    """Bind a deterministic validation map to its queries and motion bank."""
+
+    control = sentence_memory_evaluation_control_identity(cfg)
+    return _digest_named_identity(
+        {
+            "schema_name": "sentence_memory_validation_corruption_map",
+            "schema_version": 1,
+            "evaluation_control_digest": control["digest"],
+            "validation_partition_digest": str(partition_digest),
+            "bank_id": str(bank_id),
+            "conditions": ["motion_shuffled", "shuffled"],
+            "motion_query_identity": control["motion_query_identity"],
+            "full_query_identity": control["full_query_identity"],
+        }
+    )
+
+
+def sentence_memory_selection_aggregation_identity(cfg):
+    mode = configured_selection_aggregation(cfg)
+    if mode == CLUSTER_EQUAL_SELECTION_AGGREGATION:
+        definition = {
+            "normalization": "NFKC_casefold_whitespace_collapse",
+            "metric_reduction": "mean_rows_within_text_then_equal_mean_texts",
+            "distributed_partition": "whole_cluster_round_robin_no_padding_v1",
+            "rmotion": (
+                "sqrt(equal_text_mean(row_element_mse_correct_vs_motion) / "
+                "equal_text_mean(row_element_mse_correct_vs_off))"
+            ),
+        }
+    else:
+        definition = {
+            "metric_reduction": "sample_weighted_rows",
+            "rmotion": "pooled_valid_elements",
+        }
+    return _digest_named_identity(
+        {
+            "schema_name": "sentence_memory_selection_aggregation",
+            "schema_version": 1,
+            "mode": mode,
+            "definition": definition,
+        }
+    )
+
+
+def sentence_memory_architecture_identity(cfg):
+    """Describe the sentence-memory Q/K/V and temporal-prior contract."""
+
+    memory = dict(cfg.get("sentence_memory", {}) or {})
+    mode = str(memory.get("key_value_mode", "legacy_mixed_v1")).lower()
+    if mode not in {"legacy_mixed_v1", "factorized_metadata_motion_v1"}:
+        raise ValueError(f"Unsupported sentence_memory.key_value_mode {mode!r}")
+    temporal_mode = str(memory.get("temporal_prior_mode", "none")).lower()
+    if temporal_mode not in {"none", "gaussian"}:
+        raise ValueError(
+            "sentence_memory.temporal_prior_mode must be 'none' or 'gaussian'"
+        )
+    sigma = float(memory.get("temporal_prior_sigma", 0.25))
+    scale = float(memory.get("temporal_prior_scale", 1.0))
+    if not math.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError("sentence_memory.temporal_prior_sigma must be positive")
+    if not math.isfinite(scale) or scale < 0.0:
+        raise ValueError(
+            "sentence_memory.temporal_prior_scale must be non-negative"
+        )
+    if mode == "legacy_mixed_v1":
+        return _digest_named_identity(
+            {
+                "schema_name": "sentence_memory_architecture",
+                "schema_version": 1,
+                "key_value_mode": mode,
+                "implementation": "joint_motion_metadata_memory_v1",
+            }
+        )
+
+    duration_weight = max(float(memory.get("duration_weight", 0.10)), 0.0)
+    temperature = max(float(memory.get("score_temperature", 0.10)), 1e-4)
+    retrieval_scale = float(memory.get("retrieval_prior_scale", 1.0))
+    token_prior = (
+        "uniform over tokens satisfying motion_mask and part_validity>0, "
+        "normalized separately for each batch-slot-part-candidate"
+    )
+    if temporal_mode == "gaussian":
+        token_prior = (
+            "log(part_validity) + temporal_prior_scale * "
+            "(-0.5*((slot_tau-motion_tau)/temporal_prior_sigma)^2), "
+            "normalized over motion tokens separately for each "
+            "batch-slot-part-candidate"
+        )
+    return _digest_named_identity(
+        {
+            "schema_name": "sentence_memory_architecture",
+            "schema_version": 1,
+            "key_value_mode": mode,
+            "query": {
+                "sources": ["frozen_target_text_slots", "trainable_part_embedding"],
+                "construction": (
+                    "bias_free_part_query_projection(text_slot)+part_embedding; "
+                    "per-layer affine query layernorm/projection"
+                ),
+                "later_query_uses_state": False,
+            },
+            "key": {
+                "sources": [
+                    "candidate_mt5_mean_key",
+                    "cosine_score",
+                    "analytic_retrieval_probability",
+                    "normalized_adjusted_rank",
+                    "duration_log_gap",
+                    "adjusted_top2_margin",
+                ],
+                "motion_content_enters_key": False,
+                "adjusted_score": (
+                    "cosine_score-duration_weight*abs(log("
+                    "query_duration/candidate_duration))"
+                ),
+                "retrieval_probability": (
+                    "masked_softmax(adjusted_score/score_temperature)"
+                ),
+                "rank": (
+                    "count(valid adjusted scores greater)/max(valid_count-1,1)"
+                ),
+                "margin": "top1_minus_top2_adjusted_or_zero",
+                "construction": (
+                    "key_projection(mt5_key)+feature_projection([score,"
+                    "retrieval_probability,rank,duration_gap,margin]); "
+                    "per-layer key layernorm/projection"
+                ),
+            },
+            "value": {
+                "sources": ["vae_motion_mu"],
+                "metadata_text_tau_or_validity_enters_value": False,
+                "construction": (
+                    "non_affine_layernorm_then_bias_free_linear; per-layer "
+                    "non_affine_layernorm_then_bias_free_linear"
+                ),
+            },
+            "attention": {
+                "real_logit": (
+                    "QK/sqrt(head_dim)+retrieval_prior_scale*log("
+                    "retrieval_probability)+normalized_token_log_prior"
+                ),
+                "score_temperature": temperature,
+                "duration_weight": duration_weight,
+                "retrieval_prior_scale": retrieval_scale,
+                "part_validity": (
+                    "structurally valid iff motion_mask and candidate_mask and "
+                    "part_validity>0; invalid logits are negative infinity"
+                ),
+                "temporal_prior_mode": temporal_mode,
+                "temporal_prior_formula": token_prior,
+                "temporal_prior_sigma": sigma,
+                "temporal_prior_scale": scale,
+                "all_invalid": (
+                    "only null logit finite; null_mass=1 and state/gate/residual=0"
+                ),
+            },
+            "zero_preserving_path": [
+                "encoder_motion_layernorm_non_affine",
+                "encoder_motion_projection_bias_free",
+                "layer_value_layernorm_non_affine",
+                "layer_value_and_output_projections_bias_free",
+                "state_layernorm_non_affine_and_feedforward_bias_free",
+                "sentence_part_projections_and_fusion_bias_free",
+            ],
+            "analytic_prior_mode": (
+                "replace only real learned QK logits with exact zeros; retain "
+                "retrieval/token priors, motion values, learned null QK/bias/"
+                "confidence, attention dropout, state feed-forward, gates, "
+                "part fusion, and frozen generator"
+            ),
+        }
+    )
+
+
+def validate_sentence_memory_architecture_identity(
+    checkpoint, cfg, source="checkpoint"
+):
+    expected = sentence_memory_architecture_identity(cfg)
+    return _validate_named_identity(
+        checkpoint.get("sentence_memory_architecture_identity"),
+        expected,
+        source=source,
+        label="sentence-memory architecture",
+        allow_missing=(expected["key_value_mode"] == "legacy_mixed_v1"),
+    )
+
+
+def _requires_explicit_sentence_memory_control_identities(cfg):
+    memory_mode = str(
+        cfg.get("sentence_memory", {}).get(
+            "key_value_mode", "legacy_mixed_v1"
+        )
+    ).lower()
+    return bool(
+        cfg.get("eval", {}).get("evaluation_corruption") is not None
+        or cfg.get("selection", {}).get("aggregation") is not None
+        or memory_mode == "factorized_metadata_motion_v1"
+    )
+
+
+def _validate_named_identity(actual, expected, *, source, label, allow_missing):
+    if actual is None:
+        if allow_missing:
+            return expected
+        raise RuntimeError(f"{source} has no persisted {label} identity")
+    if not isinstance(actual, dict):
+        raise RuntimeError(f"{source} has a malformed {label} identity")
+    actual_payload = {key: value for key, value in actual.items() if key != "digest"}
+    actual_digest = hashlib.sha256(
+        json.dumps(actual_payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    if actual.get("digest") != actual_digest:
+        raise RuntimeError(f"{source} has an invalid {label} identity digest")
+    if actual_digest != expected["digest"]:
+        raise RuntimeError(
+            f"{source} {label} differs from the active config: "
+            f"checkpoint={actual_digest}, active={expected['digest']}"
+        )
+    return expected
+
+
+def validate_sentence_memory_evaluation_control_identity(
+    checkpoint, cfg, source="checkpoint"
+):
+    expected = sentence_memory_evaluation_control_identity(cfg)
+    return _validate_named_identity(
+        checkpoint.get("sentence_memory_evaluation_control_identity"),
+        expected,
+        source=source,
+        label="sentence-memory evaluation-control",
+        allow_missing=(
+            not _requires_explicit_sentence_memory_control_identities(cfg)
+            and expected["mode"] == LEGACY_EVALUATION_CORRUPTION_MODE
+        ),
+    )
+
+
+def validate_sentence_memory_selection_aggregation_identity(
+    checkpoint, cfg, source="checkpoint"
+):
+    expected = sentence_memory_selection_aggregation_identity(cfg)
+    return _validate_named_identity(
+        checkpoint.get("sentence_memory_selection_aggregation_identity"),
+        expected,
+        source=source,
+        label="sentence-memory selection-aggregation",
+        allow_missing=(
+            not _requires_explicit_sentence_memory_control_identities(cfg)
+            and expected["mode"] == LEGACY_SELECTION_AGGREGATION
+        ),
+    )
+
+
+def validate_sentence_memory_validation_corruption_map_identity(
+    checkpoint, cfg, source="checkpoint"
+):
+    expected = cfg.get("validation_text_partition", {}).get(
+        "evaluation_corruption_map_identity"
+    )
+    if expected is None:
+        if _requires_explicit_sentence_memory_control_identities(cfg):
+            raise RuntimeError(
+                "Active factorized run has no resolved validation corruption-map "
+                "identity"
+            )
+        return None
+    return _validate_named_identity(
+        checkpoint.get("sentence_memory_validation_corruption_map_identity"),
+        expected,
+        source=source,
+        label="sentence-memory validation corruption-map",
+        allow_missing=False,
+    )
+
+
+def sentence_memory_evaluation_corruption_kwargs(
+    cfg, *, training, condition
+):
+    """Return fixed-control kwargs only for validation corruptions."""
+
+    control = configured_evaluation_corruption(cfg)
+    condition = str(condition).lower()
+    if (
+        bool(training)
+        or condition not in {"shuffled", "motion_shuffled"}
+        or control["mode"] != FIXED_EVALUATION_CORRUPTION_MODE
+    ):
+        return {}
+    return {
+        "corruption_nonce": control["nonce"],
+        "corruption_seed": int(control["seed"]),
+        "corruption_condition": condition,
+    }
 
 
 def requires_sentence_memory_provider(cfg):
@@ -391,6 +804,12 @@ def sentence_memory_behavior_identity(cfg):
             },
         },
     }
+    if str(memory_cfg.get("key_value_mode", "legacy_mixed_v1")).lower() == (
+        "factorized_metadata_motion_v1"
+    ):
+        payload["sentence_memory_architecture_digest"] = (
+            sentence_memory_architecture_identity(cfg)["digest"]
+        )
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -529,7 +948,7 @@ def sentence_memory_objective_identity(cfg):
     if paired_cfg["enabled"]:
         objective_cfg = cfg.get("objective", {})
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "mode": "paired_correct_motion_or_full_v1",
             "paired_corruption": paired_cfg,
             "weights": {
@@ -550,7 +969,9 @@ def sentence_memory_objective_identity(cfg):
                 "reduction": "masked_sum_divided_by_batch_times_four_parts",
                 "ordinary_losses": "correct_only",
                 "motion_shuffle_query_identity": "name_and_motion_path_index_fallback_v1",
-                "evaluation_motion_shuffle_epoch": "checkpoint_epoch",
+                "training_corruption_schedule": (
+                    "query_identity_epoch_seed_v1; evaluation controls excluded"
+                ),
             },
         }
     else:
@@ -645,6 +1066,21 @@ def sentence_memory_resume_identity(cfg):
             # The accepted report is validated through its own canonical digest.
             phase_b_cfg.pop("gate_report", None)
             phase_b_cfg.pop("resolved_scientific_gate", None)
+
+    if str(
+        cfg.get("sentence_memory", {}).get(
+            "key_value_mode", "legacy_mixed_v1"
+        )
+    ).lower() == "factorized_metadata_motion_v1":
+        payload["_sentence_memory_architecture_digest"] = (
+            sentence_memory_architecture_identity(cfg)["digest"]
+        )
+        payload["_sentence_memory_evaluation_control_digest"] = (
+            sentence_memory_evaluation_control_identity(cfg)["digest"]
+        )
+        payload["_sentence_memory_selection_aggregation_digest"] = (
+            sentence_memory_selection_aggregation_identity(cfg)["digest"]
+        )
 
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return {
@@ -1094,15 +1530,530 @@ def set_sentence_memory_provider_epoch_from_checkpoint(provider, checkpoint):
 
 
 def evaluated_loader_sample_count(loader, max_batches=0):
-    """Return the exact number of local rows consumed by an evaluation pass."""
+    """Return the exact number of local aggregation units consumed."""
 
-    sampler = getattr(loader, "sampler", None)
-    total = len(sampler) if sampler is not None else len(loader.dataset)
+    explicit_units = getattr(loader, "evaluation_unit_count", None)
+    if explicit_units is not None:
+        total = int(explicit_units)
+    else:
+        sampler = getattr(loader, "sampler", None)
+        total = len(sampler) if sampler is not None else len(loader.dataset)
     max_batches = max(int(max_batches), 0)
     if max_batches:
-        batch_size = max(int(getattr(loader, "batch_size", 1) or 1), 1)
-        total = min(total, max_batches * batch_size)
+        if explicit_units is not None:
+            total = min(total, max_batches)
+        else:
+            batch_size = max(int(getattr(loader, "batch_size", 1) or 1), 1)
+            total = min(total, max_batches * batch_size)
     return int(total)
+
+
+@dataclass(frozen=True)
+class DevelopmentValidationRuntime:
+    """Development-only view of a sealed validation partition.
+
+    This object deliberately contains no confirmation row, normalized text, or
+    assignment.  The training process can therefore validate and instantiate
+    the development manifest without parsing ``partition.json`` or opening the
+    confirmation manifest.
+    """
+
+    partition_dir: Path
+    manifest_path: Path
+    normalized_texts: tuple[str, ...]
+    development_row_count: int
+    development_text_count: int
+    confirmation_row_count: int
+    confirmation_text_count: int
+    partition_digest: str
+    artifact_payload: dict
+
+
+def requires_isolated_development_validation(cfg):
+    """Return whether the factorized paired objective needs its sealed dev view."""
+
+    memory_mode = str(
+        cfg.get("sentence_memory", {}).get(
+            "key_value_mode", "legacy_mixed_v1"
+        )
+    ).lower()
+    partition_cfg = cfg.get("validation_text_partition")
+    return bool(
+        memory_mode == "factorized_metadata_motion_v1"
+        and paired_sentence_memory_corruption_config(cfg)["enabled"]
+        and isinstance(partition_cfg, dict)
+        and partition_cfg.get("enabled", False)
+    )
+
+
+def _require_sha256(value, *, label):
+    value = str(value or "").lower()
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError(f"{label} must be a lowercase SHA256 digest")
+    return value
+
+
+def load_isolated_development_validation_runtime(cfg, *, partition_dir=None):
+    """Attest and read only the prebuilt development validation manifest.
+
+    The full validation manifest, ``partition.json``, exact-seen manifest, and
+    confirmation manifest are intentionally outside this function's access
+    surface.  Membership is pinned by the development-manifest SHA256 in the
+    experiment config, while the full partition digest/counts remain pinned as
+    numeric/digest metadata for the later post-lock verifier.
+    """
+
+    if not requires_isolated_development_validation(cfg):
+        return None
+    partition_cfg = cfg.get("validation_text_partition", {})
+    if str(partition_cfg.get("split", "val")) != "val":
+        raise ValueError("Isolated development validation requires split='val'")
+
+    requested_dir = partition_dir
+    if requested_dir is None:
+        requested_dir = os.environ.get(FACTORIZED_VALIDATION_PARTITION_ENV)
+    if not requested_dir:
+        raise ValueError(
+            f"Factorized training requires explicit {FACTORIZED_VALIDATION_PARTITION_ENV} "
+            "pointing to the pre-existing sealed validation partition"
+        )
+    directory = Path(requested_dir).resolve()
+    if not directory.is_dir():
+        raise FileNotFoundError(
+            f"Sealed validation partition directory does not exist: {directory}"
+        )
+
+    # READY is the only partition-level file opened by training. Keep the
+    # accepted envelope small so it cannot become a covert copy of holdout
+    # assignments or sentence text.
+    ready_path = directory / "READY"
+    if not ready_path.is_file():
+        raise FileNotFoundError(f"Validation partition is not READY: {directory}")
+    if ready_path.stat().st_size > 4096:
+        raise ValueError("Validation partition READY metadata is unexpectedly large")
+    ready = json.loads(ready_path.read_text(encoding="utf-8"))
+    if set(ready) != {"schema_name", "schema_version", "artifact_identity"}:
+        raise ValueError("Validation partition READY metadata has an unsafe schema")
+    if ready.get("schema_name") != "signtrajfield_validation_text_cluster_partition":
+        raise ValueError("Validation partition READY schema name is invalid")
+    if int(ready.get("schema_version", -1)) != 1:
+        raise ValueError("Validation partition READY schema version is invalid")
+    artifact_identity = _require_sha256(
+        ready.get("artifact_identity"), label="READY artifact_identity"
+    )
+    expected_artifact_identity = _require_sha256(
+        partition_cfg.get("expected_partition_artifact_identity"),
+        label=(
+            "validation_text_partition.expected_partition_artifact_identity"
+        ),
+    )
+    if artifact_identity != expected_artifact_identity:
+        raise ValueError(
+            "Validation partition READY artifact identity mismatch: "
+            f"actual={artifact_identity}, expected={expected_artifact_identity}"
+        )
+
+    partition_digest = _require_sha256(
+        partition_cfg.get("expected_partition_digest"),
+        label="validation_text_partition.expected_partition_digest",
+    )
+    source_manifest_sha256 = _require_sha256(
+        partition_cfg.get("expected_validation_manifest_sha256"),
+        label="validation_text_partition.expected_validation_manifest_sha256",
+    )
+    development_manifest_sha256 = _require_sha256(
+        partition_cfg.get("expected_development_manifest_sha256"),
+        label=(
+            "validation_text_partition.expected_development_manifest_sha256"
+        ),
+    )
+    expected_bank_id = _require_sha256(
+        partition_cfg.get("expected_bank_id"),
+        label="validation_text_partition.expected_bank_id",
+    )
+
+    def required_nonnegative_integer(name):
+        if name not in partition_cfg:
+            raise ValueError(f"validation_text_partition.{name} is required")
+        value = int(partition_cfg[name])
+        if value < 0:
+            raise ValueError(
+                f"validation_text_partition.{name} must be non-negative"
+            )
+        return value
+
+    expected_validation_rows = required_nonnegative_integer(
+        "expected_validation_rows"
+    )
+    expected_development_rows = required_nonnegative_integer(
+        "expected_development_rows"
+    )
+    expected_confirmation_rows = required_nonnegative_integer(
+        "expected_confirmation_rows"
+    )
+    expected_novel_text_count = required_nonnegative_integer(
+        "expected_novel_text_count"
+    )
+    development_text_count = required_nonnegative_integer(
+        "development_text_count"
+    )
+    if expected_development_rows + expected_confirmation_rows > expected_validation_rows:
+        raise ValueError(
+            "Development and confirmation rows exceed the pinned validation row count"
+        )
+    if development_text_count > expected_novel_text_count:
+        raise ValueError(
+            "Development text count exceeds the pinned novel-text population"
+        )
+    confirmation_text_count = expected_novel_text_count - development_text_count
+
+    manifest_path = directory / DEVELOPMENT_VALIDATION_MANIFEST
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Sealed partition is missing {DEVELOPMENT_VALIDATION_MANIFEST}"
+        )
+    digest = hashlib.sha256()
+    rows = []
+    with manifest_path.open("rb") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            digest.update(line)
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    f"Invalid development manifest row {line_number}: {error}"
+                ) from error
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"Development manifest row {line_number} is not an object"
+                )
+            rows.append(row)
+    actual_development_sha256 = digest.hexdigest()
+    if actual_development_sha256 != development_manifest_sha256:
+        raise ValueError(
+            "Development manifest SHA256 mismatch: "
+            f"actual={actual_development_sha256}, "
+            f"expected={development_manifest_sha256}"
+        )
+    if len(rows) != expected_development_rows:
+        raise ValueError(
+            "Development manifest row count mismatch: "
+            f"actual={len(rows)}, expected={expected_development_rows}"
+        )
+    wrong_split = [
+        index
+        for index, row in enumerate(rows)
+        if str(row.get("source_split", "val")) != "val"
+    ]
+    if wrong_split:
+        raise ValueError(
+            "Development manifest contains a non-validation source row: "
+            f"index={wrong_split[0]}"
+        )
+    from NIAF.continuous_trajectory_field.sentence_memory import (
+        normalize_sentence_text,
+    )
+
+    normalized_texts = tuple(
+        normalize_sentence_text(row.get("text", "")) for row in rows
+    )
+    if any(not text for text in normalized_texts):
+        raise ValueError("Development manifest contains an empty normalized text")
+    if len(set(normalized_texts)) != development_text_count:
+        raise ValueError(
+            "Development manifest unique-text count mismatch: "
+            f"actual={len(set(normalized_texts))}, expected={development_text_count}"
+        )
+
+    payload_without_identity = {
+        "schema_name": DEVELOPMENT_VALIDATION_RUNTIME_SCHEMA,
+        "schema_version": 1,
+        "validation_only": True,
+        "partition": {
+            "digest": partition_digest,
+            "artifact_identity": artifact_identity,
+        },
+        "source_validation_manifest": {
+            "sha256": source_manifest_sha256,
+            "row_count": expected_validation_rows,
+        },
+        "development_manifest": {
+            "file": DEVELOPMENT_VALIDATION_MANIFEST,
+            "sha256": actual_development_sha256,
+            "row_count": expected_development_rows,
+            "unique_text_count": development_text_count,
+        },
+        "confirmation_counts": {
+            "row_count": expected_confirmation_rows,
+            "unique_text_count": confirmation_text_count,
+        },
+        "bank_id": expected_bank_id,
+        "retrieval_query_mode": "exact_name_indexed_full_val_table_subset_v1",
+        "holdout_access": "development_manifest_only_v1",
+    }
+    runtime_identity = hashlib.sha256(
+        json.dumps(
+            payload_without_identity, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    safe_payload = {
+        **payload_without_identity,
+        "runtime_identity": runtime_identity,
+    }
+    # These fields are the complete allowed partition evidence persisted into
+    # config/checkpoints. In particular there is no resolved full artifact,
+    # assignment list, confirmation text, or operational filesystem path.
+    partition_cfg["partition_digest"] = partition_digest
+    partition_cfg["partition_artifact_identity"] = artifact_identity
+    partition_cfg["development_row_count"] = expected_development_rows
+    partition_cfg["confirmation_row_count"] = expected_confirmation_rows
+    partition_cfg["confirmation_text_count"] = confirmation_text_count
+    partition_cfg["development_manifest_identity"] = dict(
+        safe_payload["development_manifest"]
+    )
+    partition_cfg["development_runtime_identity"] = {
+        "schema_name": DEVELOPMENT_VALIDATION_RUNTIME_SCHEMA,
+        "schema_version": 1,
+        "digest": runtime_identity,
+    }
+    partition_cfg["retrieval_query_mode"] = safe_payload[
+        "retrieval_query_mode"
+    ]
+    partition_cfg["exact_seen_evaluated_during_training"] = False
+    partition_cfg["confirmation_evaluated_during_training"] = False
+    return DevelopmentValidationRuntime(
+        partition_dir=directory,
+        manifest_path=manifest_path,
+        normalized_texts=normalized_texts,
+        development_row_count=expected_development_rows,
+        development_text_count=development_text_count,
+        confirmation_row_count=expected_confirmation_rows,
+        confirmation_text_count=confirmation_text_count,
+        partition_digest=partition_digest,
+        artifact_payload=safe_payload,
+    )
+
+
+def isolated_development_validation_config(cfg, runtime):
+    """Return a loader-only config that points ``val`` at the attested dev file."""
+
+    if runtime is None:
+        return cfg
+    data_cfg = cfg.get("data", {})
+    split = str(data_cfg.get("val_split", "val"))
+    if split != "val":
+        raise ValueError("Isolated development validation requires data.val_split='val'")
+    if int(data_cfg.get("limit_val", 0) or 0) != 0:
+        raise ValueError(
+            "Isolated development validation forbids data.limit_val; use "
+            "eval.max_batches only for an explicit engineering smoke"
+        )
+    loader_cfg = copy.deepcopy(cfg)
+    loader_cfg.setdefault("data", {})["val_manifest_path"] = str(
+        runtime.manifest_path
+    )
+    return loader_cfg
+
+
+def bind_sentence_memory_validation_dataset(
+    cfg, sentence_memory_provider, dataset, runtime
+):
+    """Bind validation retrieval, using the canonical table by exact dev name."""
+
+    require_memory = any(
+        mode != "off" for mode in configured_sentence_memory_eval_modes(cfg)
+    )
+    if runtime is None:
+        return sentence_memory_provider.validate_query_dataset(
+            dataset, require_neighbors=require_memory
+        )
+    if not require_memory:
+        raise RuntimeError(
+            "Factorized paired validation unexpectedly has no active memory mode"
+        )
+    partition_cfg = cfg.get("validation_text_partition", {})
+    expected_bank_id = str(partition_cfg.get("expected_bank_id", ""))
+    actual_bank_id = str(sentence_memory_provider.identity.get("bank_id", ""))
+    if actual_bank_id != expected_bank_id:
+        raise RuntimeError(
+            "Development validation bank mismatch: "
+            f"actual={actual_bank_id!r}, expected={expected_bank_id!r}"
+        )
+    full_table_identity = (
+        sentence_memory_provider.identity.get("neighbor_tables", {}).get(
+            "val"
+        )
+    )
+    if not isinstance(full_table_identity, dict):
+        raise RuntimeError(
+            "Development validation requires the identity-bound canonical "
+            "neighbors_val table"
+        )
+    expected_full_manifest = str(
+        partition_cfg.get("expected_validation_manifest_sha256", "")
+    )
+    if str(full_table_identity.get("query_manifest_sha256", "")) != (
+        expected_full_manifest
+    ):
+        raise RuntimeError(
+            "Canonical validation neighbor table manifest mismatch: "
+            f"actual={full_table_identity.get('query_manifest_sha256')!r}, "
+            f"expected={expected_full_manifest!r}"
+        )
+    expected_full_rows = int(
+        partition_cfg.get("expected_validation_rows", -1)
+    )
+    if int(full_table_identity.get("query_count", -1)) != expected_full_rows:
+        raise RuntimeError(
+            "Canonical validation neighbor table row count mismatch: "
+            f"actual={full_table_identity.get('query_count')!r}, "
+            f"expected={expected_full_rows}"
+        )
+    sentence_memory_provider.set_dataset_with_name_indexed_neighbor_subset(
+        dataset,
+        parent_manifest_sha256=expected_full_manifest,
+        expected_subset_manifest_sha256=(
+            runtime.artifact_payload["development_manifest"]["sha256"]
+        ),
+    )
+    table = sentence_memory_provider.neighbor_table
+    if not isinstance(table, dict) or table.get("lookup_mode") != (
+        "exact_name_indexed_parent_subset_v1"
+    ):
+        raise RuntimeError(
+            "Development validation did not bind an exact name-indexed neighbor subset"
+        )
+    return {
+        "split": str(getattr(dataset, "split", "")),
+        "manifest_sha256": sentence_memory_provider._dataset_manifest_sha256,
+        "neighbor_table": table.get("path"),
+        "neighbor_lookup_mode": table["lookup_mode"],
+        "parent_query_manifest_sha256": table[
+            "parent_query_manifest_sha256"
+        ],
+        "parent_query_count": int(table["parent_query_count"]),
+    }
+
+
+def build_isolated_development_validation_loader(
+    cfg,
+    dataset,
+    loader,
+    sentence_memory_provider,
+    dist_info,
+    runtime,
+):
+    """Build cluster-equal validation directly over the attested dev manifest."""
+
+    if runtime is None:
+        raise ValueError("An isolated development runtime is required")
+    if len(dataset) != runtime.development_row_count:
+        raise RuntimeError(
+            "Loaded development dataset row count differs from its attestation: "
+            f"actual={len(dataset)}, expected={runtime.development_row_count}"
+        )
+    rows = list(dataset.base.items)
+    if len(rows) != runtime.development_row_count:
+        raise RuntimeError(
+            "Development dataset manifest row count differs from its attestation"
+        )
+    from NIAF.continuous_trajectory_field.sentence_memory import (
+        normalize_sentence_text,
+    )
+
+    normalized_texts = tuple(
+        normalize_sentence_text(row.get("text", "")) for row in rows
+    )
+    if normalized_texts != runtime.normalized_texts:
+        raise RuntimeError(
+            "Loaded development dataset differs from the attested manifest order"
+        )
+    seen_indices = [
+        index
+        for index, text in enumerate(normalized_texts)
+        if sentence_memory_provider.is_seen_text(text)
+    ]
+    if seen_indices:
+        raise RuntimeError(
+            "Development manifest contains an exact train-bank text: "
+            f"index={seen_indices[0]}"
+        )
+    table = sentence_memory_provider.neighbor_table
+    if not isinstance(table, dict) or table.get("lookup_mode") != (
+        "exact_name_indexed_parent_subset_v1"
+    ):
+        raise RuntimeError(
+            "Development loader requires the exact name-indexed canonical "
+            "neighbor subset"
+        )
+
+    num_workers = int(cfg.get("eval", {}).get("num_workers", 0))
+    loader_kwargs = {}
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(
+            cfg.get("train", {}).get("persistent_workers", True)
+        )
+        loader_kwargs["prefetch_factor"] = int(
+            cfg.get("train", {}).get("prefetch_factor", 2)
+        )
+    common_loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": bool(cfg.get("train", {}).get("pin_memory", True)),
+        "collate_fn": loader.collate_fn,
+        **loader_kwargs,
+    }
+    aggregation = configured_selection_aggregation(cfg)
+    from NIAF.continuous_trajectory_field.validation_text_partitions import (
+        NormalizedTextClusterBatchSampler,
+    )
+
+    if aggregation == CLUSTER_EQUAL_SELECTION_AGGREGATION:
+        sampler = NormalizedTextClusterBatchSampler(
+            normalized_texts,
+            num_replicas=int(dist_info.get("world_size", 1)),
+            rank=int(dist_info.get("rank", 0)),
+        )
+        development_loader = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            **common_loader_kwargs,
+        )
+        development_loader.evaluation_unit = "normalized_text_cluster"
+        development_loader.evaluation_unit_count = len(sampler)
+        development_loader.selection_aggregation = aggregation
+    else:
+        sampler = None
+        if dist_info.get("enabled", False):
+            sampler = ExactDistributedEvalSampler(
+                dataset.estimated_lengths,
+                num_replicas=int(dist_info.get("world_size", 1)),
+                rank=int(dist_info.get("rank", 0)),
+                sort_by_length=bool(
+                    cfg.get("train", {}).get("length_bucketed_batches", False)
+                ),
+            )
+        development_loader = DataLoader(
+            dataset,
+            batch_size=int(getattr(loader, "batch_size", 1) or 1),
+            shuffle=False,
+            sampler=sampler,
+            drop_last=False,
+            **common_loader_kwargs,
+        )
+    partition_cfg = cfg["validation_text_partition"]
+    partition_cfg["selection_aggregation_identity"] = (
+        sentence_memory_selection_aggregation_identity(cfg)
+    )
+    partition_cfg["evaluation_corruption_map_identity"] = (
+        sentence_memory_validation_corruption_map_identity(
+            cfg,
+            partition_digest=runtime.partition_digest,
+            bank_id=sentence_memory_provider.identity["bank_id"],
+        )
+    )
+    return development_loader, sampler, runtime
 
 
 class DatasetIndexView(Dataset):
@@ -1174,6 +2125,7 @@ def build_development_validation_loader(
     from NIAF.continuous_trajectory_field.validation_text_partitions import (
         DEVELOPMENT,
         EXACT_SEEN,
+        NormalizedTextClusterBatchSampler,
         partition_validation_text_clusters,
     )
 
@@ -1218,16 +2170,6 @@ def build_development_validation_loader(
         )
     subset = DatasetIndexView(dataset, development_indices)
     lengths = [dataset.estimated_lengths[index] for index in development_indices]
-    sampler = None
-    if dist_info.get("enabled", False):
-        sampler = ExactDistributedEvalSampler(
-            lengths,
-            num_replicas=int(dist_info.get("world_size", 1)),
-            rank=int(dist_info.get("rank", 0)),
-            sort_by_length=bool(
-                cfg.get("train", {}).get("length_bucketed_batches", False)
-            ),
-        )
     num_workers = int(cfg.get("eval", {}).get("num_workers", 0))
     loader_kwargs = {}
     if num_workers > 0:
@@ -1237,17 +2179,48 @@ def build_development_validation_loader(
         loader_kwargs["prefetch_factor"] = int(
             cfg.get("train", {}).get("prefetch_factor", 2)
         )
-    development_loader = DataLoader(
-        subset,
-        batch_size=int(getattr(loader, "batch_size", 1) or 1),
-        shuffle=False,
-        sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=bool(cfg.get("train", {}).get("pin_memory", True)),
-        collate_fn=loader.collate_fn,
-        drop_last=False,
+    common_loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": bool(cfg.get("train", {}).get("pin_memory", True)),
+        "collate_fn": loader.collate_fn,
         **loader_kwargs,
-    )
+    }
+    aggregation = configured_selection_aggregation(cfg)
+    if aggregation == CLUSTER_EQUAL_SELECTION_AGGREGATION:
+        sampler = NormalizedTextClusterBatchSampler(
+            [partition.normalized_texts[index] for index in development_indices],
+            num_replicas=int(dist_info.get("world_size", 1)),
+            rank=int(dist_info.get("rank", 0)),
+        )
+        development_loader = DataLoader(
+            subset,
+            batch_sampler=sampler,
+            **common_loader_kwargs,
+        )
+        # These explicit units keep distributed averaging and max_batches from
+        # accidentally falling back to signer-row counts.
+        development_loader.evaluation_unit = "normalized_text_cluster"
+        development_loader.evaluation_unit_count = len(sampler)
+        development_loader.selection_aggregation = aggregation
+    else:
+        sampler = None
+        if dist_info.get("enabled", False):
+            sampler = ExactDistributedEvalSampler(
+                lengths,
+                num_replicas=int(dist_info.get("world_size", 1)),
+                rank=int(dist_info.get("rank", 0)),
+                sort_by_length=bool(
+                    cfg.get("train", {}).get("length_bucketed_batches", False)
+                ),
+            )
+        development_loader = DataLoader(
+            subset,
+            batch_size=int(getattr(loader, "batch_size", 1) or 1),
+            shuffle=False,
+            sampler=sampler,
+            drop_last=False,
+            **common_loader_kwargs,
+        )
     partition_cfg["partition_digest"] = partition.partition_digest
     partition_cfg["resolved_artifact"] = partition.artifact_payload
     partition_cfg["development_row_count"] = len(development_indices)
@@ -1260,6 +2233,16 @@ def build_development_validation_loader(
     # per-epoch trainer never lets them affect selection or patience.
     partition_cfg["exact_seen_evaluated_during_training"] = False
     partition_cfg["confirmation_evaluated_during_training"] = False
+    partition_cfg["selection_aggregation_identity"] = (
+        sentence_memory_selection_aggregation_identity(cfg)
+    )
+    partition_cfg["evaluation_corruption_map_identity"] = (
+        sentence_memory_validation_corruption_map_identity(
+            cfg,
+            partition_digest=partition.partition_digest,
+            bank_id=actual_bank_id,
+        )
+    )
     return development_loader, sampler, partition
 
 
@@ -1701,11 +2684,12 @@ def _sentence_memory_availability(
     if not sentence_memory_enabled(cfg):
         return torch.zeros(int(batch_size), dtype=torch.bool, device=device)
     mode = str(mode).lower()
-    if mode in {"shuffled", "motion_shuffled"}:
+    if mode in {"shuffled", "motion_shuffled", "analytic_prior"}:
         return torch.ones(int(batch_size), dtype=torch.bool, device=device)
     if mode not in SENTENCE_MEMORY_TRAIN_MODES:
         allowed = sorted(
-            SENTENCE_MEMORY_TRAIN_MODES | {"shuffled", "motion_shuffled"}
+            SENTENCE_MEMORY_TRAIN_MODES
+            | {"shuffled", "motion_shuffled", "analytic_prior"}
         )
         raise ValueError(
             f"sentence_memory_mode must be one of {allowed}, got {mode!r}"
@@ -1799,6 +2783,9 @@ def retrieve_sentence_memory(
     training,
     device,
     mode,
+    corruption_nonce=None,
+    corruption_seed=None,
+    corruption_condition=None,
 ):
     """Call either the key-based or token-based provider contract centrally."""
 
@@ -1814,6 +2801,9 @@ def retrieve_sentence_memory(
         "training": bool(training),
         "device": device,
         "mode": mode,
+        "corruption_nonce": corruption_nonce,
+        "corruption_seed": corruption_seed,
+        "corruption_condition": corruption_condition,
     }
     kwargs = {
         name: value for name, value in candidates.items() if name in parameters
@@ -2258,7 +3248,22 @@ def prepare_field_batch(
                     if resolved_sentence_mode == "shuffled"
                     else "on"
                 ),
+                **sentence_memory_evaluation_corruption_kwargs(
+                    cfg,
+                    training=training,
+                    condition=resolved_sentence_mode,
+                ),
             )
+            if not training and resolved_sentence_mode == "shuffled":
+                # Evaluation retrieves a fully shuffled candidate bundle for
+                # every available row.  Keep the diagnostic masks faithful to
+                # that control even though no training corruption branch runs.
+                sentence_memory_full_shuffle_mask = _sentence_memory_field(
+                    sentence_memory_batch, "available"
+                ).bool()
+                sentence_memory_shuffled_mask = (
+                    sentence_memory_full_shuffle_mask.clone()
+                )
             if resolved_sentence_mode == "motion_shuffled":
                 from NIAF.continuous_trajectory_field.sentence_memory import (
                     motion_only_shuffle_sentence_memory_batch,
@@ -2272,7 +3277,20 @@ def prepare_field_batch(
                     sentence_memory_batch,
                     query_ids=sentence_memory_query_ids(batch),
                     epoch=int(epoch),
-                    seed=int(cfg.get("seed", 1234)),
+                    seed=int(
+                        configured_evaluation_corruption(cfg)["seed"]
+                        if not training
+                        else cfg.get("seed", 1234)
+                    ),
+                    **{
+                        key: value
+                        for key, value in sentence_memory_evaluation_corruption_kwargs(
+                            cfg,
+                            training=training,
+                            condition=resolved_sentence_mode,
+                        ).items()
+                        if key != "corruption_seed"
+                    },
                 )
                 sentence_memory_motion_mask = (
                     _sentence_memory_field(sentence_memory_batch, "available").bool()
@@ -2365,6 +3383,10 @@ def prepare_field_batch(
             sentence_kwargs = sentence_memory_forward_kwargs(
                 sentence_memory_batch
             )
+            if resolved_sentence_mode == "analytic_prior":
+                sentence_kwargs["sentence_memory_attention_mode"] = (
+                    "analytic_prior"
+                )
             sentence_availability = sentence_kwargs[
                 "sentence_memory_available"
             ]
@@ -3950,12 +4972,32 @@ def evaluate(
 ):
     model.eval()
     average = ScalarAverager()
+    cluster_equal = (
+        getattr(loader, "evaluation_unit", None) == "normalized_text_cluster"
+    )
     progress = tqdm(loader, desc="val", leave=False, disable=not show_progress)
     for batch_index, batch in enumerate(progress):
         if max_batches and batch_index >= int(max_batches):
             break
         logical_size = len(batch["name"])
-        microbatch_size = validation_microbatch_size(batch, cfg)
+        if cluster_equal:
+            from NIAF.continuous_trajectory_field.sentence_memory import (
+                normalize_sentence_text,
+            )
+
+            normalized = {
+                normalize_sentence_text(value) for value in batch.get("text", ())
+            }
+            if len(normalized) != 1:
+                raise RuntimeError(
+                    "Cluster-equal loader batch must contain exactly one "
+                    "normalized validation text"
+                )
+        cluster_average = ScalarAverager() if cluster_equal else None
+        # A metric must first be formed independently for each signer row.
+        microbatch_size = (
+            1 if cluster_equal else validation_microbatch_size(batch, cfg)
+        )
         microbatch_count = (logical_size + microbatch_size - 1) // microbatch_size
         for microbatch_index, start in enumerate(
             range(0, logical_size, microbatch_size), start=1
@@ -3975,12 +5017,17 @@ def evaluate(
                 sentence_memory_provider=sentence_memory_provider,
                 sentence_memory_mode=sentence_memory_mode,
             )
-            average.update(metrics, n=end - start)
+            if cluster_equal:
+                cluster_average.update(metrics, n=1)
+            else:
+                average.update(metrics, n=end - start)
             if show_progress:
                 progress.set_postfix(
                     logical=f"{batch_index + 1}/{len(loader)}",
                     micro=f"{microbatch_index}/{microbatch_count}",
                 )
+        if cluster_equal:
+            average.update(cluster_average.mean(), n=1)
         if (
             bool(cfg.get("eval", {}).get("empty_cache_between_batches", True))
             and torch.device(device).type == "cuda"
@@ -4036,6 +5083,31 @@ def paired_sentence_memory_usage_moments(
     return moments
 
 
+def cluster_mean_paired_usage_moments(row_moments):
+    """Average row-level per-element MSEs within one normalized text."""
+
+    rows = list(row_moments)
+    if not rows:
+        return {}
+    output = {}
+    for part_name in _PAIRED_USAGE_PART_SLICES:
+        for label in ("motion", "off"):
+            sum_name = f"{part_name}/{label}_square_sum"
+            count_name = f"{part_name}/{label}_element_count"
+            values = []
+            for row in rows:
+                count = float(row.get(count_name, 0.0))
+                if count > 0.0:
+                    values.append(float(row[sum_name]) / count)
+            if values:
+                # Downstream distributed reduction treats each normalized text
+                # as one additive observation.  The historical field names are
+                # retained to keep the external metric schema compatible.
+                output[sum_name] = float(sum(values) / len(values))
+                output[count_name] = 1.0
+    return output
+
+
 @torch.no_grad()
 def evaluate_paired_sentence_memory_modes(
     model,
@@ -4067,6 +5139,7 @@ def evaluate_paired_sentence_memory_modes(
         "on": "sentence_memory",
         "shuffled": "shuffled_sentence_memory",
         "motion_shuffled": "motion_shuffled_sentence_memory",
+        "analytic_prior": "analytic_prior_sentence_memory",
     }
     fixed_word_mode = str(
         cfg.get("eval", {}).get("sentence_memory_word_prior_mode", "off")
@@ -4075,13 +5148,47 @@ def evaluate_paired_sentence_memory_modes(
         raise ValueError("Paired corruption validation requires the word prior off")
     model.eval()
     averages = {mode: ScalarAverager() for mode in modes}
+    cluster_equal = (
+        getattr(loader, "evaluation_unit", None) == "normalized_text_cluster"
+    )
+    configured_cluster_equal = (
+        configured_selection_aggregation(cfg)
+        == CLUSTER_EQUAL_SELECTION_AGGREGATION
+    )
+    if cluster_equal != configured_cluster_equal:
+        raise RuntimeError(
+            "Paired validation loader does not match selection.aggregation: "
+            f"loader_cluster_equal={cluster_equal}, "
+            f"configured_cluster_equal={configured_cluster_equal}"
+        )
     raw_moments = {}
     progress = tqdm(loader, desc="val", leave=False, disable=not show_progress)
     for batch_index, batch in enumerate(progress):
         if max_batches and batch_index >= int(max_batches):
             break
         logical_size = len(batch["name"])
-        microbatch_size = validation_microbatch_size(batch, cfg)
+        if cluster_equal:
+            from NIAF.continuous_trajectory_field.sentence_memory import (
+                normalize_sentence_text,
+            )
+
+            normalized = {
+                normalize_sentence_text(value) for value in batch.get("text", ())
+            }
+            if len(normalized) != 1:
+                raise RuntimeError(
+                    "Cluster-equal loader batch must contain exactly one "
+                    "normalized validation text"
+                )
+        cluster_averages = (
+            {mode: ScalarAverager() for mode in modes}
+            if cluster_equal
+            else None
+        )
+        cluster_row_moments = []
+        microbatch_size = (
+            1 if cluster_equal else validation_microbatch_size(batch, cfg)
+        )
         microbatch_count = (logical_size + microbatch_size - 1) // microbatch_size
         for microbatch_index, start in enumerate(
             range(0, logical_size, microbatch_size), start=1
@@ -4106,7 +5213,10 @@ def evaluate_paired_sentence_memory_modes(
                     sentence_memory_mode=mode,
                     return_prepared=True,
                 )
-                averages[mode].update(metrics, n=end - start)
+                if cluster_equal:
+                    cluster_averages[mode].update(metrics, n=1)
+                else:
+                    averages[mode].update(metrics, n=end - start)
                 if mode in {"off", "on", "motion_shuffled"}:
                     predictions[mode] = prepared["outputs"]["prediction"].detach()
                     if mode == "motion_shuffled":
@@ -4125,13 +5235,23 @@ def evaluate_paired_sentence_memory_modes(
                 predictions["off"],
                 moved_mask,
             )
-            for name, value in moments.items():
-                raw_moments[name] = raw_moments.get(name, 0.0) + value
+            if cluster_equal:
+                cluster_row_moments.append(moments)
+            else:
+                for name, value in moments.items():
+                    raw_moments[name] = raw_moments.get(name, 0.0) + value
             if show_progress:
                 progress.set_postfix(
                     logical=f"{batch_index + 1}/{len(loader)}",
                     micro=f"{microbatch_index}/{microbatch_count}",
                 )
+        if cluster_equal:
+            for mode in modes:
+                averages[mode].update(cluster_averages[mode].mean(), n=1)
+            for name, value in cluster_mean_paired_usage_moments(
+                cluster_row_moments
+            ).items():
+                raw_moments[name] = raw_moments.get(name, 0.0) + value
         if (
             bool(cfg.get("eval", {}).get("empty_cache_between_batches", True))
             and torch.device(device).type == "cuda"
@@ -4165,11 +5285,21 @@ def distributed_validation_metrics(values, local_sample_count, device, dist_info
     ordinary = distributed_sample_weighted_mean_scalars(
         ordinary, local_sample_count, device, dist_info
     )
-    if not raw:
+    if dist_info.get("enabled", False):
+        world_size = int(dist_info.get("world_size") or dist.get_world_size())
+        rank_raw_names = [None] * world_size
+        dist.all_gather_object(rank_raw_names, sorted(raw))
+        raw_names = sorted(
+            {name for names_on_rank in rank_raw_names for name in names_on_rank}
+        )
+    else:
+        raw_names = sorted(raw)
+    if not raw_names:
         return ordinary
-    raw_names = sorted(raw)
     additive = torch.tensor(
-        [raw[name] for name in raw_names], dtype=torch.float64, device=device
+        [raw.get(name, 0.0) for name in raw_names],
+        dtype=torch.float64,
+        device=device,
     )
     if dist_info.get("enabled", False):
         dist.all_reduce(additive, op=dist.ReduceOp.SUM)
@@ -4252,6 +5382,7 @@ def evaluate_configured_modes(
             "on": "sentence_memory",
             "shuffled": "shuffled_sentence_memory",
             "motion_shuffled": "motion_shuffled_sentence_memory",
+            "analytic_prior": "analytic_prior_sentence_memory",
         }
         # v3 keeps the v2 word-prior branch. Phase A fixes it off, while this
         # explicit setting leaves future word+sentence experiments possible.
@@ -5325,8 +6456,7 @@ def save_checkpoint(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     model_type, contract_version = checkpoint_contract(cfg)
-    torch.save(
-        {
+    payload = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "epoch": int(epoch),
@@ -5356,15 +6486,148 @@ def save_checkpoint(
                 if is_sentence_memory_model(cfg)
                 else None
             ),
+            "sentence_memory_architecture_identity": (
+                sentence_memory_architecture_identity(cfg)
+                if is_sentence_memory_model(cfg)
+                else None
+            ),
+            "sentence_memory_evaluation_control_identity": (
+                sentence_memory_evaluation_control_identity(cfg)
+                if is_sentence_memory_model(cfg)
+                else None
+            ),
+            "sentence_memory_selection_aggregation_identity": (
+                sentence_memory_selection_aggregation_identity(cfg)
+                if is_sentence_memory_model(cfg)
+                else None
+            ),
+            "sentence_memory_validation_corruption_map_identity": (
+                cfg.get("validation_text_partition", {}).get(
+                    "evaluation_corruption_map_identity"
+                )
+                if is_sentence_memory_model(cfg)
+                else None
+            ),
             "v2_to_v3_text_only_parity": cfg.get(
                 "sentence_memory_safety", {}
             ).get("v2_to_v3_text_only_parity"),
             "phase_b_scientific_gate": cfg.get(
                 "sentence_memory_safety", {}
             ).get("phase_b", {}).get("resolved_scientific_gate"),
-        },
-        path,
-    )
+        }
+
+    # ``last.pt`` is the sole exact-continuation boundary for an interrupted
+    # epoch. Never truncate the previous valid checkpoint in place: serialize
+    # beside it, durably flush when the filesystem supports that operation, and
+    # publish with one atomic replacement.
+    temporary_path = None
+    descriptor = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = None
+            torch.save(payload, handle)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError as error:
+                unsupported = {
+                    errno.EINVAL,
+                    getattr(errno, "ENOTSUP", errno.EINVAL),
+                    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+                }
+                if error.errno not in unsupported:
+                    raise
+        os.replace(temporary_path, path)
+        temporary_path = None
+        try:
+            directory_descriptor = os.open(
+                path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+        except OSError:
+            directory_descriptor = None
+        if directory_descriptor is not None:
+            try:
+                try:
+                    os.fsync(directory_descriptor)
+                except OSError as error:
+                    unsupported = {
+                        errno.EINVAL,
+                        getattr(errno, "ENOTSUP", errno.EINVAL),
+                        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+                    }
+                    if error.errno not in unsupported:
+                        raise
+            finally:
+                os.close(directory_descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def write_json_atomic(path, payload):
+    """Durably publish JSON without truncating an existing valid target."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    temporary_path = None
+    descriptor = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            handle.write(serialized)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError as error:
+                unsupported = {
+                    errno.EINVAL,
+                    getattr(errno, "ENOTSUP", errno.EINVAL),
+                    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+                }
+                if error.errno not in unsupported:
+                    raise
+        os.replace(temporary_path, path)
+        temporary_path = None
+        try:
+            directory_descriptor = os.open(
+                path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+        except OSError:
+            directory_descriptor = None
+        if directory_descriptor is not None:
+            try:
+                try:
+                    os.fsync(directory_descriptor)
+                except OSError as error:
+                    unsupported = {
+                        errno.EINVAL,
+                        getattr(errno, "ENOTSUP", errno.EINVAL),
+                        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+                    }
+                    if error.errno not in unsupported:
+                        raise
+            finally:
+                os.close(directory_descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def init_wandb(args, cfg, dist_info, out_dir, start_epoch=1, initial_global_step=0):
@@ -5443,6 +6706,9 @@ def main():
         cfg.setdefault("sentence_memory", {})[
             "resolved_behavior_identity"
         ] = sentence_memory_behavior_identity(cfg)
+    isolated_validation_runtime = load_isolated_development_validation_runtime(
+        cfg
+    )
     if args.warm_start is not None and configured_model_type(cfg) == DUAL_MODE_MODEL_TYPE:
         raise ValueError(
             "Dual-mode v2 must be trained from scratch and does not accept "
@@ -5469,8 +6735,11 @@ def main():
         distributed=dist_info["enabled"],
         world_size=dist_info["world_size"],
     )
+    validation_loader_cfg = isolated_development_validation_config(
+        cfg, isolated_validation_runtime
+    )
     val_dataset, val_loader, val_sampler = make_loader(
-        cfg,
+        validation_loader_cfg,
         data_cfg.get("val_split", "val"),
         limit=data_cfg.get("limit_val", 0),
         shuffle=False,
@@ -5510,12 +6779,11 @@ def main():
                 configured_sentence_memory_train_mode(cfg) != "off"
             ),
         )
-        sentence_memory_provider.validate_query_dataset(
+        bind_sentence_memory_validation_dataset(
+            cfg,
+            sentence_memory_provider,
             val_dataset,
-            require_neighbors=any(
-                mode != "off"
-                for mode in configured_sentence_memory_eval_modes(cfg)
-            ),
+            isolated_validation_runtime,
         )
         rank_zero_print(
             dist_info,
@@ -5546,21 +6814,47 @@ def main():
         }
     validation_text_partition = None
     if paired_sentence_memory_corruption_config(cfg)["enabled"]:
-        val_loader, val_sampler, validation_text_partition = (
-            build_development_validation_loader(
-                cfg,
-                val_dataset,
-                val_loader,
-                sentence_memory_provider,
-                dist_info,
+        if isolated_validation_runtime is not None:
+            val_loader, val_sampler, validation_text_partition = (
+                build_isolated_development_validation_loader(
+                    cfg,
+                    val_dataset,
+                    val_loader,
+                    sentence_memory_provider,
+                    dist_info,
+                    isolated_validation_runtime,
+                )
             )
-        )
+        else:
+            val_loader, val_sampler, validation_text_partition = (
+                build_development_validation_loader(
+                    cfg,
+                    val_dataset,
+                    val_loader,
+                    sentence_memory_provider,
+                    dist_info,
+                )
+            )
+        if isinstance(validation_text_partition, DevelopmentValidationRuntime):
+            development_text_count = (
+                validation_text_partition.development_text_count
+            )
+            confirmation_text_count = (
+                validation_text_partition.confirmation_text_count
+            )
+        else:
+            development_text_count = len(
+                validation_text_partition.development_texts
+            )
+            confirmation_text_count = len(
+                validation_text_partition.confirmation_texts
+            )
         rank_zero_print(
             dist_info,
             "Validation text partition: "
             f"digest={validation_text_partition.partition_digest} "
-            f"development_texts={len(validation_text_partition.development_texts)} "
-            f"confirmation_texts={len(validation_text_partition.confirmation_texts)} "
+            f"development_texts={development_text_count} "
+            f"confirmation_texts={confirmation_text_count} "
             "training_evaluates=development_only",
         )
         if dist_info["is_main"]:
@@ -5648,6 +6942,18 @@ def main():
                 checkpoint, cfg, source=str(args.resume)
             )
             validate_sentence_memory_objective_identity(
+                checkpoint, cfg, source=str(args.resume)
+            )
+            validate_sentence_memory_architecture_identity(
+                checkpoint, cfg, source=str(args.resume)
+            )
+            validate_sentence_memory_evaluation_control_identity(
+                checkpoint, cfg, source=str(args.resume)
+            )
+            validate_sentence_memory_selection_aggregation_identity(
+                checkpoint, cfg, source=str(args.resume)
+            )
+            validate_sentence_memory_validation_corruption_map_identity(
                 checkpoint, cfg, source=str(args.resume)
             )
         validate_sentence_memory_checkpoint_identity(
@@ -5941,12 +7247,11 @@ def main():
                         wandb_validation_pending_payload(epoch, global_step)
                     )
             if sentence_memory_provider is not None:
-                sentence_memory_provider.validate_query_dataset(
+                bind_sentence_memory_validation_dataset(
+                    cfg,
+                    sentence_memory_provider,
                     val_dataset,
-                    require_neighbors=any(
-                        mode != "off"
-                        for mode in configured_sentence_memory_eval_modes(cfg)
-                    ),
+                    isolated_validation_runtime,
                 )
             val_metrics = evaluate_configured_modes(
                 unwrap_model(model),
@@ -5971,6 +7276,25 @@ def main():
                 dist_info,
             )
             row.update({f"val_{key}": value for key, value in val_metrics.items()})
+            if is_sentence_memory_model(cfg):
+                row["sentence_memory_evaluation_control_digest"] = (
+                    sentence_memory_evaluation_control_identity(cfg)["digest"]
+                )
+                row["sentence_memory_selection_aggregation_digest"] = (
+                    sentence_memory_selection_aggregation_identity(cfg)["digest"]
+                )
+                row["sentence_memory_architecture_digest"] = (
+                    sentence_memory_architecture_identity(cfg)["digest"]
+                )
+                corruption_map = (
+                    cfg.get("validation_text_partition", {}).get(
+                        "evaluation_corruption_map_identity"
+                    )
+                )
+                if isinstance(corruption_map, dict):
+                    row["validation_corruption_map_digest"] = corruption_map[
+                        "digest"
+                    ]
             row["validation_pending"] = 0.0
             (
                 score,
@@ -6136,10 +7460,7 @@ def main():
             ),
             "early_stopping": copy.deepcopy(early_stopping_state),
         }
-        (out_dir / "selection_summary.json").write_text(
-            json.dumps(selection_summary, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        write_json_atomic(out_dir / "selection_summary.json", selection_summary)
     barrier(dist_info)
     if wandb_run is not None:
         wandb_run.finish()

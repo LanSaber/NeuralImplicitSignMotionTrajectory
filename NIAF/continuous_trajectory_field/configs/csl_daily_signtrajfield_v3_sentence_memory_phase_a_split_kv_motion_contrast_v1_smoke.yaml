@@ -1,0 +1,16 @@
+_base_: csl_daily_signtrajfield_v3_sentence_memory_phase_a_split_kv_motion_contrast_v1.yaml
+
+# Engineering-only one-optimizer-step smoke. It cannot authorize Stage 2 or
+# confirmation and cannot produce a promotable checkpoint.
+experiment_name: csl_daily_signtrajfield_v3_sentence_memory_phase_a_split_kv_motion_contrast_v1_smoke
+
+train:
+  epochs: 1
+  early_stopping_patience: 0
+  early_stopping_min_epochs: 1
+
+selection:
+  require_feasible: false
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_split_kv_motion_contrast_v1_smoke

@@ -21,6 +21,59 @@ EXACT_SEEN = "exact_seen"
 LABELS = (DEVELOPMENT, CONFIRMATION, EXACT_SEEN)
 
 
+class NormalizedTextClusterBatchSampler:
+    """Assign complete normalized-text clusters to ranks without padding.
+
+    The sampler emits one logical text cluster per loader batch.  Cluster
+    ownership is a stable round-robin partition of the SHA256 text order, so a
+    repeated signer realization can never migrate to another rank and no row
+    is duplicated to equalize shard sizes.  ``set_epoch`` is intentionally a
+    no-op: validation order and ownership are checkpoint-independent.
+    """
+
+    def __init__(
+        self,
+        normalized_texts: Sequence[str],
+        *,
+        num_replicas: int = 1,
+        rank: int = 0,
+    ) -> None:
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        if self.num_replicas <= 0:
+            raise ValueError("num_replicas must be positive")
+        if not 0 <= self.rank < self.num_replicas:
+            raise ValueError(
+                f"rank must be in [0, {self.num_replicas}), got {self.rank}"
+            )
+
+        clusters: dict[str, list[int]] = {}
+        for row_index, text in enumerate(normalized_texts):
+            normalized = normalize_sentence_text(text)
+            if not normalized:
+                raise ValueError(
+                    "Cluster-equal validation requires non-empty normalized text"
+                )
+            clusters.setdefault(normalized, []).append(int(row_index))
+        ordered_texts = sorted(clusters, key=validation_text_order_key)
+        owned_texts = ordered_texts[self.rank :: self.num_replicas]
+        self._batches = tuple(tuple(clusters[text]) for text in owned_texts)
+        self.cluster_texts = tuple(owned_texts)
+        self.row_count = sum(len(batch) for batch in self._batches)
+        self.epoch = 0
+
+    def __iter__(self):
+        return iter(self._batches)
+
+    def __len__(self) -> int:
+        return len(self._batches)
+
+    def set_epoch(self, epoch: int) -> None:
+        # DataLoader/trainer compatibility only.  Scientific validation maps
+        # and ordering must not depend on the training epoch.
+        self.epoch = int(epoch)
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(
         value,

@@ -1365,6 +1365,11 @@ def _gloo_paired_corruption_single_forward_worker(rank, world_size, init_file):
         timeout=timedelta(seconds=60),
     )
     try:
+        from NIAF.continuous_trajectory_field.models.sentence_memory_trajectory_hypernetwork import (
+            FACTORIZED_SENTENCE_KEY_VALUE_MODE,
+            SentenceMemorySlotEncoder,
+        )
+
         class PairedModule(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1372,15 +1377,55 @@ def _gloo_paired_corruption_single_forward_worker(rank, world_size, init_file):
                 self.base = torch.nn.Parameter(
                     torch.tensor(0.25), requires_grad=False
                 )
+                self.text_projection = torch.nn.Linear(3, 8, bias=False)
+                self.text_projection.requires_grad_(False)
+                self.sentence_memory_encoder = SentenceMemorySlotEncoder(
+                    motion_dim=4,
+                    key_dim=3,
+                    hidden_dim=8,
+                    layer_count=1,
+                    head_count=2,
+                    dropout=0.0,
+                    score_temperature=0.10,
+                    duration_weight=0.05,
+                    retrieval_prior_scale=1.0,
+                    key_value_mode=FACTORIZED_SENTENCE_KEY_VALUE_MODE,
+                    temporal_prior_mode="none",
+                    temporal_prior_sigma=0.25,
+                    temporal_prior_scale=1.0,
+                )
                 self.forward_calls = 0
 
             def forward(self, text_tokens, query_times, **kwargs):
                 self.forward_calls += 1
-                evidence = kwargs["sentence_motion_tokens"].mean(
-                    dim=(1, 2, 3)
+                text_slots = self.text_projection(text_tokens.mean(dim=1))
+                text_slots = text_slots[:, None].expand(-1, 2, -1)
+                evidence = self.sentence_memory_encoder(
+                    text_slots=text_slots,
+                    query_duration=torch.ones(
+                        text_tokens.shape[0],
+                        dtype=text_tokens.dtype,
+                        device=text_tokens.device,
+                    ),
+                    motion_tokens=kwargs["sentence_motion_tokens"],
+                    motion_mask=kwargs["sentence_motion_mask"],
+                    text_keys=kwargs["sentence_text_keys"],
+                    scores=kwargs["sentence_scores"],
+                    durations=kwargs["sentence_durations"],
+                    candidate_mask=kwargs["sentence_candidate_mask"],
+                    motion_tau=kwargs["sentence_motion_tau"],
+                    part_validity=kwargs["sentence_part_validity"],
+                    slot_tau=torch.linspace(
+                        -1.0,
+                        1.0,
+                        2,
+                        dtype=text_tokens.dtype,
+                        device=text_tokens.device,
+                    ),
                 )
+                signal = evidence["slots"].mean(dim=(1, 2, 3))
                 prediction = (
-                    self.base + self.scale * evidence[:, None, None]
+                    self.base + self.scale * signal[:, None, None]
                 ).expand(-1, query_times.shape[1], 256)
                 return {"prediction": prediction}
 
@@ -1389,10 +1434,16 @@ def _gloo_paired_corruption_single_forward_worker(rank, world_size, init_file):
         optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
         token_value = float(rank + 1)
         frozen_before = module.base.detach().clone()
+        frozen_text_before = module.text_projection.weight.detach().clone()
 
         def branch(value):
+            motion_value = torch.tensor(
+                [value, value**2, -0.3 * value, 0.5], dtype=torch.float32
+            )
             return {
-                "sentence_motion_tokens": torch.full((1, 2, 2, 2), value),
+                "sentence_motion_tokens": motion_value.view(1, 1, 1, 4).expand(
+                    1, 2, 2, 4
+                ).clone(),
                 "sentence_motion_mask": torch.ones(1, 2, 2, dtype=torch.bool),
                 "sentence_motion_tau": torch.zeros(1, 2, 2),
                 "sentence_text_keys": torch.ones(1, 2, 3),
@@ -1483,22 +1534,39 @@ def _gloo_paired_corruption_single_forward_worker(rank, world_size, init_file):
         dist.all_gather(gathered_counts, local_counts)
         assert gathered_counts[0][0] == 1 and gathered_counts[0][1] == 0
         assert gathered_counts[1][0] == 0 and gathered_counts[1][1] == 1
-        # With B=1 and all four parts selected, the fixed Bx4 reduction is
-        # exactly the per-element Smooth-L1 value (|delta|-beta/2).
-        assert float(gathered_counts[0][2]) == pytest.approx(1.2)
+        assert torch.isfinite(gathered_counts[0][2])
+        assert float(gathered_counts[0][2]) > 0.0
         assert gathered_counts[0][3] == 0
         assert gathered_counts[1][2] == 0
-        assert float(gathered_counts[1][3]) == pytest.approx(1.7)
+        assert torch.isfinite(gathered_counts[1][3])
+        assert float(gathered_counts[1][3]) > 0.0
         sum(losses.values()).backward()
         assert module.forward_calls == 1
         assert module.scale.grad is not None
         assert torch.isfinite(module.scale.grad)
         assert module.base.grad is None
+        assert module.text_projection.weight.grad is None
+        assert all(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter in module.sentence_memory_encoder.parameters()
+        )
         optimizer.step()
         assert torch.equal(module.base.detach(), frozen_before)
+        assert torch.equal(
+            module.text_projection.weight.detach(), frozen_text_before
+        )
         gathered = [torch.empty_like(module.scale) for _ in range(world_size)]
         dist.all_gather(gathered, module.scale.detach())
         assert all(torch.equal(module.scale.detach(), value) for value in gathered)
+        encoder_parameter = next(module.sentence_memory_encoder.parameters())
+        gathered_encoder = [
+            torch.empty_like(encoder_parameter) for _ in range(world_size)
+        ]
+        dist.all_gather(gathered_encoder, encoder_parameter.detach())
+        assert all(
+            torch.equal(encoder_parameter.detach(), value)
+            for value in gathered_encoder
+        )
         dist.barrier()
     finally:
         dist.destroy_process_group()
@@ -1508,7 +1576,7 @@ def _gloo_paired_corruption_single_forward_worker(rank, world_size, init_file):
     not dist.is_available() or not dist.is_gloo_available(),
     reason="PyTorch Gloo distributed backend is unavailable",
 )
-def test_two_rank_gloo_paired_corruption_uses_one_ddp_forward(tmp_path):
+def test_two_rank_gloo_factorized_paired_corruption_uses_one_ddp_forward(tmp_path):
     init_file = (tmp_path / "paired_corruption_gloo_init").resolve()
     mp.spawn(
         _gloo_paired_corruption_single_forward_worker,

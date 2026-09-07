@@ -1,0 +1,37 @@
+_base_: csl_daily_signtrajfield_v3_sentence_memory_phase_a_split_kv_motion_contrast_v1.yaml
+
+# Stage 2 is authorized only when Stage 1 is integrity-valid but scientifically
+# infeasible. Its launcher always imports the same frozen v2 checkpoint afresh;
+# this YAML inheritance shares settings, never weights or optimizer state.
+experiment_name: csl_daily_signtrajfield_v3_sentence_memory_phase_a_split_kv_temporal_bias_motion_contrast_v1
+
+sentence_memory:
+  key_value_mode: factorized_metadata_motion_v1
+  temporal_prior_mode: gaussian
+  temporal_prior_sigma: 0.25
+  temporal_prior_scale: 1.0
+
+validation_text_partition:
+  expected_development_manifest_sha256: 9a0fc32fad9bfc8168af31086a0bd8ac08cc7821e987578d51d3bd10bf70651f
+
+# Repeat the scientific controls explicitly so Stage 2 remains auditable even
+# without resolving YAML inheritance.
+eval:
+  sentence_memory_word_prior_mode: "off"
+  sentence_memory_modes:
+    - "off"
+    - "on"
+    - "motion_shuffled"
+    - "shuffled"
+    - "analytic_prior"
+  export_sentence_memory_mode: "on"
+  evaluation_corruption:
+    mode: fixed_query_condition_v1
+    seed: 1234
+    nonce: csl_daily_validation_corruption_v1
+
+selection:
+  aggregation: normalized_text_cluster_equal_v1
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_split_kv_temporal_bias_motion_contrast_v1

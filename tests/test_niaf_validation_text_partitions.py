@@ -8,6 +8,7 @@ from NIAF.continuous_trajectory_field.validation_text_partitions import (
     CONFIRMATION,
     DEVELOPMENT,
     EXACT_SEEN,
+    NormalizedTextClusterBatchSampler,
     partition_validation_text_clusters,
 )
 
@@ -87,3 +88,27 @@ def test_validation_partition_rejects_wrong_novel_population():
             development_text_count=1,
             expected_novel_text_count=796,
         )
+
+
+def test_cluster_batch_sampler_keeps_clusters_whole_without_rank_padding():
+    texts = ["Alpha", "beta", " alpha ", "gamma", "BETA", "delta"]
+    rank_batches = []
+    rank_texts = []
+    for rank in range(3):
+        sampler = NormalizedTextClusterBatchSampler(
+            texts, num_replicas=3, rank=rank
+        )
+        first = list(sampler)
+        sampler.set_epoch(99)
+        assert list(sampler) == first
+        rank_batches.extend(first)
+        rank_texts.extend(sampler.cluster_texts)
+        for batch in first:
+            assert len({texts[index].strip().casefold() for index in batch}) == 1
+
+    assert sorted(index for batch in rank_batches for index in batch) == list(
+        range(len(texts))
+    )
+    assert len(rank_texts) == len(set(rank_texts)) == 4
+    # No DistributedSampler-style padding: there are exactly four batches.
+    assert len(rank_batches) == 4

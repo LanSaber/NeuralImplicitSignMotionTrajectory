@@ -1,14 +1,17 @@
 """Diagnose temporal-slot organization and sentence-memory use on CSL-Daily.
 
-This entry point exposes two explicit, provenance-checked profiles: the
+This entry point exposes explicit, provenance-checked profiles: the
 completed epoch-2 duration-weight-0.05 Phase-A experiment, and the locked
-``best.pt`` selected by the full Phase-A' motion-contrast run.  It is a
+``best.pt`` selected by the full Phase-A' motion-contrast run, plus the first
+development-feasible Stage 1 or Stage 2 Phase-A'' factorized-memory run.  It is a
 read-only validation audit: it never updates weights, never reads the test
 split, and never initializes W&B.
 
 The command has two independently promoted stages.  ``smoke`` exercises the
-full pipeline on eight validation examples; ``full`` audits all validation rows
-and runs the causal intervention sweep on a deterministic 128-text subset.
+full pipeline on eight validation examples; ``full`` audits all rows permitted
+by its profile (factorized profiles are strictly limited to the 347 development
+signer rows) and runs the causal intervention sweep on a deterministic 128-text
+subset.
 Interrupted passive batches and causal queries resume from identity-bound NPY
 memmaps and atomic progress shards.  A ``READY`` marker is written only after
 inference, causal probes, artifact validation, plots, and the report all
@@ -77,11 +80,16 @@ from NIAF.continuous_trajectory_field.sentence_memory import (
 from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field import (
     build_sentence_memory_provider,
     retrieve_sentence_memory,
+    sentence_memory_architecture_identity,
     sentence_memory_behavior_identity,
+    sentence_memory_evaluation_control_identity,
+    sentence_memory_evaluation_corruption_kwargs,
     sentence_memory_forward_kwargs,
     sentence_memory_objective_identity,
     sentence_memory_query_ids,
     sentence_memory_resume_identity,
+    sentence_memory_selection_aggregation_identity,
+    sentence_memory_validation_corruption_map_identity,
     set_seed,
     set_sentence_memory_provider_epoch_from_checkpoint,
     validate_checkpoint_contract,
@@ -129,6 +137,21 @@ EXPECTED_VALIDATION_ROWS = 1_077
 EXPECTED_DURATION_WEIGHT = 0.05
 EXPECTED_SCORE_TEMPERATURE = 0.10
 EXPECTED_K = 8
+EXPECTED_FACTORIZED_BANK_ID = (
+    "a65661333c0f60aa65dc68d896f439a698e37832f04bb8834a378a2d5f068bcd"
+)
+EXPECTED_FACTORIZED_NEIGHBOR_SHA256 = {
+    "train": "d61c0271e190c41d20e822dd4d4f6a2690daa5bfbcd62ef45b58a767377d3852",
+    "val": "b5f5d0914e55ba9e9c79963bacb955b97d62f99f16f117381187e72c345eb199",
+}
+EXPECTED_FACTORIZED_PARTITION_DIGEST = (
+    "80f9f5e9fe8414d66730ff0f19bd95fa9f8156922b7cd6f14f27b182cae7d74e"
+)
+EXPECTED_DEVELOPMENT_ROWS = 347
+EXPECTED_DEVELOPMENT_TEXTS = 256
+FACTORIZED_DEVELOPMENT_LOOKUP_MODE = (
+    "exact_name_indexed_parent_subset_v1"
+)
 EXPECTED_DATA_DIR = Path(
     "/media/cvpr/haomian/data/SOKE_FLOW/csl_daily_upper_smplx"
 )
@@ -138,6 +161,12 @@ EXPECTED_VALIDATION_MANIFEST_SHA256 = (
 )
 PART_NAMES = ("body", "left_hand", "right_hand", "face")
 MEMORY_CONDITIONS = ("correct", "shuffled", "motion_only_shuffle")
+FACTORIZED_MEMORY_CONDITIONS = (
+    "correct",
+    "motion_only_shuffle",
+    "shuffled",
+    "analytic_prior",
+)
 INTERVENTION_STAGES = ("planner", "fused")
 BRANCH_NAMES = ("coarse", "global", "local")
 
@@ -178,6 +207,19 @@ PHASE_A_PRIME_CHECKPOINT = PHASE_A_PRIME_RUN_DIR / "checkpoints/best.pt"
 PHASE_A_PRIME_OUTPUT = (
     PHASE_A_PRIME_RUN_DIR / "evaluation/locked_validation_slot_diagnostics"
 )
+FACTORIZED_STAGE_EXPERIMENTS = {
+    "stage1": (
+        "csl_daily_signtrajfield_v3_sentence_memory_phase_a_split_kv_motion_contrast_v1"
+    ),
+    "stage2": (
+        "csl_daily_signtrajfield_v3_sentence_memory_phase_a_split_kv_temporal_bias_motion_contrast_v1"
+    ),
+}
+FACTORIZED_STAGE_TEMPORAL_PRIORS = {"stage1": "none", "stage2": "gaussian"}
+FACTORIZED_PROFILE_NAMES = {
+    "stage1": "factorized_stage1_v1",
+    "stage2": "factorized_stage2_v1",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -190,6 +232,16 @@ class DiagnosticProfile:
     fixed_checkpoint_sha256: str | None = None
     fixed_epoch: int | None = None
     require_locked_full_run: bool = False
+    factorized_stage: str | None = None
+    development_only: bool = False
+
+    @property
+    def memory_conditions(self) -> tuple[str, ...]:
+        return (
+            FACTORIZED_MEMORY_CONDITIONS
+            if self.factorized_stage is not None
+            else MEMORY_CONDITIONS
+        )
 
 
 DIAGNOSTIC_PROFILES = {
@@ -211,12 +263,36 @@ DIAGNOSTIC_PROFILES = {
         require_locked_full_run=True,
     ),
 }
+for _factorized_stage, _factorized_experiment in FACTORIZED_STAGE_EXPERIMENTS.items():
+    _factorized_run = (
+        PROJECT_ROOT
+        / "experiments/NIAF/continuous_trajectory_field"
+        / _factorized_experiment
+    )
+    _factorized_profile_name = FACTORIZED_PROFILE_NAMES[_factorized_stage]
+    DIAGNOSTIC_PROFILES[_factorized_profile_name] = DiagnosticProfile(
+        name=_factorized_profile_name,
+        experiment_name=_factorized_experiment,
+        config=(
+            PROJECT_ROOT
+            / "NIAF/continuous_trajectory_field/configs"
+            / f"{_factorized_experiment}.yaml"
+        ),
+        checkpoint=_factorized_run / "checkpoints/best.pt",
+        output=_factorized_run / "evaluation/locked_development_slot_diagnostics",
+        factorized_stage=_factorized_stage,
+        development_only=True,
+    )
 DIAGNOSTIC_RUNNER_SOURCE = Path(__file__).resolve()
 DIAGNOSTIC_CORE_SOURCE = (
     PROJECT_ROOT
     / "NIAF/continuous_trajectory_field/temporal_slot_diagnostics.py"
 )
 DIAGNOSTIC_DEPENDENCY_SOURCES = {
+    "diagnose_temporal_slots_sbatch.sh": PROJECT_ROOT
+    / "scripts/NIAF/diagnose_temporal_slots_sbatch.sh",
+    "factorized_ordered_decision.py": PROJECT_ROOT
+    / "NIAF/continuous_trajectory_field/scripts/decide_factorized_memory_stage.py",
     "sentence_memory.py": PROJECT_ROOT
     / "NIAF/continuous_trajectory_field/sentence_memory.py",
     "sentence_memory_trajectory_hypernetwork.py": PROJECT_ROOT
@@ -295,6 +371,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--out_dir", "--out-dir", type=Path)
+    parser.add_argument(
+        "--authorization",
+        type=Path,
+        help=(
+            "Explicit authorize_confirmation.json selected by the ordered "
+            "factorized-memory development gate (factorized profiles only)."
+        ),
+    )
     parser.add_argument("--stage", choices=("smoke", "full"), default="full")
     parser.add_argument("--batch_size", "--batch-size", type=int, default=16)
     parser.add_argument(
@@ -481,10 +565,8 @@ def _git_identity() -> dict[str, Any]:
 
     status = command("git", "status", "--porcelain")
     return {
-        # Compute nodes cannot resolve this Codex worktree's node-local gitdir.
-        # `_git_head()` therefore accepts the submit-host identity exported by
-        # the launcher, while the explicit source-file hashes bind the bytes
-        # that actually define this diagnostic.
+        # Factorized profiles independently require a shared standalone clone;
+        # legacy profiles retain the exported-head fallback for old runs.
         "commit": _git_head(),
         "branch": command("git", "branch", "--show-current"),
         "tracked_worktree_clean": status == "" if status is not None else None,
@@ -511,6 +593,62 @@ def _git_head() -> str:
     ):
         raise RuntimeError(f"Unexpected git HEAD identity: {value!r}")
     return value.lower()
+
+
+def _factorized_source_checkout_identity(expected_head: str) -> dict[str, Any]:
+    """Independently validate the shared standalone checkout for Phase-A''."""
+
+    source_root = PROJECT_ROOT.resolve()
+    dot_git = source_root / ".git"
+    if (
+        not source_root.is_relative_to(Path("/media/cvpr").resolve())
+        or not dot_git.is_dir()
+        or dot_git.is_symlink()
+    ):
+        raise RuntimeError(
+            "Factorized diagnostics require a standalone clone on /media/cvpr"
+        )
+    durable_experiments = source_root / "experiments"
+    frozen_text_model = source_root / "deps" / "mt5-base"
+    if (
+        not durable_experiments.is_dir()
+        or not durable_experiments.resolve().is_relative_to(Path("/media/cvpr"))
+        or not frozen_text_model.is_dir()
+        or not frozen_text_model.resolve().is_relative_to(Path("/media/cvpr"))
+    ):
+        raise RuntimeError(
+            "Factorized diagnostic lacks shared experiments or frozen mT5"
+        )
+
+    def command(*arguments: str) -> str:
+        try:
+            return subprocess.check_output(
+                ("git", "-C", str(source_root), *arguments),
+                text=True,
+                stderr=subprocess.PIPE,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise RuntimeError("Cannot validate factorized diagnostic source") from error
+
+    common_dir = Path(
+        command("rev-parse", "--path-format=absolute", "--git-common-dir")
+    ).resolve()
+    actual_head = command("rev-parse", "HEAD").lower()
+    if common_dir != dot_git.resolve():
+        raise RuntimeError("Factorized diagnostic source uses external git metadata")
+    if actual_head != str(expected_head).lower() or actual_head != _git_head():
+        raise RuntimeError("Factorized diagnostic executed another source commit")
+    if command("status", "--porcelain", "--untracked-files=all"):
+        raise RuntimeError("Factorized diagnostic source checkout is not clean")
+    return {
+        "repository_root": str(source_root),
+        "git_directory": str(common_dir),
+        "git_head": actual_head,
+        "durable_experiments_root": str(durable_experiments.resolve()),
+        "frozen_text_model_root": str(frozen_text_model.resolve()),
+        "standalone_shared_clone_checked": True,
+        "worktree_clean_checked": True,
+    }
 
 
 def _selected_profile(args: argparse.Namespace) -> DiagnosticProfile:
@@ -585,6 +723,30 @@ def _validate_arguments(
         )
     if args.stage == "full" and args.out_dir.resolve() != profile.output.resolve():
         raise ValueError(f"Full output must be written to {profile.output}")
+    if profile.factorized_stage is not None:
+        if getattr(args, "authorization", None) is None:
+            raise ValueError(
+                "Factorized diagnostics require an explicit --authorization "
+                "pointing to authorize_confirmation.json"
+            )
+        expected_authorization = (
+            profile.checkpoint.parents[1]
+            / "evaluation/ordered_development_decision/authorize_confirmation.json"
+        )
+        if args.authorization.resolve(strict=True) != expected_authorization.resolve(
+            strict=True
+        ):
+            raise ValueError(
+                "Factorized diagnostics require the selected run's exact "
+                f"confirmation authorization: {expected_authorization}"
+            )
+        if args.checkpoint.name != "best.pt" or args.checkpoint.is_symlink():
+            raise ValueError(
+                "Factorized diagnostics accept only a real checkpoints/best.pt; "
+                "best_infeasible.pt and aliases are forbidden"
+            )
+    elif getattr(args, "authorization", None) is not None:
+        raise ValueError("--authorization is valid only for factorized profiles")
 
 
 def _validate_config(
@@ -636,6 +798,36 @@ def _validate_config(
             raise ValueError(f"sentence_memory.{name}={actual!r}; expected {expected!r}")
     if str(cfg.get("conditioning", {}).get("word_prior_train_mode")) != "off":
         raise ValueError("Word prior must be disabled for this attribution audit")
+    if profile.factorized_stage is not None:
+        if memory.get("key_value_mode") != "factorized_metadata_motion_v1":
+            raise ValueError("Factorized profile requires metadata/motion split K/V")
+        expected_temporal = FACTORIZED_STAGE_TEMPORAL_PRIORS[
+            profile.factorized_stage
+        ]
+        if str(memory.get("temporal_prior_mode")) != expected_temporal:
+            raise ValueError(
+                "Factorized profile has the wrong temporal prior: "
+                f"expected {expected_temporal!r}"
+            )
+        expected_modes = [
+            "off",
+            "on",
+            "motion_shuffled",
+            "shuffled",
+            "analytic_prior",
+        ]
+        if list(cfg.get("eval", {}).get("sentence_memory_modes", ())) != expected_modes:
+            raise ValueError("Factorized diagnostic requires the fixed five eval modes")
+        if dict(cfg.get("eval", {}).get("evaluation_corruption", {}) or {}) != {
+            "mode": "fixed_query_condition_v1",
+            "seed": 1234,
+            "nonce": "csl_daily_validation_corruption_v1",
+        }:
+            raise ValueError("Factorized validation corruption controls changed")
+        if str(cfg.get("selection", {}).get("aggregation")) != (
+            "normalized_text_cluster_equal_v1"
+        ):
+            raise ValueError("Factorized selection aggregation changed")
 
 
 def _load_checkpoint(
@@ -941,6 +1133,246 @@ def _validate_phase_a_prime_locked_run(
     }
 
 
+def _validate_factorized_authorized_run(
+    checkpoint: Mapping[str, Any],
+    *,
+    profile: DiagnosticProfile,
+    checkpoint_path: Path,
+    config_path: Path,
+    authorization_path: Path,
+) -> dict[str, Any]:
+    """Validate the first dev-feasible factorized stage without opening holdout data."""
+
+    if profile.factorized_stage not in FACTORIZED_STAGE_EXPERIMENTS:
+        raise RuntimeError("Factorized authorization validator needs a Stage 1/2 profile")
+    stage = str(profile.factorized_stage)
+    from NIAF.continuous_trajectory_field.scripts.decide_factorized_memory_stage import (
+        verify_authorization,
+    )
+
+    authorization = verify_authorization(
+        authorization_path,
+        purpose="confirmation",
+        stage=stage,
+    )
+    if (
+        authorization.get("test_data_accessed") is not False
+        or authorization.get("confirmation_manifest_opened") is not False
+    ):
+        raise RuntimeError("Factorized authorization is not pre-confirmation evidence")
+    authorized_checkpoint = dict(authorization.get("checkpoint", {}) or {})
+    resolved_checkpoint = checkpoint_path.resolve(strict=True)
+    if (
+        checkpoint_path.name != "best.pt"
+        or checkpoint_path.is_symlink()
+        or resolved_checkpoint.name != "best.pt"
+        or Path(str(authorized_checkpoint.get("path", ""))).resolve(strict=True)
+        != resolved_checkpoint
+    ):
+        raise RuntimeError(
+            "Factorized diagnostic accepts only the authorized real best.pt; "
+            "best_infeasible.pt is forbidden"
+        )
+    checkpoint_sha256 = _sha256(resolved_checkpoint)
+    if checkpoint_sha256 != authorized_checkpoint.get("sha256"):
+        raise RuntimeError("Diagnostic checkpoint SHA256 differs from authorization")
+    checkpoint_epoch = int(checkpoint.get("epoch", -1))
+    if checkpoint_epoch not in range(1, 5) or checkpoint_epoch != int(
+        authorized_checkpoint.get("epoch", -2)
+    ):
+        raise RuntimeError("Diagnostic checkpoint epoch differs from authorization")
+    authorized_config = dict(authorized_checkpoint.get("config", {}) or {})
+    if (
+        Path(str(authorized_config.get("path", ""))).resolve(strict=True)
+        != config_path.resolve(strict=True)
+        or _sha256(config_path) != authorized_config.get("sha256")
+    ):
+        raise RuntimeError("Diagnostic config path/SHA256 differs from authorization")
+
+    cfg = load_config(config_path)
+    checkpoint_cfg = dict(checkpoint.get("config", {}) or {})
+    if (
+        cfg.get("experiment_name") != profile.experiment_name
+        or checkpoint_cfg.get("experiment_name") != profile.experiment_name
+    ):
+        raise RuntimeError("Factorized authorization selected another experiment")
+    for candidate_cfg in (cfg, checkpoint_cfg):
+        candidate_memory = dict(candidate_cfg.get("sentence_memory", {}) or {})
+        if (
+            candidate_memory.get("key_value_mode")
+            != "factorized_metadata_motion_v1"
+            or candidate_memory.get("temporal_prior_mode")
+            != FACTORIZED_STAGE_TEMPORAL_PRIORS[stage]
+        ):
+            raise RuntimeError("Authorized checkpoint has the wrong factorized stage")
+    identity_functions = {
+        "architecture": sentence_memory_architecture_identity,
+        "behavior": sentence_memory_behavior_identity,
+        "objective": sentence_memory_objective_identity,
+        "resume": sentence_memory_resume_identity,
+        "evaluation_control": sentence_memory_evaluation_control_identity,
+        "selection_aggregation": sentence_memory_selection_aggregation_identity,
+    }
+    authorized_identities = dict(authorized_checkpoint.get("identities", {}) or {})
+    for name, compute in identity_functions.items():
+        checkpoint_identity = checkpoint.get(f"sentence_memory_{name}_identity")
+        authorized_identity = dict(authorized_identities.get(name, {}) or {}).get(
+            "value"
+        )
+        if (
+            checkpoint_identity != authorized_identity
+            or checkpoint_identity != compute(checkpoint_cfg)
+        ):
+            raise RuntimeError(f"Factorized {name} identity is not exact")
+        # Resume includes training-time resolved partition fields that are
+        # deliberately absent from the immutable source YAML. Its exact value
+        # is still bound twice above: to the authorized checkpoint identity and
+        # to a fresh recomputation from the checkpoint's resolved config.
+        if name != "resume" and checkpoint_identity != compute(cfg):
+            raise RuntimeError(
+                f"Factorized {name} identity differs from the source config"
+            )
+    corruption_identity = sentence_memory_validation_corruption_map_identity(
+        cfg,
+        partition_digest=EXPECTED_FACTORIZED_PARTITION_DIGEST,
+        bank_id=EXPECTED_FACTORIZED_BANK_ID,
+    )
+    if (
+        checkpoint.get("sentence_memory_validation_corruption_map_identity")
+        != corruption_identity
+        or dict(
+            authorized_identities.get("validation_corruption_map", {}) or {}
+        ).get("value")
+        != corruption_identity
+    ):
+        raise RuntimeError("Factorized validation-corruption map identity is not exact")
+
+    memory_identity = dict(checkpoint.get("sentence_memory_identity", {}) or {})
+    if memory_identity.get("bank_id") != EXPECTED_FACTORIZED_BANK_ID:
+        raise RuntimeError("Factorized checkpoint bank ID changed")
+    table_identities = dict(memory_identity.get("neighbor_tables", {}) or {})
+    if set(table_identities) != {"train", "val"}:
+        raise RuntimeError("Factorized checkpoint must bind exactly train/val tables")
+    table_hashes = {
+        split: str(dict(table_identities[split]).get("sha256", ""))
+        for split in ("train", "val")
+    }
+    if table_hashes != EXPECTED_FACTORIZED_NEIGHBOR_SHA256:
+        raise RuntimeError("Factorized train/validation neighbor identities changed")
+    if authorized_checkpoint.get("bank_id") != EXPECTED_FACTORIZED_BANK_ID or dict(
+        authorized_checkpoint.get("neighbor_table_sha256", {}) or {}
+    ) != EXPECTED_FACTORIZED_NEIGHBOR_SHA256:
+        raise RuntimeError("Authorization bank/table identities differ from checkpoint")
+
+    partition = dict(authorization.get("partition", {}) or {})
+    if (
+        partition.get("partition_digest") != EXPECTED_FACTORIZED_PARTITION_DIGEST
+        or int(partition.get("development_rows", -1)) != EXPECTED_DEVELOPMENT_ROWS
+        or int(partition.get("development_unique_texts", -1))
+        != EXPECTED_DEVELOPMENT_TEXTS
+    ):
+        raise RuntimeError("Authorization development partition changed")
+    development_manifest = Path(str(partition.get("development_manifest", "")))
+    if (
+        development_manifest.name != "manifest_development.jsonl"
+        or _sha256(development_manifest.resolve(strict=True))
+        != partition.get("development_manifest_sha256")
+    ):
+        raise RuntimeError("Authorized development manifest identity changed")
+    development_rows = _read_jsonl_objects(development_manifest)
+    normalized_texts = [
+        normalize_sentence_text(row.get("text", "")) for row in development_rows
+    ]
+    if (
+        len(development_rows) != EXPECTED_DEVELOPMENT_ROWS
+        or len(set(normalized_texts)) != EXPECTED_DEVELOPMENT_TEXTS
+        or any(not text for text in normalized_texts)
+    ):
+        raise RuntimeError("Authorized development manifest counts changed")
+
+    launch_evidence = dict(authorization.get("run_launch_identity", {}) or {})
+    launch_path = Path(str(launch_evidence.get("path", ""))).resolve(strict=True)
+    if _sha256(launch_path) != launch_evidence.get("sha256"):
+        raise RuntimeError("Authorized run-launch artifact changed")
+    launch = _read_json_object(launch_path)
+    launch_source = dict(launch.get("source", {}) or {})
+    if (
+        launch.get("launch_identity") != launch_evidence.get("launch_identity")
+        or launch_source != dict(launch_evidence.get("source", {}) or {})
+    ):
+        raise RuntimeError("Authorized source/launch identity changed")
+    source_git_head = str(launch_source.get("git_head", ""))
+    source_checkout = _factorized_source_checkout_identity(source_git_head)
+    if (
+        source_git_head != _git_head()
+        or str(launch_source.get("remote_head", "")).lower() != source_git_head
+        or not str(launch_source.get("remote_ref", "")).startswith("origin/")
+        or launch_source.get("remote_ref_exact_match_checked") is not True
+        or launch_source.get("standalone_shared_clone_checked") is not True
+        or launch_source.get("worktree_clean_checked") is not True
+        or Path(str(launch_source.get("repository_root", ""))).resolve()
+        != PROJECT_ROOT.resolve()
+        or source_checkout["repository_root"]
+        != str(Path(str(launch_source.get("repository_root", ""))).resolve())
+        or source_checkout["durable_experiments_root"]
+        != str(Path(str(launch_source.get("durable_experiments_root", ""))).resolve())
+        or source_checkout["frozen_text_model_root"]
+        != str(Path(str(launch_source.get("frozen_text_model_root", ""))).resolve())
+    ):
+        raise RuntimeError(
+            "Diagnostic source commit differs from the clean pushed training source"
+        )
+
+    predecessor = authorization.get("predecessor_authorization")
+    if stage == "stage1" and predecessor is not None:
+        raise RuntimeError("Stage 1 confirmation cannot have a predecessor")
+    if stage == "stage2":
+        if not isinstance(predecessor, Mapping):
+            raise RuntimeError("Stage 2 confirmation lacks Stage-1 infeasibility evidence")
+        predecessor_path = Path(str(predecessor.get("path", ""))).resolve(strict=True)
+        predecessor_value = verify_authorization(
+            predecessor_path,
+            purpose="stage2",
+            stage="stage1",
+        )
+        if (
+            _sha256(predecessor_path) != predecessor.get("sha256")
+            or predecessor_value.get("authorization_identity")
+            != predecessor.get("authorization_identity")
+            or predecessor_value.get("decision_identity")
+            != predecessor.get("decision_identity")
+        ):
+            raise RuntimeError("Stage-2 predecessor authorization changed")
+
+    return {
+        "schema_name": "factorized_memory_locked_development_diagnostic",
+        "schema_version": 1,
+        "stage": stage,
+        "experiment_name": profile.experiment_name,
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_epoch": checkpoint_epoch,
+        "authorization_path": str(authorization_path.resolve()),
+        "authorization_sha256": _sha256(authorization_path),
+        "authorization_identity": authorization["authorization_identity"],
+        "decision_identity": authorization["decision_identity"],
+        "source_git_head": source_git_head,
+        "source_checkout": source_checkout,
+        "run_launch_source": launch_source,
+        "bank_id": EXPECTED_FACTORIZED_BANK_ID,
+        "neighbor_table_sha256": table_hashes,
+        "partition_digest": EXPECTED_FACTORIZED_PARTITION_DIGEST,
+        "development_manifest": str(development_manifest.resolve()),
+        "development_manifest_sha256": partition["development_manifest_sha256"],
+        "development_rows": EXPECTED_DEVELOPMENT_ROWS,
+        "development_unique_texts": EXPECTED_DEVELOPMENT_TEXTS,
+        "identities": {
+            name: checkpoint[f"sentence_memory_{name}_identity"]
+            for name in identity_functions
+        }
+        | {"validation_corruption_map": corruption_identity},
+    }
+
+
 def _validate_checkpoint_identity_without_test(
     checkpoint: Mapping[str, Any],
     provider,
@@ -992,6 +1424,110 @@ def _validate_checkpoint_identity_without_test(
             raise RuntimeError(
                 f"{source} {split}-neighbor identity differs from the staged table"
             )
+
+
+def _bind_factorized_development_neighbor_subset(
+    provider,
+    dataset,
+    *,
+    parent_manifest_sha256: str,
+    subset_manifest_sha256: str,
+) -> dict[str, Any]:
+    """Bind and attest exact canonical-table lookup for the dev-only audit.
+
+    The compact development dataset is deliberately not position-compatible
+    with the canonical 1,077-row validation neighbor table.  Binding by the
+    globally unique sample name preserves the precomputed retrieval rows while
+    the provider's exact-subset lookup mode forbids online fallback, including
+    when a row has fewer than ``K`` candidates.
+    """
+
+    active_tables = dict(provider.identity.get("neighbor_tables", {}) or {})
+    full_val_identity = dict(active_tables.get("val", {}) or {})
+    if (
+        str(full_val_identity.get("sha256", ""))
+        != EXPECTED_FACTORIZED_NEIGHBOR_SHA256["val"]
+        or str(full_val_identity.get("query_manifest_sha256", ""))
+        != parent_manifest_sha256
+        or int(full_val_identity.get("query_count", -1))
+        != EXPECTED_VALIDATION_ROWS
+    ):
+        raise RuntimeError(
+            "Factorized diagnostic canonical validation-neighbor identity changed"
+        )
+
+    provider.set_dataset_with_name_indexed_neighbor_subset(
+        dataset,
+        parent_manifest_sha256=parent_manifest_sha256,
+        expected_subset_manifest_sha256=subset_manifest_sha256,
+    )
+    table = provider.neighbor_table
+    if not isinstance(table, Mapping):
+        raise RuntimeError(
+            "Factorized diagnostic did not bind a validation neighbor subset"
+        )
+    parent_rows = np.asarray(table.get("parent_query_rows", ()), dtype=np.int64)
+    parent_order_sha256 = str(table.get("parent_query_order_sha256", ""))
+    subset_order_sha256 = str(table.get("query_order_sha256", ""))
+    subset_names = [str(value) for value in table.get("query_names", ())]
+    valid_hex = set("0123456789abcdef")
+    if (
+        table.get("lookup_mode") != FACTORIZED_DEVELOPMENT_LOOKUP_MODE
+        or str(table.get("parent_query_manifest_sha256", ""))
+        != parent_manifest_sha256
+        or int(table.get("parent_query_count", -1)) != EXPECTED_VALIDATION_ROWS
+        or str(table.get("query_manifest_sha256", ""))
+        != subset_manifest_sha256
+        or len(table.get("query_names", ())) != EXPECTED_DEVELOPMENT_ROWS
+        or parent_rows.shape != (EXPECTED_DEVELOPMENT_ROWS,)
+        or np.unique(parent_rows).size != EXPECTED_DEVELOPMENT_ROWS
+        or bool(np.any(parent_rows < 0))
+        or bool(np.any(parent_rows >= EXPECTED_VALIDATION_ROWS))
+        or len(parent_order_sha256) != 64
+        or any(character not in valid_hex for character in parent_order_sha256)
+        or len(subset_order_sha256) != 64
+        or any(character not in valid_hex for character in subset_order_sha256)
+        or parent_order_sha256
+        != str(full_val_identity.get("query_order_sha256", ""))
+        or subset_order_sha256 != _digest_json(subset_names)
+    ):
+        raise RuntimeError(
+            "Factorized diagnostic neighbor subset is not the exact authorized "
+            "development projection"
+        )
+    validation = provider.validate_query_dataset(dataset, require_neighbors=True)
+    if (
+        str(validation.get("split", "")) != "val"
+        or str(validation.get("manifest_sha256", ""))
+        != subset_manifest_sha256
+        or provider.neighbor_table is not table
+    ):
+        raise RuntimeError(
+            "Factorized diagnostic provider did not retain the exact neighbor subset"
+        )
+
+    return {
+        "schema_name": "signtrajfield_factorized_development_neighbor_lookup",
+        "schema_version": 1,
+        "lookup_mode": FACTORIZED_DEVELOPMENT_LOOKUP_MODE,
+        "online_retrieval_fallback": "forbidden",
+        "canonical_table": {
+            "split": "val",
+            "sha256": EXPECTED_FACTORIZED_NEIGHBOR_SHA256["val"],
+            "parent_query_manifest_sha256": parent_manifest_sha256,
+            "parent_query_order_sha256": parent_order_sha256,
+            "parent_query_count": EXPECTED_VALIDATION_ROWS,
+        },
+        "development_subset": {
+            "query_manifest_sha256": subset_manifest_sha256,
+            "query_order_sha256": subset_order_sha256,
+            "query_count": EXPECTED_DEVELOPMENT_ROWS,
+            "parent_query_rows_sha256": _digest_json(parent_rows.tolist()),
+            "parent_query_rows_unique": True,
+            "parent_query_row_min": int(parent_rows.min()),
+            "parent_query_row_max": int(parent_rows.max()),
+        },
+    }
 
 
 class _ResumeWorkspace:
@@ -1480,9 +2016,14 @@ def _ready_identity(
     current_cfg["device"] = "cuda"
     if _digest_json(current_cfg) != expected.get("resolved_config_sha256"):
         return None
-    if _sha256(EXPECTED_VALIDATION_MANIFEST) != (
-        expected.get("validation_manifest") or {}
-    ).get("sha256"):
+    expected_manifest = expected.get("validation_manifest") or {}
+    try:
+        expected_manifest_path = Path(str(expected_manifest.get("path", ""))).resolve(
+            strict=True
+        )
+    except OSError:
+        return None
+    if _sha256(expected_manifest_path) != expected_manifest.get("sha256"):
         return None
     ready = out_dir / "READY"
     identity_path = out_dir / "provenance.json"
@@ -1530,6 +2071,7 @@ def _ready_identity(
         "neighbor_table_sha256": value.get("neighbor_table_sha256"),
         "validation_manifest": value.get("validation_manifest"),
         "locked_run_evidence": value.get("locked_run_evidence"),
+        "retrieval_lookup_evidence": value.get("retrieval_lookup_evidence"),
     }
     if comparisons != dict(expected):
         return None
@@ -1698,6 +2240,8 @@ def _motion_only_shuffle(
     *,
     epoch: int,
     seed: int,
+    corruption_nonce: str | None = None,
+    corruption_condition: str = "motion_shuffled",
 ) -> tuple[SentenceMemoryBatch, torch.Tensor]:
     shuffled, permutations, _informative = (
         motion_only_shuffle_sentence_memory_batch(
@@ -1705,6 +2249,8 @@ def _motion_only_shuffle(
             query_ids=query_ids,
             epoch=epoch,
             seed=seed,
+            corruption_nonce=corruption_nonce,
+            corruption_condition=corruption_condition,
         )
     )
     return shuffled, permutations
@@ -1749,6 +2295,8 @@ def _run_model(
     text_mask: torch.Tensor,
     query_tau: torch.Tensor,
     memory: SentenceMemoryBatch | None,
+    *,
+    attention_mode: str = "learned",
 ):
     kwargs = {} if memory is None else sentence_memory_forward_kwargs(memory)
     return model(
@@ -1760,6 +2308,7 @@ def _run_model(
         word_prior_available=torch.zeros(
             text_tokens.shape[0], dtype=torch.bool, device=text_tokens.device
         ),
+        sentence_memory_attention_mode=str(attention_mode),
         **kwargs,
     )
 
@@ -1876,6 +2425,7 @@ class ArrayStore:
         causal_rows: int,
         directions: int,
         query_points: int,
+        memory_conditions: Sequence[str] = MEMORY_CONDITIONS,
         reopen: bool = False,
     ):
         self.root = root / "arrays"
@@ -1887,6 +2437,9 @@ class ArrayStore:
             self.root.mkdir()
         self.specs: dict[str, tuple[tuple[int, ...], str]] = {}
         self.arrays: dict[str, np.memmap] = {}
+        self.memory_conditions = tuple(str(value) for value in memory_conditions)
+        if not self.memory_conditions or self.memory_conditions[0] != "correct":
+            raise ValueError("Diagnostic memory conditions must begin with correct")
 
         self._create("query_dataset_index", (rows,), "int64", -1)
         self._create("token_ids", (rows, max_text_tokens), "int32", -1)
@@ -1894,13 +2447,13 @@ class ArrayStore:
         self._create("planner_slots", (rows, slots, hidden), "float16", 0)
         self._create(
             "fused_slots",
-            (rows, len(MEMORY_CONDITIONS), slots, hidden),
+            (rows, len(self.memory_conditions), slots, hidden),
             "float16",
             0,
         )
         self._create(
             "sentence_delta",
-            (rows, len(MEMORY_CONDITIONS), slots, hidden),
+            (rows, len(self.memory_conditions), slots, hidden),
             "float16",
             0,
         )
@@ -1920,7 +2473,7 @@ class ArrayStore:
         )
         attention_prefix = (
             rows,
-            len(MEMORY_CONDITIONS),
+            len(self.memory_conditions),
             sentence_layers,
             slots,
             len(PART_NAMES),
@@ -1935,7 +2488,7 @@ class ArrayStore:
         )
         self._create(
             "sentence_gates",
-            (rows, len(MEMORY_CONDITIONS), slots, len(PART_NAMES)),
+            (rows, len(self.memory_conditions), slots, len(PART_NAMES)),
             "float16",
             0,
         )
@@ -2124,13 +2677,21 @@ def _condition_capture(
     memory,
     *,
     replay_text_attention: bool,
+    attention_mode: str = "learned",
 ):
     with DiagnosticCapture(
         model,
         replay_text_attention=replay_text_attention,
         replay_tolerance=1e-6,
     ) as capture:
-        outputs = _run_model(model, text_tokens, text_mask, query_tau, memory)
+        outputs = _run_model(
+            model,
+            text_tokens,
+            text_mask,
+            query_tau,
+            memory,
+            attention_mode=attention_mode,
+        )
         snapshot = capture.snapshot(clear=True, cpu=True)
     return outputs, snapshot
 
@@ -2419,6 +2980,7 @@ def _passive_sweep(
     args,
     store: ArrayStore,
     workspace: _ResumeWorkspace,
+    profile: DiagnosticProfile,
 ):
     start_position = int(workspace.passive_next)
     loader = DataLoader(
@@ -2481,6 +3043,11 @@ def _passive_sweep(
                 device=device,
                 mode="on",
             )
+            full_corruption_kwargs = sentence_memory_evaluation_corruption_kwargs(
+                cfg,
+                training=False,
+                condition="shuffled",
+            ) if profile.factorized_stage is not None else {}
             shuffled = retrieve_sentence_memory(
                 provider,
                 dataset=dataset,
@@ -2492,12 +3059,24 @@ def _passive_sweep(
                 training=False,
                 device=device,
                 mode="shuffled",
+                **full_corruption_kwargs,
             )
+            motion_corruption_kwargs = sentence_memory_evaluation_corruption_kwargs(
+                cfg,
+                training=False,
+                condition="motion_shuffled",
+            ) if profile.factorized_stage is not None else {}
             motion_only, motion_permutation = _motion_only_shuffle(
                 correct,
                 query_ids,
                 epoch=checkpoint_epoch,
-                seed=args.seed,
+                seed=int(motion_corruption_kwargs.get("corruption_seed", args.seed)),
+                corruption_nonce=motion_corruption_kwargs.get("corruption_nonce"),
+                corruption_condition=str(
+                    motion_corruption_kwargs.get(
+                        "corruption_condition", "motion_shuffled"
+                    )
+                ),
             )
             store["motion_source_permutation"][destination] = (
                 motion_permutation.detach().cpu().numpy().astype(np.int16)
@@ -2506,6 +3085,7 @@ def _passive_sweep(
                 "correct": correct,
                 "shuffled": shuffled,
                 "motion_only_shuffle": motion_only,
+                "analytic_prior": correct,
             }
             query_tau = query_grid_1d[None].expand(batch_size, -1)
             query_mu, query_mu_mask = codec.encode(
@@ -2526,7 +3106,7 @@ def _passive_sweep(
             condition_candidate_summary = {}
             condition_gate_summary = {}
             condition_delta_summary = {}
-            for condition_index, condition in enumerate(MEMORY_CONDITIONS):
+            for condition_index, condition in enumerate(profile.memory_conditions):
                 memory = memories[condition]
                 outputs, snapshot = _condition_capture(
                     model,
@@ -2535,6 +3115,9 @@ def _passive_sweep(
                     query_tau,
                     memory,
                     replay_text_attention=condition == "correct",
+                    attention_mode=(
+                        "analytic_prior" if condition == "analytic_prior" else "learned"
+                    ),
                 )
                 condition_outputs[condition] = outputs
                 if uninstrumented is not None and condition == "correct":
@@ -2802,6 +3385,23 @@ def _passive_sweep(
                 candidate_distance,
             )
             _append_candidate_rows(candidate_rows, query_ids, "shuffled", shuffled, None)
+            if "motion_only_shuffle" in profile.memory_conditions:
+                _append_candidate_rows(
+                    candidate_rows,
+                    query_ids,
+                    "motion_only_shuffle",
+                    motion_only,
+                    prior,
+                )
+            if "analytic_prior" in profile.memory_conditions:
+                _append_candidate_rows(
+                    candidate_rows,
+                    query_ids,
+                    "analytic_prior",
+                    correct,
+                    prior,
+                    candidate_distance,
+                )
 
             for memory_index, memory in enumerate((correct, shuffled)):
                 store["candidate_ids"][destination, memory_index] = (
@@ -2900,6 +3500,11 @@ def _passive_sweep(
                 motion_prediction = condition_outputs["motion_only_shuffle"][
                     "prediction"
                 ][row]
+                analytic_prediction = (
+                    condition_outputs["analytic_prior"]["prediction"][row]
+                    if "analytic_prior" in profile.memory_conditions
+                    else None
+                )
                 off_prediction = off_outputs["prediction"][row]
                 query_rows.append(
                     {
@@ -2989,9 +3594,23 @@ def _passive_sweep(
                             .sqrt()
                             .item()
                         ),
+                        **(
+                            {
+                                "correct_vs_analytic_prior_rms": float(
+                                    (correct_prediction - analytic_prediction)
+                                    .float()
+                                    .square()
+                                    .mean()
+                                    .sqrt()
+                                    .item()
+                                )
+                            }
+                            if analytic_prediction is not None
+                            else {}
+                        ),
                         **{
                             f"candidate_{condition}_{key}": value
-                            for condition in MEMORY_CONDITIONS
+                            for condition in profile.memory_conditions
                             for key, value in condition_candidate_summary[condition][
                                 row
                             ].items()
@@ -3000,13 +3619,13 @@ def _passive_sweep(
                             f"gate_{condition}_mean": condition_gate_summary[
                                 condition
                             ][row]
-                            for condition in MEMORY_CONDITIONS
+                            for condition in profile.memory_conditions
                         },
                         **{
                             f"sentence_delta_{condition}_mean_norm": (
                                 condition_delta_summary[condition][row]
                             )
-                            for condition in MEMORY_CONDITIONS
+                            for condition in profile.memory_conditions
                         },
                         **{f"planner_{key}": value for key, value in raw_summary[row].items()},
                         **text_summary[row],
@@ -4198,6 +4817,7 @@ def _write_plots(
     *,
     rows: int,
     causal_count: int,
+    memory_conditions: Sequence[str] = MEMORY_CONDITIONS,
 ):
     try:
         import matplotlib
@@ -4284,11 +4904,11 @@ def _write_plots(
     )
     figure, axes = plt.subplots(
         2,
-        len(MEMORY_CONDITIONS),
-        figsize=(15, 7),
+        len(memory_conditions),
+        figsize=(5 * len(memory_conditions), 7),
         constrained_layout=True,
     )
-    for condition_index, condition in enumerate(MEMORY_CONDITIONS):
+    for condition_index, condition in enumerate(memory_conditions):
         gate_image = _plot_heatmap(
             axes[0, condition_index],
             gates[condition_index].T,
@@ -4525,7 +5145,9 @@ def _write_report(
     permutation_tests: Mapping[str, Any],
     selection,
     findings: Sequence[str],
+    profile: DiagnosticProfile | None = None,
 ):
+    profile = profile or DIAGNOSTIC_PROFILES[LEGACY_PROFILE_NAME]
     lines = [
         "# CSL-Daily epoch-2 temporal-slot and sentence-memory audit",
         "",
@@ -4533,7 +5155,8 @@ def _write_report(
         f"**{novel_rows}**; unique novel texts: **{unique_novel}**.",
         "",
         "This is a validation-only diagnostic of the fixed duration-weight-0.05 "
-        "Phase-A checkpoint. It is not a promoted model evaluation.",
+        "Phase-A checkpoint. It is not a promoted model evaluation and cannot "
+        "change checkpoint selection.",
         "",
         "## Integrity checks",
         "",
@@ -4551,7 +5174,7 @@ def _write_report(
             "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
-    for condition in MEMORY_CONDITIONS:
+    for condition in profile.memory_conditions:
         values = [
             _interval_value(passive_summary, f"candidate_{condition}_{metric}")
             for metric in (
@@ -4645,22 +5268,44 @@ def run(args: argparse.Namespace) -> Path:
             checkpoint_path=args.checkpoint,
             config_path=args.config,
         )
-    validation_manifest_sha256 = _sha256(EXPECTED_VALIDATION_MANIFEST)
-    if validation_manifest_sha256 != EXPECTED_VALIDATION_MANIFEST_SHA256:
-        raise RuntimeError(
-            "Canonical CSL-Daily validation manifest hash mismatch: "
-            f"expected={EXPECTED_VALIDATION_MANIFEST_SHA256}, "
-            f"actual={validation_manifest_sha256}"
+    if profile.factorized_stage is not None:
+        locked_run_evidence = _validate_factorized_authorized_run(
+            checkpoint,
+            profile=profile,
+            checkpoint_path=args.checkpoint,
+            config_path=args.config,
+            authorization_path=args.authorization,
         )
+        validation_manifest = Path(locked_run_evidence["development_manifest"])
+        validation_manifest_sha256 = str(
+            locked_run_evidence["development_manifest_sha256"]
+        )
+    else:
+        validation_manifest = EXPECTED_VALIDATION_MANIFEST
+        validation_manifest_sha256 = _sha256(validation_manifest)
+        if validation_manifest_sha256 != EXPECTED_VALIDATION_MANIFEST_SHA256:
+            raise RuntimeError(
+                "Canonical CSL-Daily validation manifest hash mismatch: "
+                f"expected={EXPECTED_VALIDATION_MANIFEST_SHA256}, "
+                f"actual={validation_manifest_sha256}"
+            )
     validation_manifest_identity = {
-        "path": str(EXPECTED_VALIDATION_MANIFEST),
+        "path": str(validation_manifest.resolve()),
         "sha256": validation_manifest_sha256,
+        "population": (
+            "development" if profile.development_only else "full_validation"
+        ),
     }
     set_seed(int(args.seed))
     if not torch.cuda.is_available():
         raise RuntimeError("The diagnostic requires a Slurm-allocated CUDA GPU")
     device = torch.device("cuda")
-    stage_rows = 8 if args.stage == "smoke" else EXPECTED_VALIDATION_ROWS
+    full_profile_rows = (
+        EXPECTED_DEVELOPMENT_ROWS
+        if profile.development_only
+        else EXPECTED_VALIDATION_ROWS
+    )
+    stage_rows = 8 if args.stage == "smoke" else full_profile_rows
     stage_causal_rows = 8 if args.stage == "smoke" else int(args.causal_size)
     bank_override = os.environ.get(
         str(cfg["sentence_memory"].get("local_bank_env", "SIGNTRAJ_SENTENCE_MEMORY_DIR"))
@@ -4694,8 +5339,73 @@ def run(args: argparse.Namespace) -> Path:
             f"Required train/validation neighbor tables are missing: {missing_neighbors}"
         )
     bank_metadata = json.loads((bank_dir / "bank.json").read_text(encoding="utf-8"))
+    if profile.factorized_stage is not None:
+        if str(bank_metadata.get("bank_id")) != EXPECTED_FACTORIZED_BANK_ID:
+            raise RuntimeError("Staged factorized sentence-memory bank ID changed")
+        actual_table_hashes = {
+            split: _sha256(path) for split, path in neighbor_paths.items()
+        }
+        if actual_table_hashes != EXPECTED_FACTORIZED_NEIGHBOR_SHA256:
+            raise RuntimeError("Staged factorized train/validation table SHA256 changed")
     source_sha256 = _diagnostic_source_hashes()
     git_head = _git_head()
+    validate_checkpoint_contract(checkpoint, cfg, source=str(args.checkpoint))
+
+    dataset_cfg = copy.deepcopy(cfg)
+    if profile.development_only:
+        # Construct the dataset from the authorized development manifest.  This
+        # prevents even accidental iteration over confirmation rows.
+        dataset_cfg.setdefault("data", {})["val_manifest_path"] = str(
+            validation_manifest.resolve()
+        )
+        dataset_cfg["data"]["limit_val"] = 0
+    dataset = ContinuousSignDataset(
+        dataset_cfg,
+        split="val",
+        limit=0,
+        random_crop=False,
+        require_fk_cache=False,
+    )
+    if dataset.split != "val" or len(dataset) != full_profile_rows:
+        raise RuntimeError(
+            f"Expected authorized validation population with {full_profile_rows} rows; "
+            f"found split={dataset.split!r}, rows={len(dataset)}"
+        )
+    text_encoder = build_text_encoder(cfg, torch.device("cpu"))
+    provider = build_sentence_memory_provider(cfg, text_encoder, dataset=dataset)
+    retrieval_lookup_evidence: dict[str, Any]
+    if profile.factorized_stage is not None:
+        partition_cfg = dict(cfg.get("validation_text_partition", {}) or {})
+        parent_manifest_sha256 = str(
+            partition_cfg.get("expected_validation_manifest_sha256", "")
+        )
+        configured_development_sha256 = str(
+            partition_cfg.get("expected_development_manifest_sha256", "")
+        )
+        if (
+            parent_manifest_sha256 != EXPECTED_VALIDATION_MANIFEST_SHA256
+            or configured_development_sha256 != validation_manifest_sha256
+        ):
+            raise RuntimeError(
+                "Factorized diagnostic query-manifest identities differ from the "
+                "authorized validation/development partition"
+            )
+        retrieval_lookup_evidence = _bind_factorized_development_neighbor_subset(
+            provider,
+            dataset,
+            parent_manifest_sha256=parent_manifest_sha256,
+            subset_manifest_sha256=validation_manifest_sha256,
+        )
+    else:
+        provider.validate_query_dataset(dataset, require_neighbors=True)
+        retrieval_lookup_evidence = {
+            "schema_name": "signtrajfield_canonical_validation_neighbor_lookup",
+            "schema_version": 1,
+            "lookup_mode": "canonical_position_indexed_v1",
+            "online_retrieval_fallback": "legacy_provider_policy",
+            "query_manifest_sha256": validation_manifest_sha256,
+            "query_count": full_profile_rows,
+        }
     expected_settings = {
         "seed": int(args.seed),
         "batch_size": int(args.batch_size),
@@ -4711,7 +5421,13 @@ def run(args: argparse.Namespace) -> Path:
         "duration_weight": EXPECTED_DURATION_WEIGHT,
         "score_temperature": EXPECTED_SCORE_TEMPERATURE,
         "k": EXPECTED_K,
-        "motion_shuffle_epoch": checkpoint_epoch,
+        "motion_shuffle_epoch": (
+            None if profile.factorized_stage is not None else checkpoint_epoch
+        ),
+        "evaluation_population": (
+            "development" if profile.development_only else "full_validation"
+        ),
+        "memory_conditions": list(profile.memory_conditions),
         "verify_hashes": bool(args.verify_hashes),
     }
     expected_ready_identity = {
@@ -4737,6 +5453,7 @@ def run(args: argparse.Namespace) -> Path:
         "source_sha256": source_sha256,
         "git_head": git_head,
         "locked_run_evidence": locked_run_evidence,
+        "retrieval_lookup_evidence": retrieval_lookup_evidence,
     }
 
     with _atomic_output(
@@ -4750,23 +5467,6 @@ def run(args: argparse.Namespace) -> Path:
             print(f"READY diagnostic already exists: {args.out_dir}")
             return args.out_dir
         building = workspace.root
-        validate_checkpoint_contract(checkpoint, cfg, source=str(args.checkpoint))
-
-        dataset = ContinuousSignDataset(
-            cfg,
-            split="val",
-            limit=0,
-            random_crop=False,
-            require_fk_cache=False,
-        )
-        if dataset.split != "val" or len(dataset) != EXPECTED_VALIDATION_ROWS:
-            raise RuntimeError(
-                f"Expected canonical val with {EXPECTED_VALIDATION_ROWS} rows; "
-                f"found split={dataset.split!r}, rows={len(dataset)}"
-            )
-        text_encoder = build_text_encoder(cfg, torch.device("cpu"))
-        provider = build_sentence_memory_provider(cfg, text_encoder, dataset=dataset)
-        provider.validate_query_dataset(dataset, require_neighbors=True)
         provider_epoch = set_sentence_memory_provider_epoch_from_checkpoint(
             provider, checkpoint
         )
@@ -4827,6 +5527,7 @@ def run(args: argparse.Namespace) -> Path:
             causal_rows=causal_count,
             directions=int(args.directions),
             query_points=int(args.query_points),
+            memory_conditions=profile.memory_conditions,
             reopen=reopen_arrays,
         )
         if reopen_arrays:
@@ -4859,6 +5560,7 @@ def run(args: argparse.Namespace) -> Path:
                 args=args,
                 store=store,
                 workspace=workspace,
+                profile=profile,
             )
             del codec
             if torch.cuda.is_available():
@@ -4879,7 +5581,23 @@ def run(args: argparse.Namespace) -> Path:
 
         queries = passive["queries"]
         novel_mask = [bool(row["novel_text"]) for row in queries]
-        if args.stage == "full":
+        if args.stage == "full" and profile.development_only:
+            novel_rows = sum(novel_mask)
+            exact_rows = len(queries) - novel_rows
+            unique_novel = len(
+                {row["normalized_text"] for row in queries if row["novel_text"]}
+            )
+            if (novel_rows, exact_rows, unique_novel) != (
+                EXPECTED_DEVELOPMENT_ROWS,
+                0,
+                EXPECTED_DEVELOPMENT_TEXTS,
+            ):
+                raise RuntimeError(
+                    "Authorized development novelty counts changed: "
+                    f"novel={novel_rows}, exact={exact_rows}, "
+                    f"unique_novel={unique_novel}"
+                )
+        elif args.stage == "full":
             novel_rows = sum(novel_mask)
             exact_rows = len(queries) - novel_rows
             unique_novel = len(
@@ -4965,9 +5683,13 @@ def run(args: argparse.Namespace) -> Path:
             "correct_vs_off_rms",
             "correct_vs_shuffled_rms",
             "correct_vs_motion_shuffle_rms",
+        ) + (
+            ("correct_vs_analytic_prior_rms",)
+            if "analytic_prior" in profile.memory_conditions
+            else ()
         ) + tuple(
             f"candidate_{condition}_{metric}"
-            for condition in MEMORY_CONDITIONS
+            for condition in profile.memory_conditions
             for metric in (
                 "effective_k",
                 "max_share",
@@ -4980,10 +5702,10 @@ def run(args: argparse.Namespace) -> Path:
                 "part_switch_coverage",
             )
         ) + tuple(
-            f"gate_{condition}_mean" for condition in MEMORY_CONDITIONS
+            f"gate_{condition}_mean" for condition in profile.memory_conditions
         ) + tuple(
             f"sentence_delta_{condition}_mean_norm"
-            for condition in MEMORY_CONDITIONS
+            for condition in profile.memory_conditions
         )
         passive_summary = _bootstrap_summary(
             queries,
@@ -5023,6 +5745,7 @@ def run(args: argparse.Namespace) -> Path:
             causal_rows,
             rows=len(passive_indices),
             causal_count=causal_count,
+            memory_conditions=profile.memory_conditions,
         )
         findings = _interpretation(passive_summary, causal_summary)
         summary = {
@@ -5032,6 +5755,11 @@ def run(args: argparse.Namespace) -> Path:
             "stage": args.stage,
             "validation_only": True,
             "diagnostic_only": True,
+            "selection_unchanged": True,
+            "evaluation_population": (
+                "development" if profile.development_only else "full_validation"
+            ),
+            "memory_conditions": ["text_only", *profile.memory_conditions],
             "counts": {
                 "validation_rows": len(queries),
                 "novel_rows": sum(novel_mask),
@@ -5068,6 +5796,7 @@ def run(args: argparse.Namespace) -> Path:
             permutation_tests=permutation_tests,
             selection=selection,
             findings=findings,
+            profile=profile,
         )
         artifact_manifest_sha256 = _write_artifact_manifest(building)
         if _sha256(args.checkpoint) != checkpoint_sha256:
@@ -5080,6 +5809,18 @@ def run(args: argparse.Namespace) -> Path:
             )
             if final_locked_evidence != locked_run_evidence:
                 raise RuntimeError("Locked full-run provenance changed during the audit")
+        elif profile.factorized_stage is not None:
+            final_locked_evidence = _validate_factorized_authorized_run(
+                checkpoint,
+                profile=profile,
+                checkpoint_path=args.checkpoint,
+                config_path=args.config,
+                authorization_path=args.authorization,
+            )
+            if final_locked_evidence != locked_run_evidence:
+                raise RuntimeError(
+                    "Factorized checkpoint/authorization provenance changed during audit"
+                )
         provenance = {
             "schema_name": SCHEMA_NAME,
             "schema_version": SCHEMA_VERSION,
@@ -5088,6 +5829,10 @@ def run(args: argparse.Namespace) -> Path:
             "stage": args.stage,
             "validation_only": True,
             "split": "val",
+            "evaluation_population": (
+                "development" if profile.development_only else "full_validation"
+            ),
+            "selection_unchanged": True,
             "checkpoint": str(args.checkpoint.resolve()),
             "checkpoint_sha256": checkpoint_sha256,
             "checkpoint_epoch": checkpoint_epoch,
@@ -5101,6 +5846,7 @@ def run(args: argparse.Namespace) -> Path:
             ],
             "validation_manifest": validation_manifest_identity,
             "locked_run_evidence": locked_run_evidence,
+            "retrieval_lookup_evidence": retrieval_lookup_evidence,
             "bank_identity": provider.identity,
             "git": _git_identity(),
             "runtime": {

@@ -22,22 +22,38 @@ from NIAF.continuous_sign_field.scripts.train_residual_flow import (
 )
 from NIAF.continuous_trajectory_field.models import build_continuous_trajectory_field
 from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field import (
+    bind_sentence_memory_validation_dataset,
     build_sentence_memory_provider,
+    build_development_validation_loader,
+    build_isolated_development_validation_loader,
     checkpoint_selection_diagnostics,
     configured_sentence_memory_eval_modes,
+    configured_selection_aggregation,
+    CLUSTER_EQUAL_SELECTION_AGGREGATION,
     distributed_validation_metrics,
     evaluate,
     evaluate_configured_modes,
     evaluated_loader_sample_count,
     is_dual_mode,
+    isolated_development_validation_config,
     is_sentence_memory_model,
+    load_isolated_development_validation_runtime,
+    paired_sentence_memory_corruption_config,
     sentence_memory_enabled,
+    sentence_memory_architecture_identity,
+    sentence_memory_evaluation_control_identity,
     sentence_memory_provider_required,
+    sentence_memory_selection_aggregation_identity,
     selection_diagnostics,
     set_seed,
     set_sentence_memory_provider_epoch_from_checkpoint,
     validate_checkpoint_contract,
     validate_sentence_memory_checkpoint_identity,
+    validate_sentence_memory_architecture_identity,
+    validate_sentence_memory_evaluation_control_identity,
+    validate_sentence_memory_selection_aggregation_identity,
+    validate_sentence_memory_validation_corruption_map_identity,
+    requires_isolated_development_validation,
 )
 from NIAF.retrieval_confidence_field.scripts.train_retrieval_adaptive_field import (
     validate_train_only_retrieval_bank,
@@ -85,10 +101,12 @@ def parse_args():
             "both",
             "shuffled",
             "motion_shuffled",
+            "analytic_prior",
         ),
         help=(
             "For v3, evaluate configured modes (auto), off, on, off+on "
-            "(both), or a deterministic full- or motion-only-shuffled control."
+            "(both), a deterministic full- or motion-only-shuffled control, "
+            "or analytic-prior attention."
         ),
     )
     parser.add_argument("--device", default=None)
@@ -131,6 +149,81 @@ def reduce_external_evaluation_metrics(
         device,
         dist_info,
     )
+
+
+def build_public_evaluation_loader(cfg, *, split, limit, dist_info):
+    """Build the public evaluator's query loader without exposing the holdout.
+
+    Active factorized paired experiments are development-only here. Confirmation
+    remains available exclusively through the post-lock exporter.
+    """
+
+    development_runtime = None
+    loader_cfg = cfg
+    if requires_isolated_development_validation(cfg):
+        validation_split = str(cfg.get("data", {}).get("val_split", "val"))
+        if str(split) != validation_split:
+            raise ValueError(
+                "Factorized paired evaluation is restricted to the sealed "
+                f"development partition of split {validation_split!r}; use the "
+                "post-lock confirmation exporter for confirmation data"
+            )
+        if int(limit) != 0:
+            raise ValueError(
+                "Factorized paired evaluation requires the complete sealed "
+                "development manifest; --limit is not permitted"
+            )
+        development_runtime = load_isolated_development_validation_runtime(cfg)
+        loader_cfg = isolated_development_validation_config(
+            cfg, development_runtime
+        )
+
+    dataset, loader, sampler = make_loader(
+        loader_cfg,
+        split,
+        limit=max(int(limit), 0),
+        shuffle=False,
+        distributed=dist_info["enabled"],
+        world_size=dist_info["world_size"],
+        # The provider below may initialize CUDA and transformer worker
+        # threads before this loader is first iterated. Avoid a late fork,
+        # which can leave every worker blocked on an inherited lock.
+        num_workers=int(cfg.get("eval", {}).get("num_workers", 0)),
+    )
+    return dataset, loader, sampler, development_runtime
+
+
+def bind_public_evaluation_development_loader(
+    cfg,
+    dataset,
+    loader,
+    sentence_memory_provider,
+    dist_info,
+    development_runtime,
+):
+    """Bind exact canonical neighbor rows and cluster the sealed dev loader."""
+
+    if development_runtime is None:
+        return loader, None, None
+    if sentence_memory_provider is None:
+        raise RuntimeError(
+            "Factorized development evaluation requires a sentence-memory "
+            "provider for exact canonical neighbor-table binding"
+        )
+    query_binding = bind_sentence_memory_validation_dataset(
+        cfg, sentence_memory_provider, dataset, development_runtime
+    )
+    development_loader, sampler, _runtime = (
+        build_isolated_development_validation_loader(
+            cfg,
+            dataset,
+            loader,
+            sentence_memory_provider,
+            dist_info,
+            development_runtime,
+        )
+    )
+    return development_loader, sampler, query_binding
 
 
 def main():
@@ -217,17 +310,16 @@ def main():
                 shuffle=False,
                 distributed=False,
             )
-        eval_dataset, eval_loader, _eval_sampler = make_loader(
+        (
+            eval_dataset,
+            eval_loader,
+            _eval_sampler,
+            development_runtime,
+        ) = build_public_evaluation_loader(
             cfg,
-            args.split,
-            limit=max(int(args.limit), 0),
-            shuffle=False,
-            distributed=dist_info["enabled"],
-            world_size=dist_info["world_size"],
-            # The provider below may initialize CUDA and transformer worker
-            # threads before this loader is first iterated. Avoid a late fork,
-            # which can leave every worker blocked on an inherited lock.
-            num_workers=int(cfg.get("eval", {}).get("num_workers", 0)),
+            split=args.split,
+            limit=args.limit,
+            dist_info=dist_info,
         )
         rank_zero_print(
             dist_info,
@@ -244,10 +336,50 @@ def main():
         sentence_memory_provider = (
             build_sentence_memory_provider(cfg, text_encoder, dataset=eval_dataset)
             if sentence_memory_model
-            and sentence_memory_provider_required(sentence_modes)
+            and (
+                development_runtime is not None
+                or sentence_memory_provider_required(sentence_modes)
+            )
             else None
         )
-        if sentence_memory_provider is not None:
+        development_query_binding = None
+        if development_runtime is not None:
+            (
+                eval_loader,
+                _eval_sampler,
+                development_query_binding,
+            ) = bind_public_evaluation_development_loader(
+                cfg,
+                eval_dataset,
+                eval_loader,
+                sentence_memory_provider,
+                dist_info,
+                development_runtime,
+            )
+        elif (
+            sentence_memory_model
+            and resolved_sentence_memory_mode in {"auto", "both"}
+            and paired_sentence_memory_corruption_config(cfg)["enabled"]
+            and configured_selection_aggregation(cfg)
+            == CLUSTER_EQUAL_SELECTION_AGGREGATION
+        ):
+            validation_split = str(data_cfg.get("val_split", "val"))
+            if str(args.split) != validation_split:
+                raise ValueError(
+                    "Cluster-equal checkpoint selection is defined only for the "
+                    f"development partition of split {validation_split!r}; use "
+                    "the confirmation exporter for post-lock analysis"
+                )
+            eval_loader, _eval_sampler, _partition = (
+                build_development_validation_loader(
+                    cfg,
+                    eval_dataset,
+                    eval_loader,
+                    sentence_memory_provider,
+                    dist_info,
+                )
+            )
+        if sentence_memory_provider is not None and development_runtime is None:
             sentence_memory_provider.validate_query_dataset(
                 eval_dataset,
                 require_neighbors=any(mode != "off" for mode in sentence_modes),
@@ -273,6 +405,22 @@ def main():
                 else None
             ),
         )
+        if sentence_memory_model:
+            validate_sentence_memory_architecture_identity(
+                checkpoint, cfg, source=str(args.checkpoint)
+            )
+            validate_sentence_memory_evaluation_control_identity(
+                checkpoint, cfg, source=str(args.checkpoint)
+            )
+            validate_sentence_memory_selection_aggregation_identity(
+                checkpoint, cfg, source=str(args.checkpoint)
+            )
+            if cfg.get("validation_text_partition", {}).get(
+                "evaluation_corruption_map_identity"
+            ) is not None:
+                validate_sentence_memory_validation_corruption_map_identity(
+                    checkpoint, cfg, source=str(args.checkpoint)
+                )
         model.load_state_dict(checkpoint["model"], strict=True)
         model.eval()
         fk = build_fk(cfg, device)
@@ -347,6 +495,34 @@ def main():
             "sentence_memory": (
                 getattr(sentence_memory_provider, "config_summary", None)
                 if sentence_memory_provider is not None
+                else None
+            ),
+            "development_validation_runtime": (
+                development_runtime.artifact_payload
+                if development_runtime is not None
+                else None
+            ),
+            "development_validation_query_binding": development_query_binding,
+            "sentence_memory_evaluation_control_identity": (
+                sentence_memory_evaluation_control_identity(cfg)
+                if sentence_memory_model
+                else None
+            ),
+            "sentence_memory_architecture_identity": (
+                sentence_memory_architecture_identity(cfg)
+                if sentence_memory_model
+                else None
+            ),
+            "sentence_memory_selection_aggregation_identity": (
+                sentence_memory_selection_aggregation_identity(cfg)
+                if sentence_memory_model
+                else None
+            ),
+            "sentence_memory_validation_corruption_map_identity": (
+                cfg.get("validation_text_partition", {}).get(
+                    "evaluation_corruption_map_identity"
+                )
+                if sentence_memory_model
                 else None
             ),
             "selection_score": float(score),

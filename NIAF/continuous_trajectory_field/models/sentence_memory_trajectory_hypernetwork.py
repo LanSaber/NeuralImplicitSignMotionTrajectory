@@ -18,6 +18,16 @@ from NIAF.continuous_trajectory_field.models.trajectory_instance import (
 
 SENTENCE_RETRIEVAL_FEATURE_DIM = 5
 SENTENCE_CONFIDENCE_FEATURE_DIM = 4
+LEGACY_SENTENCE_KEY_VALUE_MODE = "legacy_mixed_v1"
+FACTORIZED_SENTENCE_KEY_VALUE_MODE = "factorized_metadata_motion_v1"
+SENTENCE_KEY_VALUE_MODES = frozenset(
+    {
+        LEGACY_SENTENCE_KEY_VALUE_MODE,
+        FACTORIZED_SENTENCE_KEY_VALUE_MODE,
+    }
+)
+SENTENCE_TEMPORAL_PRIOR_MODES = frozenset({"none", "gaussian"})
+SENTENCE_ATTENTION_MODES = frozenset({"learned", "analytic_prior"})
 
 
 def _masked_candidate_softmax(logits: torch.Tensor, mask: torch.Tensor):
@@ -149,6 +159,170 @@ class SentenceMemoryCrossAttention(nn.Module):
 SentenceMemoryAttentionBlock = SentenceMemoryCrossAttention
 
 
+class FactorizedSentenceMemoryCrossAttention(nn.Module):
+    """Attend with metadata-only keys and motion-only, zero-preserving values."""
+
+    def __init__(self, hidden_dim: int, head_count: int, dropout: float):
+        super().__init__()
+        hidden_dim = int(hidden_dim)
+        head_count = int(head_count)
+        if hidden_dim % head_count:
+            raise ValueError("sentence-memory hidden_dim must be divisible by head_count")
+        self.hidden_dim = hidden_dim
+        self.head_count = head_count
+        self.head_dim = hidden_dim // head_count
+
+        # Query/key affine parameters cannot inject motion into the value path.
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.key_norm = nn.LayerNorm(hidden_dim)
+        self.query_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.key_projection = nn.Linear(hidden_dim, hidden_dim)
+
+        # Everything downstream of a motion value is exactly zero-preserving.
+        self.value_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.value_projection = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.output_projection = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.state_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4, bias=False),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden_dim * 4, hidden_dim, bias=False),
+        )
+
+        self.null_key = nn.Parameter(torch.zeros(head_count, self.head_dim))
+        self.null_logit_bias = nn.Parameter(torch.zeros(head_count))
+        self.attention_dropout = nn.Dropout(float(dropout))
+        self.output_dropout = nn.Dropout(float(dropout))
+        nn.init.normal_(self.null_key, mean=0.0, std=0.02)
+
+    def _heads(self, values: torch.Tensor):
+        batch, length, _hidden = values.shape
+        return values.reshape(
+            batch,
+            length,
+            self.head_count,
+            self.head_dim,
+        ).transpose(1, 2)
+
+    def forward(
+        self,
+        text_slots: torch.Tensor,
+        state: torch.Tensor,
+        candidate_keys: torch.Tensor,
+        motion_values: torch.Tensor,
+        token_log_prior: torch.Tensor,
+        token_mask: torch.Tensor,
+        null_confidence_bias: torch.Tensor,
+        candidate_count: int,
+        token_count: int,
+        *,
+        attention_mode: str = "learned",
+    ):
+        """Return the same four-tensor hook contract as the legacy block.
+
+        ``text_slots`` is the immutable text/part query for every layer. State
+        carries motion evidence between layers, but is deliberately excluded
+        from query construction.
+        """
+
+        attention_mode = str(attention_mode).lower()
+        if attention_mode not in SENTENCE_ATTENTION_MODES:
+            raise ValueError(
+                "sentence-memory attention_mode must be one of "
+                f"{sorted(SENTENCE_ATTENTION_MODES)}, got {attention_mode!r}"
+            )
+        batch, query_count, _hidden = text_slots.shape
+        if candidate_keys.shape != (batch, int(candidate_count), self.hidden_dim):
+            raise ValueError("candidate_keys must have shape [B,K,H]")
+        if motion_values.shape != (
+            batch,
+            int(candidate_count),
+            int(token_count),
+            self.hidden_dim,
+        ):
+            raise ValueError("motion_values must have shape [B,K,U,H]")
+        expected_prior_shape = (
+            batch,
+            query_count,
+            int(candidate_count),
+            int(token_count),
+        )
+        if token_log_prior.shape != expected_prior_shape:
+            raise ValueError("token_log_prior must have shape [B,Q,K,U]")
+        if token_mask.shape != expected_prior_shape:
+            raise ValueError("token_mask must have shape [B,Q,K,U]")
+
+        query = self._heads(
+            self.query_projection(self.query_norm(text_slots))
+        )
+        key = self._heads(
+            self.key_projection(self.key_norm(candidate_keys))
+        )
+        value = self._heads(
+            self.value_projection(
+                self.value_norm(
+                    motion_values.reshape(
+                        batch,
+                        int(candidate_count) * int(token_count),
+                        self.hidden_dim,
+                    )
+                )
+            )
+        )
+
+        if attention_mode == "analytic_prior":
+            candidate_logits = query.new_zeros(
+                batch,
+                self.head_count,
+                query_count,
+                int(candidate_count),
+            )
+        else:
+            candidate_logits = torch.matmul(query, key.transpose(-1, -2))
+            candidate_logits = candidate_logits / math.sqrt(float(self.head_dim))
+        real_logits = candidate_logits.unsqueeze(-1)
+        real_logits = real_logits + token_log_prior[:, None, :, :, :]
+        real_logits = real_logits.masked_fill(
+            ~token_mask[:, None, :, :, :],
+            -torch.inf,
+        )
+        real_logits = real_logits.reshape(
+            batch,
+            self.head_count,
+            query_count,
+            int(candidate_count) * int(token_count),
+        )
+
+        null_logits = torch.einsum("bhqd,hd->bhq", query, self.null_key)
+        null_logits = null_logits / math.sqrt(float(self.head_dim))
+        null_logits = null_logits + self.null_logit_bias[None, :, None]
+        null_logits = null_logits + null_confidence_bias[:, None, None]
+        probabilities = torch.softmax(
+            torch.cat([null_logits.unsqueeze(-1), real_logits], dim=-1),
+            dim=-1,
+        )
+        null_mass = probabilities[..., 0].mean(dim=1)
+        real_probabilities = probabilities[..., 1:]
+        dropped_probabilities = self.attention_dropout(real_probabilities)
+        update = torch.matmul(dropped_probabilities, value)
+        update = update.transpose(1, 2).reshape_as(state)
+        state = state + self.output_dropout(self.output_projection(update))
+        state = state + self.output_dropout(
+            self.feed_forward(self.state_norm(state))
+        )
+
+        real_mean = real_probabilities.mean(dim=1)
+        token_mass = real_mean.reshape(
+            batch,
+            query_count,
+            int(candidate_count),
+            int(token_count),
+        )
+        candidate_mass = token_mass.sum(dim=-1)
+        return state, null_mass, candidate_mass, token_mass
+
+
 class SentenceMemorySlotEncoder(nn.Module):
     """Softly align top-K sentence-motion memories to the target text slots."""
 
@@ -163,6 +337,10 @@ class SentenceMemorySlotEncoder(nn.Module):
         score_temperature: float = 0.10,
         duration_weight: float = 0.10,
         retrieval_prior_scale: float = 1.0,
+        key_value_mode: str | None = None,
+        temporal_prior_mode: str = "none",
+        temporal_prior_sigma: float = 0.25,
+        temporal_prior_scale: float = 1.0,
     ):
         super().__init__()
         self.motion_dim = int(motion_dim)
@@ -171,32 +349,76 @@ class SentenceMemorySlotEncoder(nn.Module):
         self.score_temperature = max(float(score_temperature), 1e-4)
         self.duration_weight = max(float(duration_weight), 0.0)
         self.retrieval_prior_scale = float(retrieval_prior_scale)
+        self.key_value_mode = (
+            LEGACY_SENTENCE_KEY_VALUE_MODE
+            if key_value_mode is None
+            else str(key_value_mode).lower()
+        )
+        if self.key_value_mode not in SENTENCE_KEY_VALUE_MODES:
+            raise ValueError(
+                "sentence-memory key_value_mode must be one of "
+                f"{sorted(SENTENCE_KEY_VALUE_MODES)}, got {self.key_value_mode!r}"
+            )
+        self.temporal_prior_mode = str(temporal_prior_mode).lower()
+        if self.temporal_prior_mode not in SENTENCE_TEMPORAL_PRIOR_MODES:
+            raise ValueError(
+                "sentence-memory temporal_prior_mode must be one of "
+                f"{sorted(SENTENCE_TEMPORAL_PRIOR_MODES)}, "
+                f"got {self.temporal_prior_mode!r}"
+            )
+        self.temporal_prior_sigma = float(temporal_prior_sigma)
+        if not math.isfinite(self.temporal_prior_sigma) or self.temporal_prior_sigma <= 0:
+            raise ValueError("sentence-memory temporal_prior_sigma must be positive")
+        self.temporal_prior_scale = float(temporal_prior_scale)
+        if not math.isfinite(self.temporal_prior_scale) or self.temporal_prior_scale < 0:
+            raise ValueError("sentence-memory temporal_prior_scale must be non-negative")
 
-        self.motion_projection = nn.Sequential(
-            nn.LayerNorm(self.motion_dim),
-            nn.Linear(self.motion_dim, self.hidden_dim),
-        )
-        self.key_projection = nn.Sequential(
-            nn.LayerNorm(self.key_dim),
-            nn.Linear(self.key_dim, self.hidden_dim),
-        )
-        self.time_projection = nn.Sequential(
-            nn.Linear(5, self.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
-        self.feature_projection = nn.Sequential(
-            nn.Linear(SENTENCE_RETRIEVAL_FEATURE_DIM, self.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
-        self.memory_norm = nn.LayerNorm(self.hidden_dim)
+        if self.key_value_mode == LEGACY_SENTENCE_KEY_VALUE_MODE:
+            # Keep this branch byte-for-byte equivalent in topology and module
+            # registration order to existing v3 checkpoints.
+            self.motion_projection = nn.Sequential(
+                nn.LayerNorm(self.motion_dim),
+                nn.Linear(self.motion_dim, self.hidden_dim),
+            )
+            self.key_projection = nn.Sequential(
+                nn.LayerNorm(self.key_dim),
+                nn.Linear(self.key_dim, self.hidden_dim),
+            )
+            self.time_projection = nn.Sequential(
+                nn.Linear(5, self.hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+            )
+            self.feature_projection = nn.Sequential(
+                nn.Linear(SENTENCE_RETRIEVAL_FEATURE_DIM, self.hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+            )
+            self.memory_norm = nn.LayerNorm(self.hidden_dim)
+        else:
+            self.motion_projection = nn.Sequential(
+                nn.LayerNorm(self.motion_dim, elementwise_affine=False),
+                nn.Linear(self.motion_dim, self.hidden_dim, bias=False),
+            )
+            self.key_projection = nn.Sequential(
+                nn.LayerNorm(self.key_dim),
+                nn.Linear(self.key_dim, self.hidden_dim),
+            )
+            self.feature_projection = nn.Sequential(
+                nn.Linear(SENTENCE_RETRIEVAL_FEATURE_DIM, self.hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+            )
         self.part_query_embeddings = nn.Parameter(
             torch.zeros(PART_COUNT, self.hidden_dim)
         )
         self.part_query_projections = nn.ModuleList(
             [
-                nn.Linear(self.hidden_dim, self.hidden_dim)
+                nn.Linear(
+                    self.hidden_dim,
+                    self.hidden_dim,
+                    bias=self.key_value_mode == LEGACY_SENTENCE_KEY_VALUE_MODE,
+                )
                 for _ in range(PART_COUNT)
             ]
         )
@@ -208,10 +430,18 @@ class SentenceMemorySlotEncoder(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                SentenceMemoryCrossAttention(
-                    hidden_dim=self.hidden_dim,
-                    head_count=int(head_count),
-                    dropout=float(dropout),
+                (
+                    SentenceMemoryCrossAttention(
+                        hidden_dim=self.hidden_dim,
+                        head_count=int(head_count),
+                        dropout=float(dropout),
+                    )
+                    if self.key_value_mode == LEGACY_SENTENCE_KEY_VALUE_MODE
+                    else FactorizedSentenceMemoryCrossAttention(
+                        hidden_dim=self.hidden_dim,
+                        head_count=int(head_count),
+                        dropout=float(dropout),
+                    )
                 )
                 for _ in range(max(int(layer_count), 1))
             ]
@@ -308,6 +538,256 @@ class SentenceMemorySlotEncoder(nn.Module):
         confidence = torch.stack([best, margin, entropy, minimum_gap], dim=-1)
         return adjusted_scores, probabilities, duration_gap, confidence
 
+    def _part_queries(self, text_slots: torch.Tensor):
+        batch, slot_count, _hidden = text_slots.shape
+        queries = torch.stack(
+            [
+                projection(text_slots) + self.part_query_embeddings[index]
+                for index, projection in enumerate(self.part_query_projections)
+            ],
+            dim=2,
+        )
+        return queries.reshape(
+            batch,
+            slot_count * PART_COUNT,
+            self.hidden_dim,
+        )
+
+    def _factorized_candidate_log_prior(
+        self,
+        adjusted_scores: torch.Tensor,
+        candidate_mask: torch.Tensor,
+    ):
+        logits = adjusted_scores / self.score_temperature
+        masked_logits = logits.masked_fill(~candidate_mask, -torch.inf)
+        normalizer = torch.logsumexp(masked_logits, dim=-1, keepdim=True)
+        has_candidate = candidate_mask.any(dim=-1, keepdim=True)
+        # Avoid forming ``-inf - -inf`` for all-null rows.  Although the
+        # subsequent where masks those values in the forward pass, the NaN can
+        # otherwise leak through logsumexp's backward when candidate dropout
+        # removes every real memory.
+        safe_normalizer = torch.where(
+            has_candidate,
+            normalizer,
+            torch.zeros_like(normalizer),
+        )
+        log_prior = torch.where(
+            candidate_mask & has_candidate,
+            masked_logits - safe_normalizer,
+            torch.full_like(masked_logits, -torch.inf),
+        )
+        if self.retrieval_prior_scale == 0.0:
+            return torch.where(
+                candidate_mask,
+                torch.zeros_like(log_prior),
+                torch.full_like(log_prior, -torch.inf),
+            )
+        return log_prior * self.retrieval_prior_scale
+
+    def _factorized_token_log_prior(
+        self,
+        *,
+        motion_mask: torch.Tensor,
+        part_validity: torch.Tensor,
+        motion_tau: torch.Tensor,
+        slot_tau: torch.Tensor | None,
+        candidate_log_prior: torch.Tensor,
+        slot_count: int,
+    ):
+        batch, candidates, tokens = motion_mask.shape
+        dtype = motion_tau.dtype
+        device = motion_tau.device
+        if slot_tau is None:
+            resolved_slot_tau = torch.linspace(
+                -1.0,
+                1.0,
+                int(slot_count),
+                dtype=dtype,
+                device=device,
+            ).view(1, int(slot_count))
+        else:
+            resolved_slot_tau = slot_tau.to(device=device, dtype=dtype)
+            if resolved_slot_tau.ndim == 1:
+                if resolved_slot_tau.shape != (int(slot_count),):
+                    raise ValueError("slot_tau must have shape [S] or [B,S]")
+                resolved_slot_tau = resolved_slot_tau.view(1, int(slot_count))
+            elif resolved_slot_tau.shape != (batch, int(slot_count)):
+                raise ValueError("slot_tau must have shape [S] or [B,S]")
+        resolved_slot_tau = resolved_slot_tau.expand(batch, -1).clamp(-1.0, 1.0)
+
+        validity = part_validity.permute(0, 3, 1, 2)
+        validity = validity[:, None, :, :, :].expand(
+            -1,
+            int(slot_count),
+            -1,
+            -1,
+            -1,
+        )
+        valid = motion_mask[:, None, None, :, :] & (validity > 0.0)
+        if self.temporal_prior_mode == "gaussian":
+            token_logits = torch.log(
+                validity.clamp_min(torch.finfo(dtype).tiny)
+            )
+            difference = (
+                resolved_slot_tau[:, :, None, None]
+                - motion_tau[:, None, :, :]
+            )
+            gaussian = -0.5 * (
+                difference / self.temporal_prior_sigma
+            ).square()
+            token_logits = (
+                token_logits
+                + self.temporal_prior_scale * gaussian[:, :, None]
+            )
+        else:
+            # Stage 1 uses a uniform distribution over the positive-validity
+            # support. Fractional validity weights are introduced only by the
+            # explicit Stage-2 Gaussian prior.
+            token_logits = torch.zeros_like(validity)
+        token_logits = token_logits.masked_fill(~valid, -torch.inf)
+        token_normalizer = torch.logsumexp(token_logits, dim=-1, keepdim=True)
+        has_valid_token = valid.any(dim=-1, keepdim=True)
+        safe_token_normalizer = torch.where(
+            has_valid_token,
+            token_normalizer,
+            torch.zeros_like(token_normalizer),
+        )
+        token_log_prior = torch.where(
+            valid & has_valid_token,
+            token_logits - safe_token_normalizer,
+            torch.full_like(token_logits, -torch.inf),
+        )
+        token_log_prior = token_log_prior + candidate_log_prior[
+            :, None, None, :, None
+        ]
+        token_log_prior = token_log_prior.reshape(
+            batch,
+            int(slot_count) * PART_COUNT,
+            candidates,
+            tokens,
+        )
+        token_mask = valid.reshape_as(token_log_prior)
+        return token_log_prior, token_mask
+
+    def _forward_factorized(
+        self,
+        *,
+        text_slots: torch.Tensor,
+        motion_tokens: torch.Tensor,
+        motion_mask: torch.Tensor,
+        text_keys: torch.Tensor,
+        retrieval_features: torch.Tensor,
+        adjusted_scores: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        confidence: torch.Tensor,
+        tau: torch.Tensor,
+        part_validity: torch.Tensor | None,
+        slot_tau: torch.Tensor | None,
+        attention_mode: str,
+    ):
+        batch, candidates, tokens, _motion_dim = motion_tokens.shape
+        slot_count = int(text_slots.shape[1])
+        dtype = text_slots.dtype
+        device = text_slots.device
+        if part_validity is None:
+            resolved_part_validity = torch.ones(
+                batch,
+                candidates,
+                tokens,
+                PART_COUNT,
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            resolved_part_validity = part_validity.to(
+                device=device,
+                dtype=dtype,
+            ).clamp(0.0, 1.0)
+        resolved_part_validity = resolved_part_validity * motion_mask[..., None].to(
+            dtype
+        )
+
+        # K has only sentence text and retrieval metadata; V has only motion.
+        candidate_keys = self.key_projection(text_keys)
+        candidate_keys = candidate_keys + self.feature_projection(retrieval_features)
+        motion_values = self.motion_projection(motion_tokens)
+        motion_values = torch.where(
+            motion_mask[..., None],
+            motion_values,
+            torch.zeros_like(motion_values),
+        )
+        candidate_log_prior = self._factorized_candidate_log_prior(
+            adjusted_scores,
+            candidate_mask,
+        )
+        token_log_prior, token_mask = self._factorized_token_log_prior(
+            motion_mask=motion_mask,
+            part_validity=resolved_part_validity,
+            motion_tau=tau,
+            slot_tau=slot_tau,
+            candidate_log_prior=candidate_log_prior,
+            slot_count=slot_count,
+        )
+
+        part_queries = self._part_queries(text_slots)
+        state = part_queries.new_zeros(part_queries.shape)
+        null_mass = text_slots.new_ones(batch, slot_count * PART_COUNT)
+        candidate_mass = text_slots.new_zeros(
+            batch,
+            slot_count * PART_COUNT,
+            candidates,
+        )
+        token_mass = text_slots.new_zeros(
+            batch,
+            slot_count * PART_COUNT,
+            candidates,
+            tokens,
+        )
+        query_has_memory = token_mask.any(dim=(-1, -2))
+        null_bias = self.null_confidence(confidence).squeeze(-1)
+        for layer in self.layers:
+            state, null_mass, candidate_mass, token_mass = layer(
+                part_queries,
+                state,
+                candidate_keys,
+                motion_values,
+                token_log_prior,
+                token_mask,
+                null_bias,
+                candidates,
+                tokens,
+                attention_mode=attention_mode,
+            )
+            state = torch.where(
+                query_has_memory[..., None],
+                state,
+                torch.zeros_like(state),
+            )
+
+        state = state.reshape(batch, slot_count, PART_COUNT, self.hidden_dim)
+        part_null_mass = null_mass.reshape(batch, slot_count, PART_COUNT)
+        part_candidate_mass = candidate_mass.reshape(
+            batch,
+            slot_count,
+            PART_COUNT,
+            candidates,
+        )
+        part_available = query_has_memory.reshape(
+            batch,
+            slot_count,
+            PART_COUNT,
+        ).to(dtype)
+        return {
+            "slots": state,
+            "part_null_mass": part_null_mass,
+            "null_mass": part_null_mass.mean(dim=2),
+            "candidate_mass": part_candidate_mass.mean(dim=2),
+            "part_validity": part_available,
+            "confidence": confidence,
+            "available": candidate_mask.any(dim=-1),
+            "adjusted_scores": adjusted_scores,
+        }
+
     def forward(
         self,
         text_slots: torch.Tensor,
@@ -321,7 +801,23 @@ class SentenceMemorySlotEncoder(nn.Module):
         *,
         motion_tau: torch.Tensor | None = None,
         part_validity: torch.Tensor | None = None,
+        slot_tau: torch.Tensor | None = None,
+        attention_mode: str = "learned",
     ):
+        attention_mode = str(attention_mode).lower()
+        if attention_mode not in SENTENCE_ATTENTION_MODES:
+            raise ValueError(
+                "sentence-memory attention_mode must be one of "
+                f"{sorted(SENTENCE_ATTENTION_MODES)}, got {attention_mode!r}"
+            )
+        if (
+            self.key_value_mode == LEGACY_SENTENCE_KEY_VALUE_MODE
+            and attention_mode != "learned"
+        ):
+            raise ValueError(
+                "analytic_prior attention requires "
+                f"key_value_mode={FACTORIZED_SENTENCE_KEY_VALUE_MODE!r}"
+            )
         batch, candidates, tokens = self.validate_inputs(
             motion_tokens,
             motion_mask,
@@ -361,13 +857,37 @@ class SentenceMemorySlotEncoder(nn.Module):
         # caller consistently permutes candidates and all their metadata.
         greater = adjusted[:, None, :] > adjusted[:, :, None]
         greater = greater & candidate_mask[:, None, :]
-        ranks = greater.sum(dim=-1).to(dtype) / max(candidates - 1, 1)
+        rank_numerator = greater.sum(dim=-1).to(dtype)
+        if self.key_value_mode == FACTORIZED_SENTENCE_KEY_VALUE_MODE:
+            rank_denominator = (
+                candidate_mask.sum(dim=-1).sub(1).clamp_min(1).to(dtype)
+            )[:, None]
+            ranks = rank_numerator / rank_denominator
+        else:
+            # Preserve the legacy mixed-memory computation exactly.
+            ranks = rank_numerator / max(candidates - 1, 1)
         ranks = ranks * candidate_mask.to(dtype)
         margin = confidence[:, 1:2].expand(-1, candidates)
         retrieval_features = torch.stack(
             [scores, probabilities, ranks, duration_gap, margin],
             dim=-1,
         )
+
+        if self.key_value_mode == FACTORIZED_SENTENCE_KEY_VALUE_MODE:
+            return self._forward_factorized(
+                text_slots=text_slots,
+                motion_tokens=motion_tokens,
+                motion_mask=motion_mask,
+                text_keys=text_keys,
+                retrieval_features=retrieval_features,
+                adjusted_scores=adjusted,
+                candidate_mask=candidate_mask,
+                confidence=confidence,
+                tau=tau,
+                part_validity=part_validity,
+                slot_tau=slot_tau,
+                attention_mode=attention_mode,
+            )
 
         memory = self.motion_projection(motion_tokens)
         memory = memory + self.key_projection(text_keys)[:, :, None, :]
@@ -393,19 +913,8 @@ class SentenceMemorySlotEncoder(nn.Module):
         log_prior = log_prior.reshape(batch, candidates * tokens)
         null_bias = self.null_confidence(confidence).squeeze(-1)
 
-        part_queries = torch.stack(
-            [
-                projection(text_slots) + self.part_query_embeddings[index]
-                for index, projection in enumerate(self.part_query_projections)
-            ],
-            dim=2,
-        )
+        part_queries = self._part_queries(text_slots)
         slot_count = text_slots.shape[1]
-        part_queries = part_queries.reshape(
-            batch,
-            slot_count * PART_COUNT,
-            self.hidden_dim,
-        )
         state = part_queries.new_zeros(part_queries.shape)
         null_mass = text_slots.new_ones(batch, slot_count * PART_COUNT)
         candidate_mass = text_slots.new_zeros(
@@ -506,6 +1015,10 @@ class SentenceMemoryTrajectoryHypernetwork(DualModeTrajectoryHypernetwork):
         sentence_duration_weight: float = 0.10,
         sentence_retrieval_prior_scale: float = 1.0,
         sentence_gate_initial_bias: float = -2.2,
+        sentence_key_value_mode: str | None = None,
+        sentence_temporal_prior_mode: str = "none",
+        sentence_temporal_prior_sigma: float = 0.25,
+        sentence_temporal_prior_scale: float = 1.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -521,6 +1034,14 @@ class SentenceMemoryTrajectoryHypernetwork(DualModeTrajectoryHypernetwork):
             score_temperature=float(sentence_score_temperature),
             duration_weight=float(sentence_duration_weight),
             retrieval_prior_scale=float(sentence_retrieval_prior_scale),
+            key_value_mode=sentence_key_value_mode,
+            temporal_prior_mode=str(sentence_temporal_prior_mode),
+            temporal_prior_sigma=float(sentence_temporal_prior_sigma),
+            temporal_prior_scale=float(sentence_temporal_prior_scale),
+        )
+        factorized = (
+            self.sentence_memory_encoder.key_value_mode
+            == FACTORIZED_SENTENCE_KEY_VALUE_MODE
         )
         gate_input_dim = self.context_hidden_dim * 2 + SENTENCE_CONFIDENCE_FEATURE_DIM
         self.sentence_memory_gate = nn.Sequential(
@@ -531,7 +1052,11 @@ class SentenceMemoryTrajectoryHypernetwork(DualModeTrajectoryHypernetwork):
         )
         self.sentence_memory_part_projections = nn.ModuleList(
             [
-                nn.Linear(self.context_hidden_dim, self.context_hidden_dim)
+                nn.Linear(
+                    self.context_hidden_dim,
+                    self.context_hidden_dim,
+                    bias=not factorized,
+                )
                 for _ in range(PART_COUNT)
             ]
         )
@@ -598,7 +1123,17 @@ class SentenceMemoryTrajectoryHypernetwork(DualModeTrajectoryHypernetwork):
         sentence_candidate_mask: torch.Tensor | None = None,
         sentence_part_validity: torch.Tensor | None = None,
         sentence_memory_available: torch.Tensor | None = None,
+        sentence_memory_attention_mode: str = "learned",
     ) -> TrajectoryInstance:
+        sentence_memory_attention_mode = str(
+            sentence_memory_attention_mode
+        ).lower()
+        if sentence_memory_attention_mode not in SENTENCE_ATTENTION_MODES:
+            raise ValueError(
+                "sentence_memory_attention_mode must be one of "
+                f"{sorted(SENTENCE_ATTENTION_MODES)}, "
+                f"got {sentence_memory_attention_mode!r}"
+            )
         sentence_inputs = self._sentence_inputs(
             sentence_motion_tokens,
             sentence_motion_mask,
@@ -713,6 +1248,8 @@ class SentenceMemoryTrajectoryHypernetwork(DualModeTrajectoryHypernetwork):
             sentence_candidate_mask,
             motion_tau=sentence_motion_tau,
             part_validity=sentence_part_validity,
+            slot_tau=slot_tau,
+            attention_mode=sentence_memory_attention_mode,
         )
         if sentence_memory_available is None:
             sentence_memory_available = sentence["available"]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import asdict
 
@@ -1376,3 +1377,397 @@ def test_diagnostic_motion_shuffle_matches_canonical_epoch_salted_utility():
     assert torch.equal(observed.tokens, expected.tokens)
     assert observed.provenance == expected.provenance
     assert observed.provenance["motion_only_shuffle_epoch"] == 3
+
+
+def _factorized_authorization_fixture(tmp_path, monkeypatch, *, stage="stage1"):
+    profile = diagnostic_cli.DIAGNOSTIC_PROFILES[
+        diagnostic_cli.FACTORIZED_PROFILE_NAMES[stage]
+    ]
+    cfg = diagnostic_cli.load_config(profile.config)
+    checkpoint_path = tmp_path / "run" / "checkpoints" / "best.pt"
+    checkpoint_path.parent.mkdir(parents=True)
+    checkpoint_path.write_bytes(b"factorized checkpoint")
+    authorization_path = tmp_path / "authorize_confirmation.json"
+    authorization_path.write_text("{}\n", encoding="utf-8")
+    development_manifest = tmp_path / "manifest_development.jsonl"
+    rows = [
+        {"name": f"row-{index}", "text": f"novel text {index % 256}"}
+        for index in range(347)
+    ]
+    development_manifest.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    source_head = "a" * 40
+    launch_path = tmp_path / "run_launch_identity.json"
+    launch = {
+        "launch_identity": "launch-id",
+        "source": {
+            "git_head": source_head,
+            "remote_ref": "origin/fixed",
+            "remote_head": source_head,
+            "repository_root": str(diagnostic_cli.PROJECT_ROOT.resolve()),
+            "git_directory": str(
+                (diagnostic_cli.PROJECT_ROOT / ".git").resolve()
+            ),
+            "durable_experiments_root": str(
+                (diagnostic_cli.PROJECT_ROOT / "experiments").resolve()
+            ),
+            "frozen_text_model_root": str(
+                (diagnostic_cli.PROJECT_ROOT / "deps/mt5-base").resolve()
+            ),
+            "standalone_shared_clone_checked": True,
+            "worktree_clean_checked": True,
+            "remote_ref_exact_match_checked": True,
+        },
+    }
+    launch_path.write_text(json.dumps(launch), encoding="utf-8")
+
+    checkpoint_cfg = copy.deepcopy(cfg)
+    checkpoint_cfg.setdefault("validation_text_partition", {}).update(
+        {
+            "partition_digest": (
+                diagnostic_cli.EXPECTED_FACTORIZED_PARTITION_DIGEST
+            ),
+            "resolved_artifact": {"runtime_only": True},
+            "confirmation_evaluated_during_training": False,
+        }
+    )
+    checkpoint_cfg["device"] = "cuda"
+    functions = {
+        "architecture": diagnostic_cli.sentence_memory_architecture_identity,
+        "behavior": diagnostic_cli.sentence_memory_behavior_identity,
+        "objective": diagnostic_cli.sentence_memory_objective_identity,
+        "resume": diagnostic_cli.sentence_memory_resume_identity,
+        "evaluation_control": (
+            diagnostic_cli.sentence_memory_evaluation_control_identity
+        ),
+        "selection_aggregation": (
+            diagnostic_cli.sentence_memory_selection_aggregation_identity
+        ),
+    }
+    identities = {
+        name: function(checkpoint_cfg) for name, function in functions.items()
+    }
+    # Runtime partition resolution belongs in the resume identity only; all
+    # behavior identities must still match the immutable source configuration.
+    for name, function in functions.items():
+        if name != "resume":
+            assert identities[name] == function(cfg)
+    assert identities["resume"] != functions["resume"](cfg)
+    corruption = diagnostic_cli.sentence_memory_validation_corruption_map_identity(
+        cfg,
+        partition_digest=diagnostic_cli.EXPECTED_FACTORIZED_PARTITION_DIGEST,
+        bank_id=diagnostic_cli.EXPECTED_FACTORIZED_BANK_ID,
+    )
+    checkpoint = {
+        "epoch": 2,
+        "config": checkpoint_cfg,
+        "sentence_memory_identity": {
+            "bank_id": diagnostic_cli.EXPECTED_FACTORIZED_BANK_ID,
+            "neighbor_tables": {
+                split: {"sha256": sha}
+                for split, sha in (
+                    diagnostic_cli.EXPECTED_FACTORIZED_NEIGHBOR_SHA256.items()
+                )
+            },
+        },
+        **{
+            f"sentence_memory_{name}_identity": value
+            for name, value in identities.items()
+        },
+        "sentence_memory_validation_corruption_map_identity": corruption,
+    }
+    authorized_identities = {
+        name: {"digest": value["digest"], "value": value}
+        for name, value in identities.items()
+    }
+    authorized_identities["validation_corruption_map"] = {
+        "digest": corruption["digest"],
+        "value": corruption,
+    }
+    authorization = {
+        "authorization_identity": "authorization-id",
+        "decision_identity": "decision-id",
+        "test_data_accessed": False,
+        "confirmation_manifest_opened": False,
+        "checkpoint": {
+            "path": str(checkpoint_path),
+            "sha256": diagnostic_cli._sha256(checkpoint_path),
+            "epoch": checkpoint["epoch"],
+            "config": {
+                "path": str(profile.config.resolve()),
+                "sha256": diagnostic_cli._sha256(profile.config),
+            },
+            "identities": authorized_identities,
+            "bank_id": diagnostic_cli.EXPECTED_FACTORIZED_BANK_ID,
+            "neighbor_table_sha256": (
+                diagnostic_cli.EXPECTED_FACTORIZED_NEIGHBOR_SHA256
+            ),
+        },
+        "partition": {
+            "partition_digest": diagnostic_cli.EXPECTED_FACTORIZED_PARTITION_DIGEST,
+            "development_manifest": str(development_manifest),
+            "development_manifest_sha256": diagnostic_cli._sha256(
+                development_manifest
+            ),
+            "development_rows": 347,
+            "development_unique_texts": 256,
+        },
+        "run_launch_identity": {
+            "path": str(launch_path),
+            "sha256": diagnostic_cli._sha256(launch_path),
+            "launch_identity": launch["launch_identity"],
+            "source": launch["source"],
+        },
+        "predecessor_authorization": None,
+    }
+    predecessor_authorization = None
+    if stage == "stage2":
+        predecessor_path = tmp_path / "authorize_stage2.json"
+        predecessor_path.write_text("{}\n", encoding="utf-8")
+        predecessor_authorization = {
+            "authorization_identity": "stage1-infeasible-authorization",
+            "decision_identity": "stage1-infeasible-decision",
+        }
+        authorization["predecessor_authorization"] = {
+            "path": str(predecessor_path),
+            "sha256": diagnostic_cli._sha256(predecessor_path),
+            **predecessor_authorization,
+        }
+    from NIAF.continuous_trajectory_field.scripts import (
+        decide_factorized_memory_stage as decision_cli,
+    )
+
+    def verify_authorization(path, *, purpose, stage):
+        del path
+        if purpose == "confirmation" and stage == profile.factorized_stage:
+            return authorization
+        if (
+            predecessor_authorization is not None
+            and purpose == "stage2"
+            and stage == "stage1"
+        ):
+            return predecessor_authorization
+        raise AssertionError(f"unexpected authorization request: {purpose}/{stage}")
+
+    monkeypatch.setattr(decision_cli, "verify_authorization", verify_authorization)
+    monkeypatch.setenv("SIGNTRAJ_SOURCE_GIT_HEAD", source_head)
+    monkeypatch.setattr(
+        diagnostic_cli,
+        "_factorized_source_checkout_identity",
+        lambda expected_head: {
+            "repository_root": str(diagnostic_cli.PROJECT_ROOT.resolve()),
+            "git_directory": str(
+                (diagnostic_cli.PROJECT_ROOT / ".git").resolve()
+            ),
+            "git_head": expected_head,
+            "durable_experiments_root": str(
+                (diagnostic_cli.PROJECT_ROOT / "experiments").resolve()
+            ),
+            "frozen_text_model_root": str(
+                (diagnostic_cli.PROJECT_ROOT / "deps/mt5-base").resolve()
+            ),
+            "standalone_shared_clone_checked": True,
+            "worktree_clean_checked": True,
+        },
+    )
+    return profile, cfg, checkpoint, checkpoint_path, authorization_path
+
+
+def test_factorized_profiles_are_development_only_and_expose_analytic_prior():
+    for stage, name in diagnostic_cli.FACTORIZED_PROFILE_NAMES.items():
+        profile = diagnostic_cli.DIAGNOSTIC_PROFILES[name]
+        assert profile.factorized_stage == stage
+        assert profile.development_only is True
+        assert profile.checkpoint.name == "best.pt"
+        assert profile.output.name == "locked_development_slot_diagnostics"
+        assert profile.memory_conditions == (
+            "correct",
+            "motion_only_shuffle",
+            "shuffled",
+            "analytic_prior",
+        )
+        diagnostic_cli._validate_config(
+            diagnostic_cli.load_config(profile.config), profile
+        )
+    assert diagnostic_cli.DIAGNOSTIC_PROFILES[
+        diagnostic_cli.LEGACY_PROFILE_NAME
+    ].memory_conditions == diagnostic_cli.MEMORY_CONDITIONS
+
+
+def test_factorized_diagnostic_binds_exact_name_indexed_neighbor_subset():
+    subset_sha256 = "b" * 64
+
+    class Dataset:
+        split = "val"
+
+    class Provider:
+        def __init__(self, *, lookup_mode="exact_name_indexed_parent_subset_v1"):
+            self.identity = {
+                "neighbor_tables": {
+                    "val": {
+                        "sha256": diagnostic_cli.EXPECTED_FACTORIZED_NEIGHBOR_SHA256[
+                            "val"
+                        ],
+                        "query_manifest_sha256": (
+                            diagnostic_cli.EXPECTED_VALIDATION_MANIFEST_SHA256
+                        ),
+                        "query_count": diagnostic_cli.EXPECTED_VALIDATION_ROWS,
+                        "query_order_sha256": "c" * 64,
+                    }
+                }
+            }
+            self.lookup_mode = lookup_mode
+            self.neighbor_table = None
+            self.bind_args = None
+
+        def set_dataset_with_name_indexed_neighbor_subset(
+            self,
+            dataset,
+            *,
+            parent_manifest_sha256,
+            expected_subset_manifest_sha256,
+        ):
+            self.bind_args = (
+                dataset,
+                parent_manifest_sha256,
+                expected_subset_manifest_sha256,
+            )
+            query_names = [
+                f"dev-{index}"
+                for index in range(diagnostic_cli.EXPECTED_DEVELOPMENT_ROWS)
+            ]
+            self.neighbor_table = {
+                "lookup_mode": self.lookup_mode,
+                "parent_query_manifest_sha256": parent_manifest_sha256,
+                "parent_query_order_sha256": "c" * 64,
+                "parent_query_count": diagnostic_cli.EXPECTED_VALIDATION_ROWS,
+                "parent_query_rows": np.arange(
+                    diagnostic_cli.EXPECTED_DEVELOPMENT_ROWS, dtype=np.int64
+                ),
+                "query_manifest_sha256": expected_subset_manifest_sha256,
+                "query_order_sha256": diagnostic_cli._digest_json(query_names),
+                "query_names": query_names,
+                "path": "neighbors_val.npz",
+            }
+            return self
+
+        def validate_query_dataset(self, dataset, *, require_neighbors=False):
+            assert require_neighbors is True
+            assert dataset is self.bind_args[0]
+            return {
+                "split": "val",
+                "manifest_sha256": subset_sha256,
+                "neighbor_table": "neighbors_val.npz",
+            }
+
+    dataset = Dataset()
+    provider = Provider()
+    evidence = diagnostic_cli._bind_factorized_development_neighbor_subset(
+        provider,
+        dataset,
+        parent_manifest_sha256=diagnostic_cli.EXPECTED_VALIDATION_MANIFEST_SHA256,
+        subset_manifest_sha256=subset_sha256,
+    )
+    assert provider.bind_args == (
+        dataset,
+        diagnostic_cli.EXPECTED_VALIDATION_MANIFEST_SHA256,
+        subset_sha256,
+    )
+    assert evidence["lookup_mode"] == (
+        "exact_name_indexed_parent_subset_v1"
+    )
+    assert evidence["online_retrieval_fallback"] == "forbidden"
+    assert evidence["canonical_table"]["parent_query_count"] == 1077
+    assert evidence["development_subset"]["query_count"] == 347
+
+    with pytest.raises(RuntimeError, match="exact authorized development projection"):
+        diagnostic_cli._bind_factorized_development_neighbor_subset(
+            Provider(lookup_mode="online"),
+            dataset,
+            parent_manifest_sha256=(
+                diagnostic_cli.EXPECTED_VALIDATION_MANIFEST_SHA256
+            ),
+            subset_manifest_sha256=subset_sha256,
+        )
+
+
+def test_factorized_authorization_binds_checkpoint_config_source_bank_and_partition(
+    tmp_path, monkeypatch
+):
+    profile, _cfg, checkpoint, checkpoint_path, authorization_path = (
+        _factorized_authorization_fixture(tmp_path, monkeypatch)
+    )
+    evidence = diagnostic_cli._validate_factorized_authorized_run(
+        checkpoint,
+        profile=profile,
+        checkpoint_path=checkpoint_path,
+        config_path=profile.config,
+        authorization_path=authorization_path,
+    )
+    assert evidence["stage"] == "stage1"
+    assert evidence["development_rows"] == 347
+    assert evidence["development_unique_texts"] == 256
+    assert evidence["checkpoint_sha256"] == diagnostic_cli._sha256(checkpoint_path)
+    assert evidence["bank_id"] == diagnostic_cli.EXPECTED_FACTORIZED_BANK_ID
+    assert set(evidence["neighbor_table_sha256"]) == {"train", "val"}
+    assert evidence["identities"]["architecture"]["key_value_mode"] == (
+        "factorized_metadata_motion_v1"
+    )
+
+
+def test_factorized_authorization_rejects_best_infeasible_alias(tmp_path, monkeypatch):
+    profile, _cfg, checkpoint, _checkpoint_path, authorization_path = (
+        _factorized_authorization_fixture(tmp_path, monkeypatch)
+    )
+    bad_checkpoint = tmp_path / "run" / "checkpoints" / "best_infeasible.pt"
+    bad_checkpoint.write_bytes(b"factorized checkpoint")
+    with pytest.raises(RuntimeError, match="best_infeasible"):
+        diagnostic_cli._validate_factorized_authorized_run(
+            checkpoint,
+            profile=profile,
+            checkpoint_path=bad_checkpoint,
+            config_path=profile.config,
+            authorization_path=authorization_path,
+        )
+
+
+def test_factorized_stage2_authorization_requires_stage1_infeasibility_chain(
+    tmp_path, monkeypatch
+):
+    profile, _cfg, checkpoint, checkpoint_path, authorization_path = (
+        _factorized_authorization_fixture(tmp_path, monkeypatch, stage="stage2")
+    )
+    evidence = diagnostic_cli._validate_factorized_authorized_run(
+        checkpoint,
+        profile=profile,
+        checkpoint_path=checkpoint_path,
+        config_path=profile.config,
+        authorization_path=authorization_path,
+    )
+    assert evidence["stage"] == "stage2"
+
+
+def test_diagnostic_run_model_forwards_analytic_prior_mode():
+    class RecordingModel:
+        def __init__(self):
+            self.kwargs = None
+
+        def __call__(self, **kwargs):
+            self.kwargs = kwargs
+            return {"prediction": torch.zeros(1)}
+
+    model = RecordingModel()
+    text = torch.zeros(1, 2, 3)
+    mask = torch.ones(1, 2, dtype=torch.bool)
+    tau = torch.zeros(1, 4)
+    diagnostic_cli._run_model(
+        model,
+        text,
+        mask,
+        tau,
+        None,
+        attention_mode="analytic_prior",
+    )
+    assert model.kwargs["sentence_memory_attention_mode"] == "analytic_prior"

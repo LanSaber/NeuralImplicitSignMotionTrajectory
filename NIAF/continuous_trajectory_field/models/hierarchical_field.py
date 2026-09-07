@@ -549,6 +549,10 @@ class SentenceMemoryContinuousTrajectoryField(DualModeContinuousTrajectoryField)
         sentence_duration_weight: float = 0.10,
         sentence_retrieval_prior_scale: float = 1.0,
         sentence_gate_initial_bias: float = -2.2,
+        sentence_key_value_mode: str | None = None,
+        sentence_temporal_prior_mode: str = "none",
+        sentence_temporal_prior_sigma: float = 0.25,
+        sentence_temporal_prior_scale: float = 1.0,
         **kwargs,
     ):
         # Build v2 first and copy its state into the extended hypernetwork. This
@@ -589,6 +593,10 @@ class SentenceMemoryContinuousTrajectoryField(DualModeContinuousTrajectoryField)
             sentence_duration_weight=float(sentence_duration_weight),
             sentence_retrieval_prior_scale=float(sentence_retrieval_prior_scale),
             sentence_gate_initial_bias=float(sentence_gate_initial_bias),
+            sentence_key_value_mode=sentence_key_value_mode,
+            sentence_temporal_prior_mode=str(sentence_temporal_prior_mode),
+            sentence_temporal_prior_sigma=float(sentence_temporal_prior_sigma),
+            sentence_temporal_prior_scale=float(sentence_temporal_prior_scale),
         )
         incompatible = extended.load_state_dict(legacy.state_dict(), strict=False)
         if incompatible.unexpected_keys or any(
@@ -619,6 +627,7 @@ class SentenceMemoryContinuousTrajectoryField(DualModeContinuousTrajectoryField)
         sentence_candidate_mask: torch.Tensor | None = None,
         sentence_part_validity: torch.Tensor | None = None,
         sentence_memory_available: torch.Tensor | None = None,
+        sentence_memory_attention_mode: str = "learned",
     ) -> TrajectoryInstance:
         return self.hypernetwork(
             text_tokens=text_tokens,
@@ -636,6 +645,7 @@ class SentenceMemoryContinuousTrajectoryField(DualModeContinuousTrajectoryField)
             sentence_candidate_mask=sentence_candidate_mask,
             sentence_part_validity=sentence_part_validity,
             sentence_memory_available=sentence_memory_available,
+            sentence_memory_attention_mode=sentence_memory_attention_mode,
         )
 
     def forward(
@@ -659,6 +669,7 @@ class SentenceMemoryContinuousTrajectoryField(DualModeContinuousTrajectoryField)
         sentence_candidate_mask: torch.Tensor | None = None,
         sentence_part_validity: torch.Tensor | None = None,
         sentence_memory_available: torch.Tensor | None = None,
+        sentence_memory_attention_mode: str = "learned",
     ):
         trajectory = self.encode_trajectory(
             text_tokens=text_tokens,
@@ -676,6 +687,7 @@ class SentenceMemoryContinuousTrajectoryField(DualModeContinuousTrajectoryField)
             sentence_candidate_mask=sentence_candidate_mask,
             sentence_part_validity=sentence_part_validity,
             sentence_memory_available=sentence_memory_available,
+            sentence_memory_attention_mode=sentence_memory_attention_mode,
         )
         return self.query_trajectory(
             trajectory,
@@ -778,6 +790,16 @@ def build_continuous_trajectory_field(cfg, text_dim: int):
                 ),
                 sentence_gate_initial_bias=float(
                     sentence_cfg.get("gate_initial_bias", -2.2)
+                ),
+                sentence_key_value_mode=sentence_cfg.get("key_value_mode"),
+                sentence_temporal_prior_mode=str(
+                    sentence_cfg.get("temporal_prior_mode", "none")
+                ),
+                sentence_temporal_prior_sigma=float(
+                    sentence_cfg.get("temporal_prior_sigma", 0.25)
+                ),
+                sentence_temporal_prior_scale=float(
+                    sentence_cfg.get("temporal_prior_scale", 1.0)
                 ),
             )
             return SentenceMemoryContinuousTrajectoryField(**common)

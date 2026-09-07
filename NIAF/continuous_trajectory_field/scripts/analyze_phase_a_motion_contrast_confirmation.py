@@ -204,11 +204,17 @@ def load_mode_export(
     config_path: Path | None = None,
     checkpoint_epoch: int | None = None,
     motion_shuffle_seed: int | None = None,
+    expected_memory_mode: str | None = None,
+    expected_evaluation_corruption: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     directory = directory.resolve()
     summary_path = directory / "export_summary.json"
     summary = _json(summary_path)
-    expected_memory_mode = MODE_SENTENCE_MEMORY[mode]
+    expected_memory_mode = (
+        MODE_SENTENCE_MEMORY[mode]
+        if expected_memory_mode is None
+        else str(expected_memory_mode)
+    )
     if str(summary.get("split")) != "val":
         raise ConfirmationInputError(f"{mode} export is not validation-only")
     if str(summary.get("length_mode")) != "predicted":
@@ -218,6 +224,12 @@ def load_mode_export(
     if str(summary.get("sentence_memory_mode")) != expected_memory_mode:
         raise ConfirmationInputError(
             f"{mode} has sentence-memory mode {summary.get('sentence_memory_mode')!r}"
+        )
+    if expected_evaluation_corruption is not None and dict(
+        summary.get("sentence_memory_evaluation_corruption", {}) or {}
+    ) != dict(expected_evaluation_corruption):
+        raise ConfirmationInputError(
+            f"{mode} has the wrong fixed evaluation-corruption identity"
         )
     if config_path is not None and _resolve_existing(
         summary.get("config"), fallback_dir=directory
@@ -255,12 +267,22 @@ def load_mode_export(
             raise ConfirmationInputError(
                 f"{mode} contains a non-novel sentence-memory query"
             )
+        _resolve_existing(row.get("sample"), fallback_dir=directory)
 
     metrics: dict[str, dict[str, dict[str, np.ndarray]]] = {}
     expected_indices = {f"{index:04d}" for index in range(len(rows))}
     for alignment in ALIGNMENTS:
         dtw_path = directory / DTW_FILE[alignment]
         payload = _json(dtw_path)
+        dtw_csv_path = dtw_path.with_suffix(".csv")
+        if not dtw_csv_path.is_file() or dtw_csv_path.stat().st_size <= 0:
+            raise ConfirmationInputError(f"{mode}/{alignment} CSV is missing or empty")
+        with dtw_csv_path.open(newline="", encoding="utf-8") as handle:
+            csv_rows = list(csv.DictReader(handle))
+        if len(csv_rows) != len(payload.get("rows", [])):
+            raise ConfirmationInputError(
+                f"{mode}/{alignment} CSV/JSON result counts differ"
+            )
         if str(payload.get("alignment_mode")) != alignment:
             raise ConfirmationInputError(f"{mode}/{alignment} alignment mismatch")
         if int(payload.get("num_pairs", -1)) != len(rows):
@@ -299,11 +321,23 @@ def load_mode_export(
         metrics[alignment] = by_part
 
     if mode == "motion_shuffled_sentence_memory":
-        if checkpoint_epoch is None or motion_shuffle_seed is None:
+        fixed_corruption = bool(
+            expected_evaluation_corruption is not None
+            and expected_evaluation_corruption.get("mode")
+            == "fixed_query_condition_v1"
+        )
+        if motion_shuffle_seed is None or (
+            checkpoint_epoch is None and not fixed_corruption
+        ):
             raise ConfirmationInputError(
                 "Motion-shuffled validation requires its checkpoint-epoch/seed lock"
             )
-        if int(summary.get("sentence_memory_motion_shuffle_epoch", -1)) != int(
+        if fixed_corruption:
+            if summary.get("sentence_memory_motion_shuffle_epoch") is not None:
+                raise ConfirmationInputError(
+                    "Fixed motion shuffle unexpectedly depends on checkpoint epoch"
+                )
+        elif int(summary.get("sentence_memory_motion_shuffle_epoch", -1)) != int(
             checkpoint_epoch
         ):
             raise ConfirmationInputError(
@@ -326,10 +360,15 @@ def load_mode_export(
                     raise ConfirmationInputError(
                         "Motion-shuffled confirmation row was not informative"
                     )
-                for field, expected in (
-                    ("sentence_memory_motion_shuffle_epoch", checkpoint_epoch),
-                    ("sentence_memory_motion_shuffle_seed", motion_shuffle_seed),
-                ):
+                expected_fields = [
+                    ("sentence_memory_motion_shuffle_seed", motion_shuffle_seed)
+                ]
+                if not fixed_corruption:
+                    expected_fields.insert(
+                        0,
+                        ("sentence_memory_motion_shuffle_epoch", checkpoint_epoch),
+                    )
+                for field, expected in expected_fields:
                     if field not in sample.files:
                         raise ConfirmationInputError(
                             f"Motion-shuffled export lacks {field} provenance"
@@ -338,6 +377,57 @@ def load_mode_export(
                     if len(actual) != 1 or int(actual[0]) != int(expected):
                         raise ConfirmationInputError(
                             f"Motion-shuffled export has the wrong {field}"
+                        )
+                if fixed_corruption:
+                    for field, expected in (
+                        (
+                            "sentence_memory_evaluation_corruption_mode",
+                            "fixed_query_condition_v1",
+                        ),
+                        (
+                            "sentence_memory_evaluation_corruption_nonce",
+                            expected_evaluation_corruption["nonce"],
+                        ),
+                        (
+                            "sentence_memory_evaluation_corruption_condition",
+                            "motion_shuffled",
+                        ),
+                    ):
+                        if field not in sample.files or str(
+                            np.asarray(sample[field]).reshape(-1)[0]
+                        ) != str(expected):
+                            raise ConfirmationInputError(
+                                f"Motion-shuffled export has the wrong {field}"
+                            )
+
+    if (
+        mode == "shuffled_sentence_memory"
+        and expected_evaluation_corruption is not None
+        and expected_evaluation_corruption.get("mode")
+        == "fixed_query_condition_v1"
+    ):
+        for row in rows:
+            sample_path = _resolve_existing(row["sample"], fallback_dir=directory)
+            with np.load(sample_path, allow_pickle=False) as sample:
+                for field, expected in (
+                    (
+                        "sentence_memory_evaluation_corruption_mode",
+                        "fixed_query_condition_v1",
+                    ),
+                    (
+                        "sentence_memory_evaluation_corruption_nonce",
+                        expected_evaluation_corruption["nonce"],
+                    ),
+                    (
+                        "sentence_memory_evaluation_corruption_condition",
+                        "shuffled",
+                    ),
+                ):
+                    if field not in sample.files or str(
+                        np.asarray(sample[field]).reshape(-1)[0]
+                    ) != str(expected):
+                        raise ConfirmationInputError(
+                            f"Full-shuffled export has the wrong {field}"
                         )
 
     return {

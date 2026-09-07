@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -32,15 +34,18 @@ from NIAF.continuous_trajectory_field.models import build_continuous_trajectory_
 from NIAF.continuous_trajectory_field.sentence_memory import (
     SentenceMemoryBatch,
     motion_only_shuffle_sentence_memory_batch,
+    sha256_file,
 )
 from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field import (
     _sentence_memory_field,
     build_sentence_memory_provider,
     checkpoint_contract,
+    configured_evaluation_corruption,
     is_dual_mode,
     is_sentence_memory_model,
     retrieve_sentence_memory,
     sentence_memory_enabled,
+    sentence_memory_evaluation_corruption_kwargs,
     sentence_memory_forward_kwargs,
     sentence_memory_provider_required,
     sentence_memory_query_ids,
@@ -54,6 +59,448 @@ from NIAF.retrieval_confidence_field.scripts.export_retrieval_adaptive_samples i
 from NIAF.retrieval_confidence_field.scripts.train_retrieval_adaptive_field import (
     validate_train_only_retrieval_bank,
 )
+
+
+FACTORIZED_EXPECTED_QUERY_MANIFEST_ENV = (
+    "SIGNTRAJ_EXPECTED_QUERY_MANIFEST_SHA256"
+)
+ISOLATED_DEVELOPMENT_MANIFEST_ENV = (
+    "SIGNTRAJ_ISOLATED_DEVELOPMENT_MANIFEST_SHA256"
+)
+ISOLATED_DEVELOPMENT_ROWS_ENV = "SIGNTRAJ_ISOLATED_DEVELOPMENT_ROWS"
+ISOLATED_DEVELOPMENT_ARTIFACT_ENV = (
+    "SIGNTRAJ_ISOLATED_DEVELOPMENT_PARTITION_ARTIFACT_IDENTITY"
+)
+
+
+def _validated_sha256(value, *, label):
+    value = str(value or "").lower()
+    if len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise ValueError(f"{label} must be a lowercase SHA256 digest")
+    return value
+
+
+def is_factorized_sentence_memory_config(cfg):
+    return bool(
+        is_sentence_memory_model(cfg)
+        and sentence_memory_enabled(cfg)
+        and str(
+            cfg.get("sentence_memory", {}).get(
+                "key_value_mode", "legacy_mixed_v1"
+            )
+        ).lower()
+        == "factorized_metadata_motion_v1"
+    )
+
+
+def authorize_factorized_export_manifest(cfg, manifest_path):
+    """Authorize one sealed dev or explicitly post-spend confirmation manifest."""
+
+    if not is_factorized_sentence_memory_config(cfg):
+        return None
+    manifest_path = Path(manifest_path).resolve()
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Factorized export query manifest does not exist: {manifest_path}"
+        )
+    partition_cfg = dict(cfg.get("validation_text_partition", {}) or {})
+    ready_path = manifest_path.parent / "READY"
+    if not ready_path.is_file() or ready_path.stat().st_size > 4096:
+        raise RuntimeError(
+            "Factorized export manifest is not inside a sealed partition"
+        )
+    ready = json.loads(ready_path.read_text(encoding="utf-8"))
+    expected_artifact_identity = _validated_sha256(
+        partition_cfg.get("expected_partition_artifact_identity"),
+        label=(
+            "validation_text_partition.expected_partition_artifact_identity"
+        ),
+    )
+    if ready != {
+        "schema_name": "signtrajfield_validation_text_cluster_partition",
+        "schema_version": 1,
+        "artifact_identity": expected_artifact_identity,
+    }:
+        raise RuntimeError("Factorized export sealed partition identity changed")
+
+    selected_sha256 = sha256_file(manifest_path)
+    development_sha256 = _validated_sha256(
+        partition_cfg.get("expected_development_manifest_sha256"),
+        label=(
+            "validation_text_partition.expected_development_manifest_sha256"
+        ),
+    )
+    post_spend_sha256 = os.environ.get(
+        FACTORIZED_EXPECTED_QUERY_MANIFEST_ENV
+    )
+    if selected_sha256 == development_sha256:
+        if manifest_path.name != "manifest_development.jsonl":
+            raise RuntimeError(
+                "Pinned development manifest has an unexpected filename"
+            )
+        authority = "config_pinned_development_manifest_v1"
+        expected_rows = int(
+            partition_cfg.get("expected_development_rows", -1)
+        )
+    else:
+        post_spend_sha256 = _validated_sha256(
+            post_spend_sha256,
+            label=FACTORIZED_EXPECTED_QUERY_MANIFEST_ENV,
+        )
+        if selected_sha256 != post_spend_sha256:
+            raise RuntimeError(
+                "Factorized export query manifest is neither the pinned "
+                "development set nor the explicitly authorized post-spend set"
+            )
+        if manifest_path.name != "manifest_confirmation.jsonl":
+            raise RuntimeError(
+                "Post-spend factorized export requires manifest_confirmation.jsonl"
+            )
+        authority = "post_spend_environment_manifest_v1"
+        expected_rows = int(
+            partition_cfg.get("expected_confirmation_rows", -1)
+        )
+    if expected_rows < 1:
+        raise RuntimeError("Factorized export has no pinned query row count")
+    return {
+        "authority": authority,
+        "manifest_path": manifest_path,
+        "manifest_sha256": selected_sha256,
+        "expected_rows": expected_rows,
+        "partition_artifact_identity": expected_artifact_identity,
+    }
+
+
+def authorize_isolated_development_export_manifest(manifest_path):
+    """Authorize a pre-confirmation dev manifest for nonfactorized parity export."""
+
+    configured = {
+        "manifest_sha256": os.environ.get(ISOLATED_DEVELOPMENT_MANIFEST_ENV),
+        "row_count": os.environ.get(ISOLATED_DEVELOPMENT_ROWS_ENV),
+        "artifact_identity": os.environ.get(ISOLATED_DEVELOPMENT_ARTIFACT_ENV),
+    }
+    if not any(value is not None for value in configured.values()):
+        return None
+    if any(value is None for value in configured.values()):
+        raise RuntimeError(
+            "Isolated development export requires all three explicit "
+            "manifest/count/partition environment controls"
+        )
+    manifest_path = Path(manifest_path).resolve()
+    if manifest_path.name != "manifest_development.jsonl":
+        raise RuntimeError(
+            "Isolated development export requires manifest_development.jsonl"
+        )
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Isolated development manifest does not exist: {manifest_path}"
+        )
+    expected_manifest_sha256 = _validated_sha256(
+        configured["manifest_sha256"], label=ISOLATED_DEVELOPMENT_MANIFEST_ENV
+    )
+    expected_artifact_identity = _validated_sha256(
+        configured["artifact_identity"],
+        label=ISOLATED_DEVELOPMENT_ARTIFACT_ENV,
+    )
+    try:
+        expected_rows = int(configured["row_count"])
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"{ISOLATED_DEVELOPMENT_ROWS_ENV} must be a positive integer"
+        ) from error
+    if expected_rows < 1 or str(expected_rows) != str(configured["row_count"]):
+        raise ValueError(
+            f"{ISOLATED_DEVELOPMENT_ROWS_ENV} must be a canonical positive integer"
+        )
+    ready_path = manifest_path.parent / "READY"
+    if not ready_path.is_file() or ready_path.stat().st_size > 4096:
+        raise RuntimeError(
+            "Isolated development manifest is not inside a sealed partition"
+        )
+    ready = json.loads(ready_path.read_text(encoding="utf-8"))
+    if ready != {
+        "schema_name": "signtrajfield_validation_text_cluster_partition",
+        "schema_version": 1,
+        "artifact_identity": expected_artifact_identity,
+    }:
+        raise RuntimeError("Isolated development partition identity changed")
+    actual_sha256 = sha256_file(manifest_path)
+    if actual_sha256 != expected_manifest_sha256:
+        raise RuntimeError("Isolated development manifest identity changed")
+    return {
+        "authority": "explicit_isolated_development_environment_v1",
+        "manifest_path": manifest_path,
+        "manifest_sha256": actual_sha256,
+        "expected_rows": expected_rows,
+        "partition_artifact_identity": expected_artifact_identity,
+    }
+
+
+def prepare_export_manifest(
+    cfg,
+    *,
+    split,
+    out_dir,
+    num_samples,
+    seed,
+    manifest,
+    selection_mode,
+):
+    """Select export rows without inspecting canonical val for factorized subsets."""
+
+    factorized = is_factorized_sentence_memory_config(cfg)
+    isolated_development = None
+    isolated_controls_present = any(
+        os.environ.get(name) is not None
+        for name in (
+            ISOLATED_DEVELOPMENT_MANIFEST_ENV,
+            ISOLATED_DEVELOPMENT_ROWS_ENV,
+            ISOLATED_DEVELOPMENT_ARTIFACT_ENV,
+        )
+    )
+    if not factorized and isolated_controls_present:
+        if manifest is None:
+            raise RuntimeError(
+                "Isolated development export requires an explicit manifest"
+            )
+        isolated_development = authorize_isolated_development_export_manifest(
+            manifest
+        )
+    if factorized or isolated_development is not None:
+        if str(split) != "val":
+            raise RuntimeError("Isolated experiment exports are validation-only")
+        if manifest is None:
+            raise RuntimeError(
+                "Isolated export requires an explicit sealed manifest"
+            )
+        authorization = (
+            authorize_factorized_export_manifest(cfg, manifest)
+            if factorized
+            else isolated_development
+        )
+        selected_manifest, selected_rows, summary = select_manifest(
+            cfg,
+            split,
+            out_dir,
+            num_samples,
+            seed,
+            manifest=manifest,
+            selection_mode=selection_mode,
+        )
+        if len(selected_rows) != int(authorization["expected_rows"]):
+            raise RuntimeError(
+                "Isolated export query row count differs from its "
+                f"authorization: actual={len(selected_rows)}, "
+                f"expected={authorization['expected_rows']}"
+            )
+        # The dataset reads the sealed source directly. Re-serializing rows to
+        # the output copy would change the byte-level manifest identity.
+        dataset_manifest = Path(manifest).resolve()
+        selected_manifest_copy = Path(selected_manifest).resolve()
+        summary.update(
+            {
+                "canonical_source_manifest": None,
+                "canonical_sample_count": None,
+                "is_complete_canonical_manifest": None,
+                "is_canonical_order": None,
+                "canonical_manifest_inspection": (
+                    "forbidden_isolated_explicit_manifest_v1"
+                ),
+                "selected_manifest_copy": str(selected_manifest_copy),
+                "selected_manifest_copy_sha256": sha256_file(
+                    selected_manifest_copy
+                ),
+                "output_manifest": str(dataset_manifest),
+                "dataset_manifest": str(dataset_manifest),
+                "dataset_manifest_sha256": authorization["manifest_sha256"],
+                "query_manifest_authority": authorization["authority"],
+                "sealed_partition_artifact_identity": authorization[
+                    "partition_artifact_identity"
+                ],
+            }
+        )
+        # Keep the standalone selection summary aligned with the manifest
+        # evidence embedded in export_summary.json.
+        (Path(out_dir) / "sample_manifest_summary.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return dataset_manifest, selected_rows, summary
+
+    configured_manifest = cfg.get("data", {}).get(f"{split}_manifest_path")
+    canonical_manifest = (
+        Path(configured_manifest)
+        if configured_manifest
+        else Path(cfg["data"]["data_dir"])
+        / "meta"
+        / f"manifest_{split}.jsonl"
+    )
+    canonical_rows = read_jsonl(canonical_manifest)
+    selected_manifest, selected_rows, summary = select_manifest(
+        cfg,
+        split,
+        out_dir,
+        num_samples,
+        seed,
+        manifest=manifest,
+        selection_mode=selection_mode,
+    )
+    complete_canonical_manifest = (
+        len(selected_rows) == len(canonical_rows)
+        and sorted(
+            json.dumps(row, sort_keys=True, separators=(",", ":"))
+            for row in selected_rows
+        )
+        == sorted(
+            json.dumps(row, sort_keys=True, separators=(",", ":"))
+            for row in canonical_rows
+        )
+    )
+    canonical_order = selected_rows == canonical_rows
+    summary.update(
+        {
+            "canonical_source_manifest": str(canonical_manifest),
+            "canonical_sample_count": len(canonical_rows),
+            "is_complete_canonical_manifest": complete_canonical_manifest,
+            "is_canonical_order": canonical_order,
+        }
+    )
+    if manifest is not None:
+        # Explicit manifests are already the query authority. Preserve their
+        # byte identity instead of routing the dataset and provenance through
+        # select_manifest's semantically equivalent JSONL reserialization.
+        dataset_manifest = Path(manifest).resolve()
+        selected_manifest_copy = Path(selected_manifest).resolve()
+        summary.update(
+            {
+                "selected_manifest_copy": str(selected_manifest_copy),
+                "selected_manifest_copy_sha256": sha256_file(
+                    selected_manifest_copy
+                ),
+                "output_manifest": str(dataset_manifest),
+                "dataset_manifest": str(dataset_manifest),
+                "dataset_manifest_sha256": sha256_file(dataset_manifest),
+            }
+        )
+        (Path(out_dir) / "sample_manifest_summary.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    else:
+        dataset_manifest = (
+            canonical_manifest if canonical_order else selected_manifest
+        )
+    return dataset_manifest, selected_rows, summary
+
+
+def bind_factorized_export_neighbor_subset(cfg, dataset, provider):
+    """Bind an authorized val subset to exact canonical neighbor-table rows."""
+
+    if not is_factorized_sentence_memory_config(cfg):
+        return None
+    if provider is None:
+        raise RuntimeError(
+            "Factorized export requires a sentence-memory provider even for "
+            "memory-off/all-null provenance"
+        )
+    if str(getattr(dataset, "split", "")) != "val":
+        raise RuntimeError("Factorized experiment exports are validation-only")
+    base = getattr(dataset, "base", dataset)
+    manifest_path = Path(getattr(base, "manifest_path", ""))
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Factorized export query manifest does not exist: {manifest_path}"
+        )
+    authorization = authorize_factorized_export_manifest(cfg, manifest_path)
+    selected_sha256 = authorization["manifest_sha256"]
+    partition_cfg = dict(cfg.get("validation_text_partition", {}) or {})
+    authority = authorization["authority"]
+    expected_rows = int(authorization["expected_rows"])
+    if expected_rows < 1 or len(dataset) != expected_rows:
+        raise RuntimeError(
+            "Factorized export query row count differs from its authorization: "
+            f"actual={len(dataset)}, expected={expected_rows}"
+        )
+
+    parent_manifest_sha256 = _validated_sha256(
+        partition_cfg.get("expected_validation_manifest_sha256"),
+        label="validation_text_partition.expected_validation_manifest_sha256",
+    )
+    expected_parent_rows = int(
+        partition_cfg.get("expected_validation_rows", -1)
+    )
+    expected_bank_id = str(partition_cfg.get("expected_bank_id", ""))
+    provider_identity = provider.identity
+    if str(provider_identity.get("bank_id", "")) != expected_bank_id:
+        raise RuntimeError("Factorized export sentence bank identity changed")
+    full_table_identity = (
+        provider_identity.get("neighbor_tables", {}).get("val")
+    )
+    if not isinstance(full_table_identity, dict):
+        raise RuntimeError(
+            "Factorized export requires the canonical validation neighbor table"
+        )
+    if str(full_table_identity.get("query_manifest_sha256", "")) != (
+        parent_manifest_sha256
+    ):
+        raise RuntimeError(
+            "Factorized export canonical neighbor manifest identity changed"
+        )
+    if int(full_table_identity.get("query_count", -1)) != expected_parent_rows:
+        raise RuntimeError(
+            "Factorized export canonical neighbor query count changed"
+        )
+    provider.set_dataset_with_name_indexed_neighbor_subset(
+        dataset,
+        parent_manifest_sha256=parent_manifest_sha256,
+        expected_subset_manifest_sha256=selected_sha256,
+    )
+    subset = provider.neighbor_table
+    if not isinstance(subset, dict) or subset.get("lookup_mode") != (
+        "exact_name_indexed_parent_subset_v1"
+    ):
+        raise RuntimeError(
+            "Factorized export did not bind an exact name-indexed neighbor subset"
+        )
+    if (
+        subset.get("parent_query_manifest_sha256")
+        != parent_manifest_sha256
+        or int(subset.get("parent_query_count", -1)) != expected_parent_rows
+    ):
+        raise RuntimeError(
+            "Factorized export neighbor subset lost its canonical parent identity"
+        )
+    payload = {
+        "schema_name": "factorized_sentence_memory_export_query_binding",
+        "schema_version": 1,
+        "authority": authority,
+        "partition_artifact_identity": authorization[
+            "partition_artifact_identity"
+        ],
+        "query_manifest": {
+            "file": manifest_path.name,
+            "sha256": selected_sha256,
+            "row_count": len(dataset),
+        },
+        "canonical_neighbor_table": {
+            "sha256": full_table_identity.get("sha256"),
+            "query_manifest_sha256": parent_manifest_sha256,
+            "query_order_sha256": full_table_identity.get(
+                "query_order_sha256"
+            ),
+            "query_count": expected_parent_rows,
+        },
+        "bank_id": expected_bank_id,
+        "lookup_mode": subset["lookup_mode"],
+        "online_fallback_allowed": False,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return {
+        **payload,
+        "digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
 
 
 def parse_args():
@@ -110,13 +557,14 @@ def parse_args():
             "on",
             "shuffled",
             "motion_shuffled",
+            "analytic_prior",
             "all_null",
         ),
         help=(
             "For v3, export with memory off, retrieved memory on, or the "
-            "deterministic full- or motion-only-shuffled controls, or the "
-            "all-null integrity control. auto uses the configured export mode "
-            "(on by default)."
+            "deterministic full- or motion-only-shuffled controls, the "
+            "analytic retrieval-prior diagnostic, or the all-null integrity "
+            "control. auto uses the configured export mode (on by default)."
         ),
     )
     parser.add_argument("--context_fps", type=float, default=20.0)
@@ -218,6 +666,67 @@ def sentence_memory_diagnostics_row(instance, index):
         "null_mass_mean": float(row_null.mean().item()),
         "candidate_mass_mean": candidate_mass_mean,
     }
+
+
+class FactorizedAttentionCapture:
+    """Temporarily retain final factorized attention masses for one export batch."""
+
+    def __init__(self, model, cfg):
+        self.value = None
+        self.handle = None
+        memory_cfg = dict(cfg.get("sentence_memory", {}) or {})
+        if memory_cfg.get("key_value_mode") != "factorized_metadata_motion_v1":
+            return
+        encoder = model.hypernetwork.sentence_memory_encoder
+        if not encoder.layers:
+            raise ValueError("Factorized sentence memory has no attention layer")
+        self.slot_count = int(model.hypernetwork.temporal_slot_count)
+        self.part_count = 4
+        self.handle = encoder.layers[-1].register_forward_hook(self._hook)
+
+    def _hook(self, _module, _inputs, output):
+        if not isinstance(output, tuple) or len(output) != 4:
+            raise ValueError("Malformed factorized attention-layer output")
+        _state, null_mass, candidate_mass, token_mass = output
+        batch = int(null_mass.shape[0])
+        expected_queries = self.slot_count * self.part_count
+        if null_mass.shape[1] != expected_queries:
+            raise ValueError("Factorized attention query count changed")
+        self.value = {
+            "null_mass": null_mass.detach().reshape(
+                batch, self.slot_count, self.part_count
+            ).cpu(),
+            "candidate_mass": candidate_mass.detach().reshape(
+                batch,
+                self.slot_count,
+                self.part_count,
+                candidate_mass.shape[-1],
+            ).cpu(),
+            "token_mass": token_mass.detach().reshape(
+                batch,
+                self.slot_count,
+                self.part_count,
+                token_mass.shape[-2],
+                token_mass.shape[-1],
+            ).cpu(),
+        }
+
+    def clear(self):
+        self.value = None
+
+    def row(self, index):
+        if self.handle is None:
+            return None
+        if self.value is None:
+            raise RuntimeError("Factorized attention hook did not observe a forward")
+        return {
+            name: value[int(index)].numpy() for name, value in self.value.items()
+        }
+
+    def close(self):
+        if self.handle is not None:
+            self.handle.remove()
+            self.handle = None
 
 
 def sentence_memory_text_subset(memory_batch, provider, index, text):
@@ -347,11 +856,12 @@ def prepare_inference_batch(
         "on",
         "shuffled",
         "motion_shuffled",
+        "analytic_prior",
         "all_null",
     }:
         raise ValueError(
             "v3 sentence_memory_mode must be 'off', 'on', 'shuffled', or "
-            "'motion_shuffled', or 'all_null'"
+            "'motion_shuffled', 'analytic_prior', or 'all_null'"
         )
 
     adapter_context = None
@@ -395,6 +905,7 @@ def prepare_inference_batch(
             )
     sentence_memory_batch = None
     sentence_kwargs = {}
+    evaluation_corruption = configured_evaluation_corruption(cfg)
     if sentence_memory_model:
         sentence_available = torch.full(
             (text_tokens.shape[0],),
@@ -426,20 +937,43 @@ def prepare_inference_batch(
                     device=device,
                     mode=(
                         "on"
-                        if resolved_sentence_mode == "motion_shuffled"
+                        if resolved_sentence_mode
+                        in {"motion_shuffled", "analytic_prior"}
                         else resolved_sentence_mode
+                    ),
+                    **sentence_memory_evaluation_corruption_kwargs(
+                        cfg,
+                        training=False,
+                        condition=resolved_sentence_mode,
                     ),
                 )
             if resolved_sentence_mode == "motion_shuffled":
+                corruption_kwargs = sentence_memory_evaluation_corruption_kwargs(
+                    cfg, training=False, condition="motion_shuffled"
+                )
                 sentence_memory_batch, _permutation, _informative = (
                     motion_only_shuffle_sentence_memory_batch(
                         sentence_memory_batch,
                         query_ids=sentence_memory_query_ids(batch),
                         epoch=int(sentence_memory_epoch),
-                        seed=int(cfg.get("seed", 1234)),
+                        seed=int(
+                            corruption_kwargs.get(
+                                "corruption_seed", cfg.get("seed", 1234)
+                            )
+                        ),
+                        corruption_nonce=corruption_kwargs.get(
+                            "corruption_nonce"
+                        ),
+                        corruption_condition=str(
+                            corruption_kwargs.get(
+                                "corruption_condition", "motion_shuffled"
+                            )
+                        ),
                     )
                 )
             sentence_kwargs = sentence_memory_forward_kwargs(sentence_memory_batch)
+            if resolved_sentence_mode == "analytic_prior":
+                sentence_kwargs["sentence_memory_attention_mode"] = "analytic_prior"
     if dual_mode:
         trajectory = model.encode_trajectory(
             text_tokens=text_tokens,
@@ -465,16 +999,24 @@ def prepare_inference_batch(
             resolved_sentence_mode if sentence_memory_model else "not_applicable"
         ),
         "sentence_memory_batch": sentence_memory_batch,
+        "sentence_memory_attention_mode": (
+            "analytic_prior"
+            if resolved_sentence_mode == "analytic_prior"
+            else "learned"
+        ),
         "sentence_memory_motion_shuffle_epoch": (
             int(sentence_memory_epoch)
             if resolved_sentence_mode == "motion_shuffled"
+            and evaluation_corruption["mode"]
+            != "fixed_query_condition_v1"
             else None
         ),
         "sentence_memory_motion_shuffle_seed": (
-            int(cfg.get("seed", 1234))
+            int(evaluation_corruption["seed"])
             if resolved_sentence_mode == "motion_shuffled"
             else None
         ),
+        "sentence_memory_evaluation_corruption": evaluation_corruption,
     }
 
 
@@ -524,50 +1066,15 @@ def main():
     cfg.setdefault("scaffold", {})["prefer_cache"] = False
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    configured_manifest = cfg.get("data", {}).get(
-        f"{args.split}_manifest_path"
-    )
-    canonical_manifest = (
-        Path(configured_manifest)
-        if configured_manifest
-        else Path(cfg["data"]["data_dir"])
-        / "meta"
-        / f"manifest_{args.split}.jsonl"
-    )
-    canonical_rows = read_jsonl(canonical_manifest)
-    selected_manifest, _selected_rows, manifest_summary = select_manifest(
+    dataset_manifest, _selected_rows, manifest_summary = prepare_export_manifest(
         cfg,
-        args.split,
-        out_dir,
-        args.num_samples,
-        args.seed,
+        split=args.split,
+        out_dir=out_dir,
+        num_samples=args.num_samples,
+        seed=args.seed,
         manifest=args.manifest,
         selection_mode=args.selection_mode,
     )
-    complete_canonical_manifest = (
-        len(_selected_rows) == len(canonical_rows)
-        and sorted(
-            json.dumps(row, sort_keys=True, separators=(",", ":"))
-            for row in _selected_rows
-        )
-        == sorted(
-            json.dumps(row, sort_keys=True, separators=(",", ":"))
-            for row in canonical_rows
-        )
-    )
-    canonical_order = _selected_rows == canonical_rows
-    manifest_summary.update(
-        {
-            "canonical_source_manifest": str(canonical_manifest),
-            "canonical_sample_count": len(canonical_rows),
-            "is_complete_canonical_manifest": complete_canonical_manifest,
-            "is_canonical_order": canonical_order,
-        }
-    )
-    # A complete first-order export can consume the precomputed neighbor table
-    # directly. Subsets and reordered manifests deliberately use the copied
-    # manifest and fall back to audited exact retrieval by stable query fields.
-    dataset_manifest = canonical_manifest if canonical_order else selected_manifest
     cfg.setdefault("data", {})[f"{args.split}_manifest_path"] = str(dataset_manifest)
     cfg.setdefault("data", {})[f"limit_{args.split}"] = 0
     device = resolve_device(args.device)
@@ -609,20 +1116,31 @@ def main():
     )
     needs_provider = not dual_mode or resolved_word_prior_mode == "on"
     provider = ScaffoldProvider(cfg, dataset, device) if needs_provider else None
+    factorized_export = is_factorized_sentence_memory_config(cfg)
     sentence_memory_provider = (
         build_sentence_memory_provider(cfg, text_encoder, dataset=dataset)
         if sentence_memory_model
-        and sentence_memory_provider_required(resolved_sentence_memory_mode)
+        and (
+            factorized_export
+            or sentence_memory_provider_required(resolved_sentence_memory_mode)
+        )
         else None
     )
+    sentence_memory_query_binding = None
     if sentence_memory_provider is not None:
-        sentence_memory_provider.validate_query_dataset(
-            # Export manifests are often five-row subsets whose hash cannot
-            # match the precomputed full-split table. The provider safely
-            # falls back to online search for this small query set.
-            dataset,
-            require_neighbors=False,
-        )
+        if factorized_export:
+            sentence_memory_query_binding = (
+                bind_factorized_export_neighbor_subset(
+                    cfg, dataset, sentence_memory_provider
+                )
+            )
+        else:
+            sentence_memory_provider.validate_query_dataset(
+                # Legacy exports retain their audited online fallback for
+                # arbitrary debug subsets.
+                dataset,
+                require_neighbors=False,
+            )
     retrieval_bank = (
         validate_train_only_retrieval_bank(cfg, provider)
         if provider is not None
@@ -650,11 +1168,13 @@ def main():
     model_type, contract_version = checkpoint_contract(cfg)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
+    factorized_attention = FactorizedAttentionCapture(model, cfg)
 
     fps_values = tuple(dict.fromkeys(float(value) for value in args.sample_fps))
     rows = []
     sample_counter = 0
     for batch in tqdm(loader, desc="export continuous trajectories"):
+        factorized_attention.clear()
         batch = move_batch_to_device(batch, device)
         target = prepare_motion(batch, dataset, device)
         inference = prepare_inference_batch(
@@ -742,6 +1262,9 @@ def main():
                 ),
                 "word_prior_mode": np.asarray(inference["word_prior_mode"]),
                 "sentence_memory_mode": np.asarray(inference["sentence_memory_mode"]),
+                "sentence_memory_attention_mode": np.asarray(
+                    inference["sentence_memory_attention_mode"]
+                ),
                 "length_mode": np.asarray(args.length_mode),
                 "context_fps": np.asarray(float(args.context_fps), dtype=np.float32),
                 "sample_fps": np.asarray(float(main_fps), dtype=np.float32),
@@ -782,6 +1305,9 @@ def main():
                         ("duration_ratio",),
                     ),
                     ("sentence_memory_candidate_mask", "candidate_mask", ()),
+                    ("sentence_memory_token_tau", "token_tau", ()),
+                    ("sentence_memory_token_mask", "token_mask", ()),
+                    ("sentence_memory_part_validity", "part_validity", ()),
                 ):
                     value = _memory_row_numpy(
                         memory_batch,
@@ -838,9 +1364,45 @@ def main():
                     ("payload_reads", "sentence_memory_payload_reads"),
                 ):
                     if provenance_name in memory_provenance:
-                        extra[output_name] = np.asarray(
-                            memory_provenance[provenance_name]
-                        )
+                        provenance_value = memory_provenance[provenance_name]
+                        if provenance_value is not None:
+                            extra[output_name] = np.asarray(provenance_value)
+                for provenance_name, output_name in (
+                    (
+                        "evaluation_corruption_mode",
+                        "sentence_memory_evaluation_corruption_mode",
+                    ),
+                    (
+                        "evaluation_corruption_nonce",
+                        "sentence_memory_evaluation_corruption_nonce",
+                    ),
+                    (
+                        "evaluation_corruption_condition",
+                        "sentence_memory_evaluation_corruption_condition",
+                    ),
+                ):
+                    provenance_value = memory_provenance.get(provenance_name)
+                    if provenance_value is not None:
+                        extra[output_name] = np.asarray(str(provenance_value))
+            attention_row = (
+                factorized_attention.row(local_index)
+                if memory_batch is not None
+                else None
+            )
+            if attention_row is not None:
+                extra.update(
+                    {
+                        "sentence_memory_part_null_mass": attention_row[
+                            "null_mass"
+                        ].astype(np.float32),
+                        "sentence_memory_part_candidate_mass": attention_row[
+                            "candidate_mass"
+                        ].astype(np.float32),
+                        "sentence_memory_part_token_mass": attention_row[
+                            "token_mass"
+                        ].astype(np.float32),
+                    }
+                )
             extra.update(_trajectory_numpy(inference["trajectory"], local_index))
             for branch_name, branch_prediction in branch_samples.items():
                 branch_rot6d, branch_axis, branch_smplx = rot6d_to_axis_and_smplx(
@@ -936,16 +1498,29 @@ def main():
         "sentence_memory_mode": (
             resolved_sentence_memory_mode if sentence_memory_model else "not_applicable"
         ),
+        "sentence_memory_attention_mode": (
+            "analytic_prior"
+            if sentence_memory_model
+            and resolved_sentence_memory_mode == "analytic_prior"
+            else ("learned" if sentence_memory_model else "not_applicable")
+        ),
         "sentence_memory_motion_shuffle_epoch": (
             int(checkpoint_epoch)
             if sentence_memory_model
             and resolved_sentence_memory_mode == "motion_shuffled"
+            and configured_evaluation_corruption(cfg)["mode"]
+            != "fixed_query_condition_v1"
             else None
         ),
         "sentence_memory_motion_shuffle_seed": (
-            int(cfg.get("seed", 1234))
+            int(configured_evaluation_corruption(cfg)["seed"])
             if sentence_memory_model
             and resolved_sentence_memory_mode == "motion_shuffled"
+            else None
+        ),
+        "sentence_memory_evaluation_corruption": (
+            configured_evaluation_corruption(cfg)
+            if sentence_memory_model
             else None
         ),
         "sentence_memory": (
@@ -956,6 +1531,21 @@ def main():
                 if sentence_memory_model
                 else None
             )
+        ),
+        "sentence_memory_query_binding": sentence_memory_query_binding,
+        "factorized_attention_artifacts": (
+            {
+                "schema": "final_layer_part_attention_mass_v1",
+                "part_order": ["body", "lhand", "rhand", "face"],
+                "slot_count": int(model.hypernetwork.temporal_slot_count),
+                "layer": "final",
+                "head_reduction": "mean",
+                "null_mass_field": "sentence_memory_part_null_mass",
+                "candidate_mass_field": "sentence_memory_part_candidate_mass",
+                "token_mass_field": "sentence_memory_part_token_mass",
+            }
+            if factorized_attention.handle is not None
+            else None
         ),
         "context_fps": float(args.context_fps),
         "sample_fps": list(fps_values),
@@ -970,6 +1560,7 @@ def main():
     (out_dir / "export_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    factorized_attention.close()
     print(
         json.dumps(
             {
