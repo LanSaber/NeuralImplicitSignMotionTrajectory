@@ -31,7 +31,43 @@ case "$ACTION" in
     fi
     if [[ -e "$TARGET" ]]; then rm -rf -- "$TARGET"; fi
     mkdir -p -- "$TARGET"
-    cp -a -- "$SOURCE"/. "$TARGET"/
+    STAGE_ONLY_REQUESTED_NEIGHBORS="${STAGE_ONLY_REQUESTED_NEIGHBORS:-0}"
+    case "$STAGE_ONLY_REQUESTED_NEIGHBORS" in
+      0|1) ;;
+      *)
+        echo "ERROR: STAGE_ONLY_REQUESTED_NEIGHBORS must be 0 or 1" >&2
+        exit 1
+        ;;
+    esac
+    if [[ "$STAGE_ONLY_REQUESTED_NEIGHBORS" == "0" ]]; then
+      # Compatibility mode for training/evaluation launchers whose persisted
+      # checkpoint identity includes every table in the source bank.
+      cp -a -- "$SOURCE"/. "$TARGET"/
+    else
+      # Validation-only diagnostics must not copy, open, or hash an unrelated
+      # test neighbor table.  Copy all core bank artifacts, then only the
+      # explicitly requested neighbor tables.  READY is copied last.
+      for source_path in "$SOURCE"/*; do
+        base_name="$(basename -- "$source_path")"
+        case "$base_name" in
+          READY|neighbors_*.npz) continue ;;
+        esac
+        cp -a -- "$source_path" "$TARGET"/
+      done
+      for split in $SPLITS; do
+        case "$split" in
+          train|val|test) ;;
+          *) echo "ERROR: invalid requested neighbor split: $split" >&2; exit 1 ;;
+        esac
+        neighbor_path="$SOURCE/neighbors_${split}.npz"
+        [[ -f "$neighbor_path" ]] || {
+          echo "ERROR: requested neighbor table is missing: $neighbor_path" >&2
+          exit 1
+        }
+        cp -a -- "$neighbor_path" "$TARGET"/
+      done
+      cp -a -- "$SOURCE/READY" "$TARGET/READY"
+    fi
     [[ -f "$TARGET/READY" ]] || {
       echo "ERROR: staged sentence-memory bank has no READY marker: $TARGET" >&2
       exit 1
