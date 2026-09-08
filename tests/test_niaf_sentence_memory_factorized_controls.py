@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1156,12 +1157,36 @@ def test_cluster_equal_ddp_reduction_uses_cluster_counts(tmp_path):
         )
         for rank in range(2)
     ]
-    for process in processes:
-        process.start()
-    result = queue.get(timeout=30)
-    for process in processes:
-        process.join(timeout=30)
-        assert process.exitcode == 0
+    # A cold spawned ARM64 worker imports PyTorch and the trajectory package
+    # from shared CIFS.  That startup can legitimately exceed 30 seconds on a
+    # scheduler-selected node even though the Gloo reduction itself is fast.
+    deadline = time.monotonic() + 210.0
+    result = None
+    exitcodes = []
+    started_processes = []
+    try:
+        for process in processes:
+            process.start()
+            started_processes.append(process)
+        result = queue.get(timeout=180)
+        for process in started_processes:
+            process.join(timeout=max(deadline - time.monotonic(), 0.0))
+        exitcodes = [process.exitcode for process in started_processes]
+    finally:
+        for process in started_processes:
+            if process.is_alive():
+                process.terminate()
+        terminate_deadline = time.monotonic() + 10.0
+        for process in started_processes:
+            process.join(timeout=max(terminate_deadline - time.monotonic(), 0.0))
+        for process in started_processes:
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=10)
+        queue.close()
+        queue.join_thread()
+    assert exitcodes == [0, 0]
+    assert result is not None
     assert result["metric"] == pytest.approx(11.0 / 3.0)
     assert result["paired_sentence_memory/Rmotion"] == pytest.approx(
         (7.0 / 12.0) ** 0.5
