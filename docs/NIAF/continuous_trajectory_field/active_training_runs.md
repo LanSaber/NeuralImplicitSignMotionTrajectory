@@ -5,7 +5,7 @@ runs. Read it before answering an unqualified question such as "What is the
 current training progress?" The scheduler and logs remain the source of truth
 for live state; this registry determines **which run** the question refers to.
 
-Last observed: **2026-09-07 17:05 Asia/Dubai (UTC+04:00)**
+Last observed: **2026-09-08 05:02 Asia/Dubai (UTC+04:00)**
 
 ## Default run resolution
 
@@ -19,7 +19,7 @@ has the highest Slurm job ID or is already in the `RUNNING` state.
 Dataset-qualified requests override that default: "the How2Sign training"
 refers to `how2sign-signtrajfield-v2-full-20260807`, and "the CSL-Daily
 training" refers to
-`csl-daily-signtrajfield-rag-v3-phase-a-motion-contrast-v1-20260907`.
+`csl-daily-signtrajfield-rag-v3-phase-a-factorized-memory-v1-20260908`.
 
 ## Active prerequisite artifact jobs (not training)
 
@@ -84,7 +84,49 @@ logs/sbatch/csl_rag_neighbors_142745.out
 logs/sbatch/csl_rag_neighbors_142745.err
 ```
 
-## Latest CSL-Daily: SignTrajField-RAG v3 Phase-A' motion-contrast v1
+## Latest completed CSL-Daily: Phase-A'' factorized-memory experiment
+
+| Field | Value |
+|---|---|
+| Alias | `csl-daily-signtrajfield-rag-v3-phase-a-factorized-memory-v1-20260908` |
+| State | **Ordered protocol complete; stopped by the Stage-2 development gate and not deployable.** Stage 1 and Stage 2 were integrity-valid but scientifically infeasible. Neither stage produced `best.pt`, so no confirmation, locked temporal-slot diagnostic, test evaluation, checkpoint promotion, or Phase B was authorized |
+| Ordered arms | Stage 1 factorized metadata-only keys and motion-only values with uniform valid-token support. Stage 2 added only the fixed Gaussian slot/token bias (`sigma=0.25`) after a provenance-bound Stage-1 authorization; it started fresh from v2 and did not import Stage-1 model or optimizer state |
+| Dataset and controls | Full 18,399-row training set; epoch validation on 256 equally weighted normalized-text development clusters/347 signer rows. Partition digest `80f9f5e9fe8414d66730ff0f19bd95fa9f8156922b7cd6f14f27b182cae7d74e`; fixed validation corruption-map digest `403b57d632ede59023cf8470beafc1c4c4616503a0d8c2b398931d65868cfc06`. The 540-cluster/728-row confirmation partition remained unopened |
+| Shared protocol | Seed 1234; `K=8`, top-M 64, duration weight 0.05, temperature 0.10, candidate dropout 0.10; Phase-A' paired correct/corrupt objective; frozen generator; only 59 `hypernetwork.sentence_memory_*` tensors trainable; four epochs/four development validation events per stage; five modes including explanatory-only analytic prior |
+| Initialization | Each eligible stage used a fresh strict import from frozen v2 SHA256 `06ca0a2613005b6e3949bab0e5d7ded999b212723debd3e7685a58c077e44c54`. Initial and selected-checkpoint memory-off prediction/duration parity were exactly `0.0`; all-null predictions and durations were bit-exact to memory-off with zero gates/candidate mass, null mass one, and zero motion-payload reads |
+| Source | Clean standalone shared clone at final executable commit `ec11f7aac47de13315ddc3123303bd77f7b32d44` (`Stage only train and val for factorized decisions`). Both `origin/codex/csl-daily-factorized-memory-v1` and the immutable `origin/codex/csl-daily-factorized-memory-v1-run` were at that commit before the eligible launch; the run branch remained fixed throughout the protocol |
+| Engineering gates | Full CPU Slurm `143196` completed: **308 passed**, 12 warnings, in 238.49 seconds. Repaired one-GPU smoke `143197` completed and exercised Stage 1 then Stage 2 for exactly one optimizer step each, with finite outputs/state, frozen-base enforcement, exact v2 parity, all five validation modes, train/validation-only staging, and W&B disabled |
+| Eligible Stage 1 | Slurm `143198`, four nodes/GPUs, completed all four epochs and global step 288, then returned the intentional fail-closed scheduler status (`FAILED`, exit `143`) because no feasible checkpoint existed. Launch identity `a041d80035cd1259f20b65e94fadaea76fcc8420ee472b14c3f26331bb54f794`; config SHA256 `99984578cf7ea8ed537b589fa576c3b639fe3f8b19c4ea3831686ccfb93e36de` |
+| Stage-1 decision | Slurm `143259` completed the sealed 347-row development integrity audit and wrote `valid_infeasible`, decision identity `74b0784d261d8a9d291b28938b7cac37a28495a82c1e08f45dd73591e82610f6`. Correct composite `12.6261835001` versus text-only `12.7318543089`, motion-shuffled `12.6262922686`, and full-shuffled `12.6273469365`; corresponding improvements were 0.82997%, **0.000861%**, and **0.009214%**, with `Rmotion=0.00344204`. Hand paths improved 18.21%/33.88%, but the required 0.1% corruption margins and `Rmotion >= 0.05` failed |
+| Stage-1 checkpoint | `best_infeasible.pt`, epoch 4/global step 288, SHA256 `af28da2d80099ff7194147002722c14d2198368febe16afff2aa21ac3220a77b`; metrics SHA256 `c798f08a52d01ddc5a41695c0382ce3da2e883649f81ef6f931214ba1d51988a`; selection-summary SHA256 `fbf8ee43ebbd1b49aaac8af155ac981967760a1c21876f9565988bf49f463fc5`. It was retained for audit only and must not be promoted |
+| Stage-2 authorization | Stage 1 emitted only `authorize_stage2.json`, SHA256 `12fb2f225c751b425208c6c6e52d76293a9df95759a21dff1c5e7aa24d2b2406`, authorization identity `d15bb66e67baec1f505201288cc879d87430803d444fa82837cea09066a14075`. Stage-2 launch input identity `b44bfd8746b236ad85d7983b0662e47413f457aa5f810fb7b7a75b2258348ea0` preserved that chain |
+| Eligible Stage 2 | Slurm `143261`, four nodes/GPUs, fresh from v2, completed all four epochs and global step 288, then returned the same intentional fail-closed scheduler status (`FAILED`, exit `143`). Launch identity `165de4b4e65edc12a954ca09cd5d019618d4a7e3c8eb98cf4a3d5c13c7f9ce09`; config SHA256 `f80ab48ed91adaa6929db9d872d6f1fe3eb9bbe968f8ccc742519d0fd7420a06` |
+| Stage-2 decision | Slurm `143277` completed the sealed development integrity audit and wrote `valid_infeasible`, decision identity `b8dd760128d39f858d654668131621bae8cbd8114fe71455d0931cb1e17570b7`. Correct composite `12.6256599036` versus text-only `12.7318543089`, motion-shuffled `12.6257268809`, and full-shuffled `12.6263435677`; corresponding improvements were 0.83408%, **0.000530%**, and **0.005415%**, with `Rmotion=0.00253200`. Hand paths improved 18.23%/33.90%, but the corruption margins and motion-sensitivity gate again failed |
+| Stage-2 checkpoint | `best_infeasible.pt`, epoch 4/global step 288, SHA256 `e7c1e625088b160afe830da90aaaa612c2b3bda06d4e81c00b3eeb8c28c3fd46`; metrics SHA256 `d3cd8e7d66befa01f3eff28c55748bcaae8e805fa6fb5dc2479332756a1cf637`; selection-summary SHA256 `a66eff3a3c034e2170ebce330fa0786125831f3573497110409a84db76ac2660`. It was retained for audit only and must not be promoted |
+| Identity evidence | Stage-1/Stage-2 architecture digests `918c1aaf1b36abf803b3335f207a2d479313235cfe1fba2dc075b151101d4f8a` / `d1562e4bf8d23b59997881129160418f7fec65fc576a29a0bfb9cd1a01d07eb3`; shared objective `8267d7875a277e9b9ffcc7fc4e4d04e0db3f11565e6a251f987a80db33680821`; evaluation control `c18aa1206d659bf096248a5bd194ab2c0ccfc36cacfad1ee8191929fb2156a58`; cluster aggregation `5370fb44c8a505b0ec2a7087c3f5dd88c280f4734416108cef9bac1e26b0f7df`; bank ID `a65661333c0f60aa65dc68d896f439a698e37832f04bb8834a378a2d5f068bcd` |
+| Eligible isolation | Jobs `143198`, `143259`, `143261`, and `143277` staged/audited only the train and validation neighbor tables. Their ordered decisions attest `test_data_accessed=false` and `confirmation_manifest_opened=false`; W&B was disabled throughout |
+| Excluded integrity incident | Initial Stage-1 training `143170` at source `50a3854a38a3f3c0de1be0c3cccb15c026a7e768` completed four epochs but was excluded. Its decision `143194` incorrectly opened the shared full bank instead of a train/validation-only local stage, SHA256-read `neighbors_test.npz` metadata, then failed before any trajectory export because provider identities `{train,val,test}` differed from the checkpoint's `{train,val}`. No test example, test manifest, prediction, metric, confirmation row, or authorization was produced. The staging defect was repaired in `ec11f7a`, and the entire ordered experiment was restarted fresh rather than reusing the affected checkpoint |
+| Incident preservation | Excluded run: `experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_split_kv_motion_contrast_v1.integrity_failed_train143170_decision143194_test_neighbor_access`; matching launch prerequisites use the same path plus `.prerequisites`. Both are retained unchanged for audit |
+| Final scientific decision | Factorized K/V separation and the fixed temporal prior still yielded a generic memory-on improvement without meaningful dependence on the retrieved motion. Per the predeclared stop rule, stop after Stage 2; do not weaken gates, inspect confirmation/test outcomes, promote `best_infeasible.pt`, or begin Phase B |
+| Outputs | Stage 1: `experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_split_kv_motion_contrast_v1`; Stage 2: `experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_split_kv_temporal_bias_motion_contrast_v1` |
+| Confirmation/test/diagnostic status | No `authorize_confirmation.json` exists. No confirmation spend marker, confirmation export/analysis, test-set evaluation, locked temporal-slot diagnostic, or Phase-B job was launched. The only test-related access was the explicitly excluded `143194` neighbor-table metadata incident described above |
+| Runbook | `docs/NIAF/continuous_trajectory_field/phase_a_factorized_memory_v1.md` |
+| Default alias | Unchanged |
+
+Logs and terminal evidence:
+
+```text
+logs/sbatch/csl_v3_factorized_cpu_repair_full_143196.out
+logs/sbatch/csl_v3_splitkv_smoke_143197.out
+logs/sbatch/csl_v3_splitkv_s1_143198.out
+logs/sbatch/csl_v3_splitkv_decide_143259.out
+logs/sbatch/csl_v3_splitkv_s2_143261.out
+logs/sbatch/csl_v3_splitkv_decide_143277.out
+experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_split_kv_motion_contrast_v1/evaluation/ordered_development_decision/decision.json
+experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_split_kv_temporal_bias_motion_contrast_v1/evaluation/ordered_development_decision/decision.json
+```
+
+## Previous completed CSL-Daily: SignTrajField-RAG v3 Phase-A' motion-contrast v1
 
 | Field | Value |
 |---|---|
