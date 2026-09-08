@@ -69,7 +69,7 @@ EXPERIMENTS = {
     ),
 }
 LEASE_EXPERIMENTS = {
-    CALIBRATION_STAGE: "csl_daily_sentence_memory_relevance_calibration_v1",
+    CALIBRATION_STAGE: "csl_daily_sentence_memory_relevance_calibration_v1_retry1",
     **EXPERIMENTS,
 }
 STAGE1_EVAL_MODES = (
@@ -128,7 +128,7 @@ def _calibration_directory(cfg: Mapping[str, Any]) -> Path:
         directory = SOURCE_ROOT / directory
     expected = SOURCE_ROOT / (
         "experiments/NIAF/continuous_trajectory_field/"
-        "csl_daily_sentence_memory_relevance_calibration_v1"
+        "csl_daily_sentence_memory_relevance_calibration_v1_retry1"
     )
     if directory.resolve() != expected.resolve():
         raise OrderedDecisionError(

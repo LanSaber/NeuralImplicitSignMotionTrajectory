@@ -1,0 +1,16 @@
+_base_: csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1.yaml
+
+# Engineering-only recovery coverage after invalid smoke attempt 143300.
+# This output is never eligible for ordered authorization.
+experiment_name: csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1_smoke_retry1
+
+train:
+  epochs: 1
+  early_stopping_patience: 0
+  early_stopping_min_epochs: 1
+
+selection:
+  require_feasible: false
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1_smoke_retry1

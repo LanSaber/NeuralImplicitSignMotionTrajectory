@@ -385,6 +385,17 @@ def test_centered_mode_order_objective_identity_and_selection_gates():
     failed["sentence_memory/association_matching_top1"] = 0.249
     assert checkpoint_selection_diagnostics(failed, stage_b)[2] is False
 
+    invalid_utility = _passing_metrics()
+    invalid_utility["text_only/pred_loss_endpoint"] = 9.7
+    _, _, feasible, details = checkpoint_selection_diagnostics(
+        invalid_utility, stage_a, return_details=True
+    )
+    diagnostic = details["dual_mode"]
+    assert feasible is False
+    assert diagnostic["identity_utility_denominator_valid"] is False
+    assert diagnostic["identity_utility_fraction"] == 0.0
+    assert math.isfinite(diagnostic["identity_utility_denominator"])
+
 
 def test_stage_b_architecture_identity_seals_exact_association_descriptors():
     cfg = _paired_cfg(association=True)

@@ -18,8 +18,18 @@ SOURCE_GIT_HEAD="${SOURCE_GIT_HEAD:?Set SOURCE_GIT_HEAD to the clean pushed comm
 PYTHON_ENV="${PYTHON_ENV:-/media/cvpr/haomian/python_envs/SOKE}"
 PYTHON_BIN="${PYTHON_BIN:-$PYTHON_ENV/bin/python}"
 SOURCE_BANK="${SENTENCE_MEMORY_DIR:-/media/cvpr/haomian/data/SOKE_FLOW/csl_daily_upper_smplx/meta/niaf_sentence_memory/mt5_vae_mu_train_v1}"
-CALIBRATION_OUT="${CALIBRATION_OUT:-$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_v1}"
-CONTROL_DIR="${CONTROL_DIR:-$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_ordered_v1_control}"
+CANONICAL_CALIBRATION_OUT="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_v1_retry1"
+if [[ -n "${CALIBRATION_OUT:-}" && "$CALIBRATION_OUT" != "$CANONICAL_CALIBRATION_OUT" ]]; then
+  echo "ERROR: calibration forbids a noncanonical output path" >&2
+  exit 1
+fi
+CALIBRATION_OUT="$CANONICAL_CALIBRATION_OUT"
+CANONICAL_CONTROL_DIR="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_ordered_v1_control"
+if [[ -n "${CONTROL_DIR:-}" && "$CONTROL_DIR" != "$CANONICAL_CONTROL_DIR" ]]; then
+  echo "ERROR: calibration forbids a noncanonical control path" >&2
+  exit 1
+fi
+CONTROL_DIR="$CANONICAL_CONTROL_DIR"
 GLOBAL_HOLDOUT_SPEND="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_factorized_ordered_v1_control/confirmation_holdout_spent.json"
 AUDIT_CFG="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v3_sentence_memory_phase_a_split_kv_motion_contrast_v1.yaml"
 LAUNCHER="$PROJECT_DIR/scripts/NIAF/calibrate_csl_daily_sentence_memory_relevance_v1_sbatch.sh"

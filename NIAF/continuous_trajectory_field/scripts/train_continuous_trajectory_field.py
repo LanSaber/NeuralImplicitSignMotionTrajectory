@@ -560,7 +560,8 @@ def sentence_memory_selection_aggregation_identity(cfg):
                     ),
                     "identity_utility_fraction": (
                         "(mean_nonce(pair_composite)-correct_composite)/(text_only_"
-                        "composite-correct_composite); denominator>1e-8"
+                        "composite-correct_composite); denominator>1e-8; invalid_"
+                        "denominator_emits_value_0_and_valid_false"
                     ),
                     "association_matching": (
                         "within_correct_row_symmetric_K_to_V_and_V_to_K; equal_"
@@ -7313,13 +7314,24 @@ def _centered_sentence_memory_selection_diagnostics(
             ),
         )
 
-    utility_denominator = scores["off"] - scores["correct"]
-    utility = (
-        (mean_pair_score - scores["correct"]) / utility_denominator
-        if math.isfinite(utility_denominator) and utility_denominator > 1e-8
-        else float("nan")
+    utility_denominator_raw = scores["off"] - scores["correct"]
+    utility_numerator = mean_pair_score - scores["correct"]
+    utility_denominator_valid = bool(
+        math.isfinite(utility_denominator_raw)
+        and utility_denominator_raw > 1e-8
+        and math.isfinite(utility_numerator)
     )
-    diagnostic["identity_utility_denominator"] = utility_denominator
+    utility = (
+        utility_numerator / utility_denominator_raw
+        if utility_denominator_valid
+        else 0.0
+    )
+    diagnostic["identity_utility_denominator"] = (
+        utility_denominator_raw
+        if math.isfinite(utility_denominator_raw)
+        else 0.0
+    )
+    diagnostic["identity_utility_denominator_valid"] = utility_denominator_valid
     add_minimum(
         "identity_utility_fraction",
         utility,

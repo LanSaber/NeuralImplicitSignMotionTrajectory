@@ -1,8 +1,14 @@
 # CSL-Daily Phase-A''' centered/relevance runbook
 
-Status: implementation prepared only. No calibration, test, smoke, training,
-decision, diagnostic, confirmation, or test-set job is submitted by this
-change.
+Status: recovery source prepared after the first smoke attempt exposed an
+invalid non-finite diagnostic sentinel. The original immutable source commit
+`578cbb550a9e17ead6bb2111c717046f660f712c`, its accepted calibration job
+`143299`, and failed smoke job `143300` are retained as invalid-attempt
+evidence and must never authorize a full stage. The recovery must repeat the
+complete CPU gate, publish a new source-bound train-only calibration, and run
+both smoke arms under fresh `_smoke_retry1` experiment names before any full
+training. No full-stage, decision, diagnostic, confirmation, or test-set job
+has been authorized by either attempt.
 
 ## Immutable protocol
 
@@ -62,11 +68,16 @@ exact slope/intercept; checkpoint-copied scalars alone are not authority.
 ## Source and staging invariants
 
 All jobs require `PROJECT_DIR` to be a clean, pushed standalone clone on
-shared `/media/cvpr` storage with a real `.git` directory. The branch and
+shared `/media/cvpr` storage with a real `.git` directory. The retry branch and
 origin head stay fixed for calibration, tests, smoke, all possible resumes,
 both ordered stages, decision, diagnostic, and confirmation. The clone must
 expose durable `experiments` and `deps/mt5-base`. Jobs reject a Codex worktree
 whose gitdir points to node-local storage.
+
+The retired immutable branch
+`codex/csl-daily-centered-memory-v1-run` remains fixed at `578cbb5...` as
+forensic provenance for jobs `143298`--`143300`. It must not be advanced or
+reused. Recovery uses the distinct clone and immutable branch named below.
 
 The strict staging helper reads only explicit core filenames from `bank.json`
 and explicit requested `neighbors_train.npz`/`neighbors_val.npz`. It never
@@ -90,8 +101,8 @@ Do not launch until the implementation is committed and pushed and the shared
 run clone is clean.
 
 ```bash
-export PROJECT_DIR=/media/cvpr/haomian/SignTrajField_centered_run_source
-export SOURCE_REMOTE_BRANCH=codex/csl-daily-centered-memory-v1-run
+export PROJECT_DIR=/media/cvpr/haomian/SignTrajField_centered_run_source_r1
+export SOURCE_REMOTE_BRANCH=codex/csl-daily-centered-memory-v1-run-r1
 export GIT_CONFIG_COUNT=1
 export GIT_CONFIG_KEY_0=safe.directory
 export GIT_CONFIG_VALUE_0="$PROJECT_DIR"

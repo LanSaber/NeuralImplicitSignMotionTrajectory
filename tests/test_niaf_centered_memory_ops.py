@@ -28,6 +28,7 @@ GLOBAL_SPEND = (
     "csl_daily_signtrajfield_v3_sentence_memory_phase_a_factorized_ordered_v1_control/"
     "confirmation_holdout_spent.json"
 )
+CALIBRATION_RETRY = "csl_daily_sentence_memory_relevance_calibration_v1_retry1"
 STAGE_A_MODES = [
     "off",
     "on",
@@ -136,6 +137,29 @@ def test_calibration_launcher_is_train_only_attested_and_durable():
         'if [[ "$EXISTING_ACCEPTED" == "1" ]]'
     )
     assert "--source_remote_ref" in source and "--source_remote_head" in source
+    assert CALIBRATION_RETRY in source
+    assert "calibration forbids a noncanonical output path" in source
+    assert "calibration forbids a noncanonical control path" in source
+
+
+def test_recovery_calibration_path_is_consistent_and_source_bound():
+    stage_a = load_config(CONFIG_DIR / f"{STAGE_A}.yaml")
+    stage_b = load_config(CONFIG_DIR / f"{STAGE_B}.yaml")
+    for cfg in (stage_a, stage_b):
+        artifact = cfg["sentence_memory"]["relevance_calibration"]["artifact_dir"]
+        assert Path(artifact).name == CALIBRATION_RETRY
+    for script in (
+        "calibrate_csl_daily_sentence_memory_relevance_v1_sbatch.sh",
+        "smoke_csl_daily_centered_memory_v1_sbatch.sh",
+        "run_csl_daily_centered_memory_stage.sh",
+        "decide_csl_daily_centered_memory_v1_sbatch.sh",
+    ):
+        assert CALIBRATION_RETRY in _source(script)
+    helper = (
+        ROOT
+        / "NIAF/continuous_trajectory_field/scripts/decide_centered_memory_stage.py"
+    ).read_text(encoding="utf-8")
+    assert helper.count(CALIBRATION_RETRY) == 2
 
 
 def test_full_driver_enforces_order_fresh_v2_and_single_holdout_lock():
@@ -247,6 +271,11 @@ def test_full_and_smoke_slurm_resources_are_explicit():
     assert "MAX_TRAIN_BATCHES=2" in smoke
     assert 'global_step", -1)) != 1' in smoke
     assert smoke.count("run_arm csl_daily_signtrajfield_v3") == 2
+    assert smoke.count("_smoke_retry1") == 3
+    assert "invalid smoke attempt 143300" in (
+        CONFIG_DIR
+        / f"{STAGE_A}_smoke_retry1.yaml"
+    ).read_text(encoding="utf-8")
     cpu = _source("test_csl_daily_centered_memory_v1_sbatch.sh")
     assert "pytest==8.4.2" in cpu and "ruff==0.12.0" in cpu
     assert "/media/cvpr/haomian/python_envs/slt/bin/uv" in cpu
