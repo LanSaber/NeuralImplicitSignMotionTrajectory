@@ -1,0 +1,40 @@
+_base_: csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1.yaml
+
+# Stage B is permitted only after Stage A is integrity-valid but development-
+# infeasible.  YAML inheritance shares controls, never model/optimizer state;
+# its full launcher imports the pinned v2 checkpoint afresh.
+experiment_name: csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1
+
+sentence_memory:
+  key_value_mode: factorized_metadata_motion_v1
+  candidate_value_mode: centered_candidate_covariance_v1
+  relevance_gate_mode: frozen_absolute_adjusted_score_v1
+  association_mode: absolute_text_motion_v1
+  temporal_prior_mode: none
+
+objective:
+  lambda_sentence_association_bce: 0.10
+  lambda_sentence_association_infonce: 0.05
+  association_temperature: 0.10
+
+eval:
+  sentence_memory_modes:
+    - "off"
+    - "on"
+    - motion_shuffled_n0
+    - motion_shuffled_n1
+    - motion_shuffled_n2
+    - cross_query_motion
+    - full_replacement
+    - joint_tuple_permuted
+    - uniform_final_mass
+    - analytic_prior
+    - association_disabled
+
+train:
+  epochs: 6
+  early_stopping_patience: 2
+  early_stopping_min_epochs: 3
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1

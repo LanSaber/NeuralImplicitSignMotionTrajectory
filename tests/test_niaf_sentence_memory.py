@@ -910,8 +910,9 @@ def test_training_and_eval_apply_semantic_and_source_filters(tmp_path):
         "sentence_scores",
         "sentence_durations",
         "sentence_part_validity",
-        "sentence_memory_available",
-    }
+            "sentence_memory_available",
+            "sentence_candidate_ids",
+        }
 
 
 def test_off_mode_avoids_candidates_and_returns_shape_safe_batch(

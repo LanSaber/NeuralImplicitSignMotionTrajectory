@@ -5,6 +5,7 @@ from dataclasses import replace
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from NIAF.continuous_trajectory_field.models.dual_mode_trajectory_hypernetwork import (
     PART_COUNT,
@@ -18,6 +19,7 @@ from NIAF.continuous_trajectory_field.models.trajectory_instance import (
 
 SENTENCE_RETRIEVAL_FEATURE_DIM = 5
 SENTENCE_CONFIDENCE_FEATURE_DIM = 4
+SENTENCE_ASSOCIATION_DIM = 128
 LEGACY_SENTENCE_KEY_VALUE_MODE = "legacy_mixed_v1"
 FACTORIZED_SENTENCE_KEY_VALUE_MODE = "factorized_metadata_motion_v1"
 SENTENCE_KEY_VALUE_MODES = frozenset(
@@ -27,7 +29,38 @@ SENTENCE_KEY_VALUE_MODES = frozenset(
     }
 )
 SENTENCE_TEMPORAL_PRIOR_MODES = frozenset({"none", "gaussian"})
-SENTENCE_ATTENTION_MODES = frozenset({"learned", "analytic_prior"})
+RAW_FACTORIZED_CANDIDATE_VALUE_MODE = "raw_factorized_v1"
+CENTERED_CANDIDATE_VALUE_MODE = "centered_candidate_covariance_v1"
+SENTENCE_CANDIDATE_VALUE_MODES = frozenset(
+    {
+        RAW_FACTORIZED_CANDIDATE_VALUE_MODE,
+        CENTERED_CANDIDATE_VALUE_MODE,
+    }
+)
+NO_SENTENCE_ASSOCIATION_MODE = "none"
+ABSOLUTE_TEXT_MOTION_ASSOCIATION_MODE = "absolute_text_motion_v1"
+SENTENCE_ASSOCIATION_MODES = frozenset(
+    {
+        NO_SENTENCE_ASSOCIATION_MODE,
+        ABSOLUTE_TEXT_MOTION_ASSOCIATION_MODE,
+    }
+)
+NO_SENTENCE_RELEVANCE_GATE_MODE = "none"
+FROZEN_ABSOLUTE_RELEVANCE_GATE_MODE = "frozen_absolute_adjusted_score_v1"
+SENTENCE_RELEVANCE_GATE_MODES = frozenset(
+    {
+        NO_SENTENCE_RELEVANCE_GATE_MODE,
+        FROZEN_ABSOLUTE_RELEVANCE_GATE_MODE,
+    }
+)
+SENTENCE_ATTENTION_MODES = frozenset(
+    {
+        "learned",
+        "analytic_prior",
+        "uniform_final_candidate_mass",
+        "association_disabled",
+    }
+)
 
 
 def _masked_candidate_softmax(logits: torch.Tensor, mask: torch.Tensor):
@@ -57,6 +90,32 @@ def _token_tau(mask: torch.Tensor, dtype: torch.dtype):
         tau,
     )
     return tau * mask.to(dtype)
+
+
+def _gather_candidate_axis(
+    values: torch.Tensor,
+    order: torch.Tensor,
+    *,
+    axis: int,
+):
+    """Gather a candidate axis with one independent order per batch row."""
+
+    if values.ndim < 2 or order.ndim != 2 or values.shape[0] != order.shape[0]:
+        raise ValueError("candidate gather requires values [B,...] and order [B,K]")
+    axis = int(axis)
+    if axis < 0:
+        axis += values.ndim
+    if axis <= 0 or axis >= values.ndim:
+        raise ValueError("candidate gather axis must be a non-batch tensor axis")
+    if values.shape[axis] != order.shape[1]:
+        raise ValueError("candidate gather axis and order length disagree")
+    index_shape = [1] * values.ndim
+    index_shape[0] = order.shape[0]
+    index_shape[axis] = order.shape[1]
+    index = order.reshape(index_shape)
+    expanded_shape = list(values.shape)
+    expanded_shape[axis] = order.shape[1]
+    return torch.gather(values, axis, index.expand(expanded_shape))
 
 
 class SentenceMemoryCrossAttention(nn.Module):
@@ -162,7 +221,13 @@ SentenceMemoryAttentionBlock = SentenceMemoryCrossAttention
 class FactorizedSentenceMemoryCrossAttention(nn.Module):
     """Attend with metadata-only keys and motion-only, zero-preserving values."""
 
-    def __init__(self, hidden_dim: int, head_count: int, dropout: float):
+    def __init__(
+        self,
+        hidden_dim: int,
+        head_count: int,
+        dropout: float,
+        candidate_value_mode: str | None = None,
+    ):
         super().__init__()
         hidden_dim = int(hidden_dim)
         head_count = int(head_count)
@@ -171,6 +236,18 @@ class FactorizedSentenceMemoryCrossAttention(nn.Module):
         self.hidden_dim = hidden_dim
         self.head_count = head_count
         self.head_dim = hidden_dim // head_count
+        self.candidate_value_mode = (
+            RAW_FACTORIZED_CANDIDATE_VALUE_MODE
+            if candidate_value_mode is None
+            else str(candidate_value_mode).lower()
+        )
+        if self.candidate_value_mode not in SENTENCE_CANDIDATE_VALUE_MODES:
+            raise ValueError(
+                "sentence-memory candidate_value_mode must be one of "
+                f"{sorted(SENTENCE_CANDIDATE_VALUE_MODES)}, "
+                f"got {self.candidate_value_mode!r}"
+            )
+        self._last_debug: dict[str, torch.Tensor] = {}
 
         # Query/key affine parameters cannot inject motion into the value path.
         self.query_norm = nn.LayerNorm(hidden_dim)
@@ -218,6 +295,9 @@ class FactorizedSentenceMemoryCrossAttention(nn.Module):
         token_count: int,
         *,
         attention_mode: str = "learned",
+        candidate_ids: torch.Tensor | None = None,
+        candidate_acceptance_gate: torch.Tensor | None = None,
+        restore_candidate_order: torch.Tensor | None = None,
     ):
         """Return the same four-tensor hook contract as the legacy block.
 
@@ -252,6 +332,33 @@ class FactorizedSentenceMemoryCrossAttention(nn.Module):
             raise ValueError("token_log_prior must have shape [B,Q,K,U]")
         if token_mask.shape != expected_prior_shape:
             raise ValueError("token_mask must have shape [B,Q,K,U]")
+        centered = (
+            self.candidate_value_mode == CENTERED_CANDIDATE_VALUE_MODE
+        )
+        if centered:
+            if candidate_ids is None:
+                raise ValueError(
+                    "sentence_candidate_ids are required for "
+                    f"candidate_value_mode={CENTERED_CANDIDATE_VALUE_MODE!r}"
+                )
+            if candidate_ids.shape != (batch, int(candidate_count)):
+                raise ValueError("sentence_candidate_ids must have shape [B,K]")
+            if candidate_ids.dtype == torch.bool or torch.is_floating_point(
+                candidate_ids
+            ):
+                raise ValueError("sentence_candidate_ids must use an integer dtype")
+            if candidate_acceptance_gate is None:
+                candidate_acceptance_gate = text_slots.new_ones(
+                    batch,
+                    int(candidate_count),
+                )
+            elif candidate_acceptance_gate.shape != (
+                batch,
+                int(candidate_count),
+            ):
+                raise ValueError(
+                    "candidate_acceptance_gate must have shape [B,K]"
+                )
 
         query = self._heads(
             self.query_projection(self.query_norm(text_slots))
@@ -302,6 +409,207 @@ class FactorizedSentenceMemoryCrossAttention(nn.Module):
             torch.cat([null_logits.unsqueeze(-1), real_logits], dim=-1),
             dim=-1,
         )
+
+        if centered:
+            # First form the ordinary null+real distribution.  Absolute
+            # association/relevance gates then reject candidate probability
+            # without renormalizing the surviving candidates: every rejected
+            # bit of mass is routed back to the null path.
+            base_real = probabilities[..., 1:].reshape(
+                batch,
+                self.head_count,
+                query_count,
+                int(candidate_count),
+                int(token_count),
+            )
+            support = token_mask.any(dim=-1)
+            informative = support.sum(dim=-1) > 1
+            acceptance = candidate_acceptance_gate.to(
+                device=text_slots.device,
+                dtype=text_slots.dtype,
+            ).clamp(0.0, 1.0)
+            acceptance = acceptance[:, None, None, :, None]
+            final_token_head = base_real * acceptance
+            final_candidate_head = final_token_head.sum(dim=-1)
+            final_candidate_head = torch.where(
+                informative[:, None, :, None],
+                final_candidate_head,
+                torch.zeros_like(final_candidate_head),
+            )
+            accepted_mass = final_candidate_head.sum(dim=-1, keepdim=True)
+
+            support_float = support.to(dtype=text_slots.dtype)
+            uniform = support_float / support_float.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(1.0)
+            uniform_head = uniform[:, None, :, :]
+            uniform_absolute = accepted_mass * uniform_head
+            if attention_mode == "uniform_final_candidate_mass":
+                # Share this exact tensor with the coefficient calculation
+                # below.  This makes the control bitwise zero rather than only
+                # algebraically zero after floating-point cancellation.
+                final_candidate_head = uniform_absolute
+                centered_coefficients = torch.zeros_like(final_candidate_head)
+            else:
+                centered_coefficients = (
+                    final_candidate_head - uniform_absolute
+                )
+                # Algebraically uniform candidate masses have zero covariance.
+                # Detect exact equality rather than applying a tolerance: a
+                # near-uniform learned distribution is still meaningful, while
+                # an exactly uniform one must remain bitwise zero even when the
+                # floating-point rho/N reconstruction rounds differently.
+                positive_infinity = torch.full_like(
+                    final_candidate_head,
+                    torch.inf,
+                )
+                negative_infinity = torch.full_like(
+                    final_candidate_head,
+                    -torch.inf,
+                )
+                support_head = support[:, None, :, :]
+                supported_minimum = torch.where(
+                    support_head,
+                    final_candidate_head,
+                    positive_infinity,
+                ).amin(dim=-1)
+                supported_maximum = torch.where(
+                    support_head,
+                    final_candidate_head,
+                    negative_infinity,
+                ).amax(dim=-1)
+                exactly_uniform = (
+                    informative[:, None, :]
+                    & (supported_minimum == supported_maximum)
+                )
+                centered_coefficients = torch.where(
+                    exactly_uniform[..., None],
+                    torch.zeros_like(centered_coefficients),
+                    centered_coefficients,
+                )
+
+            # The within-candidate token distribution is structural and does
+            # not depend on candidate mass.  Pool values only after this
+            # layer's motion-only value projection, separately per head,
+            # target slot, and articulator query.
+            structural_logits = token_log_prior.masked_fill(
+                ~token_mask,
+                -torch.inf,
+            )
+            token_conditional = torch.softmax(structural_logits, dim=-1)
+            token_conditional = torch.where(
+                token_mask,
+                torch.nan_to_num(
+                    token_conditional,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ),
+                torch.zeros_like(token_conditional),
+            )
+            value_by_candidate = value.reshape(
+                batch,
+                self.head_count,
+                int(candidate_count),
+                int(token_count),
+                self.head_dim,
+            )
+            candidate_summary = torch.einsum(
+                "bqku,bhkud->bhqkd",
+                token_conditional,
+                value_by_candidate,
+            )
+
+            # Referencing the smallest stable bank item ID makes the numerical
+            # form independent of physical candidate order.  Averaging ties
+            # preserves that contract even for defensive duplicate-ID input.
+            ids = candidate_ids.to(device=text_slots.device)
+            expanded_ids = ids[:, None, :].expand(-1, query_count, -1)
+            sentinel = torch.iinfo(ids.dtype).max
+            supported_ids = torch.where(
+                support,
+                expanded_ids,
+                torch.full_like(expanded_ids, sentinel),
+            )
+            minimum_id = supported_ids.amin(dim=-1, keepdim=True)
+            reference_mask = support & (expanded_ids == minimum_id)
+            reference_weight = reference_mask.to(text_slots.dtype)
+            reference_weight = reference_weight / reference_weight.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(1.0)
+            reference = torch.einsum(
+                "bqk,bhqkd->bhqd",
+                reference_weight,
+                candidate_summary,
+            ).unsqueeze(-2)
+            centered_summary = candidate_summary - reference
+            update = torch.einsum(
+                "bhqk,bhqkd->bhqd",
+                centered_coefficients,
+                centered_summary,
+            )
+            update = torch.where(
+                informative[:, None, :, None],
+                update,
+                torch.zeros_like(update),
+            )
+            update_flat = update.transpose(1, 2).reshape_as(state)
+            state = state + self.output_dropout(
+                self.output_projection(update_flat)
+            )
+            state = state + self.output_dropout(
+                self.feed_forward(self.state_norm(state))
+            )
+
+            # Redistribute the final candidate masses across their structural
+            # token conditionals for the established diagnostic hook.
+            final_token_head = (
+                final_candidate_head.unsqueeze(-1)
+                * token_conditional[:, None, :, :, :]
+            )
+            candidate_mass = final_candidate_head.mean(dim=1)
+            null_mass = 1.0 - candidate_mass.sum(dim=-1)
+            null_mass = torch.where(
+                informative,
+                null_mass,
+                torch.ones_like(null_mass),
+            )
+            token_mass = final_token_head.mean(dim=1)
+            self._last_debug = {
+                "centered_update": update_flat,
+                "candidate_support": support,
+                "uniform_candidate_mass": uniform,
+                "final_part_candidate_mass": candidate_mass,
+                "final_part_null_mass": null_mass,
+            }
+            # Centered callers canonicalize candidate tuples by stable item ID
+            # so reductions are independent of provider rank.  State and null
+            # mass have no candidate axis, but the returned attention tensors
+            # are a public forward-hook surface and must retain the caller's
+            # physical candidate labels.
+            returned_candidate_mass = candidate_mass
+            returned_token_mass = token_mass
+            if restore_candidate_order is not None:
+                returned_candidate_mass = _gather_candidate_axis(
+                    returned_candidate_mass,
+                    restore_candidate_order,
+                    axis=-1,
+                )
+                returned_token_mass = _gather_candidate_axis(
+                    returned_token_mass,
+                    restore_candidate_order,
+                    axis=-2,
+                )
+            return (
+                state,
+                null_mass,
+                returned_candidate_mass,
+                returned_token_mass,
+            )
+
+        self._last_debug = {}
         null_mass = probabilities[..., 0].mean(dim=1)
         real_probabilities = probabilities[..., 1:]
         dropped_probabilities = self.attention_dropout(real_probabilities)
@@ -338,9 +646,17 @@ class SentenceMemorySlotEncoder(nn.Module):
         duration_weight: float = 0.10,
         retrieval_prior_scale: float = 1.0,
         key_value_mode: str | None = None,
+        candidate_value_mode: str | None = None,
         temporal_prior_mode: str = "none",
         temporal_prior_sigma: float = 0.25,
         temporal_prior_scale: float = 1.0,
+        association_mode: str = NO_SENTENCE_ASSOCIATION_MODE,
+        association_dim: int = SENTENCE_ASSOCIATION_DIM,
+        association_temperature: float = 0.10,
+        association_threshold_initial: float = 0.0,
+        relevance_gate_mode: str = NO_SENTENCE_RELEVANCE_GATE_MODE,
+        relevance_slope: float | None = None,
+        relevance_intercept: float | None = None,
     ):
         super().__init__()
         self.motion_dim = int(motion_dim)
@@ -359,6 +675,25 @@ class SentenceMemorySlotEncoder(nn.Module):
                 "sentence-memory key_value_mode must be one of "
                 f"{sorted(SENTENCE_KEY_VALUE_MODES)}, got {self.key_value_mode!r}"
             )
+        self.candidate_value_mode = (
+            RAW_FACTORIZED_CANDIDATE_VALUE_MODE
+            if candidate_value_mode is None
+            else str(candidate_value_mode).lower()
+        )
+        if self.candidate_value_mode not in SENTENCE_CANDIDATE_VALUE_MODES:
+            raise ValueError(
+                "sentence-memory candidate_value_mode must be one of "
+                f"{sorted(SENTENCE_CANDIDATE_VALUE_MODES)}, "
+                f"got {self.candidate_value_mode!r}"
+            )
+        if (
+            self.key_value_mode != FACTORIZED_SENTENCE_KEY_VALUE_MODE
+            and self.candidate_value_mode != RAW_FACTORIZED_CANDIDATE_VALUE_MODE
+        ):
+            raise ValueError(
+                "centered candidate values require "
+                f"key_value_mode={FACTORIZED_SENTENCE_KEY_VALUE_MODE!r}"
+            )
         self.temporal_prior_mode = str(temporal_prior_mode).lower()
         if self.temporal_prior_mode not in SENTENCE_TEMPORAL_PRIOR_MODES:
             raise ValueError(
@@ -372,6 +707,82 @@ class SentenceMemorySlotEncoder(nn.Module):
         self.temporal_prior_scale = float(temporal_prior_scale)
         if not math.isfinite(self.temporal_prior_scale) or self.temporal_prior_scale < 0:
             raise ValueError("sentence-memory temporal_prior_scale must be non-negative")
+        if (
+            self.candidate_value_mode == CENTERED_CANDIDATE_VALUE_MODE
+            and self.temporal_prior_mode != "none"
+        ):
+            raise ValueError(
+                f"candidate_value_mode={CENTERED_CANDIDATE_VALUE_MODE!r} "
+                "requires temporal_prior_mode='none'"
+            )
+
+        self.association_mode = str(association_mode).lower()
+        if self.association_mode not in SENTENCE_ASSOCIATION_MODES:
+            raise ValueError(
+                "sentence-memory association_mode must be one of "
+                f"{sorted(SENTENCE_ASSOCIATION_MODES)}, "
+                f"got {self.association_mode!r}"
+            )
+        if (
+            self.association_mode != NO_SENTENCE_ASSOCIATION_MODE
+            and self.candidate_value_mode != CENTERED_CANDIDATE_VALUE_MODE
+        ):
+            raise ValueError(
+                "absolute text-motion association requires "
+                f"candidate_value_mode={CENTERED_CANDIDATE_VALUE_MODE!r}"
+            )
+        self.association_dim = int(association_dim)
+        if (
+            self.association_mode == ABSOLUTE_TEXT_MOTION_ASSOCIATION_MODE
+            and self.association_dim != SENTENCE_ASSOCIATION_DIM
+        ):
+            raise ValueError(
+                "absolute_text_motion_v1 requires association_dim=128"
+            )
+        self.association_temperature = float(association_temperature)
+        if (
+            not math.isfinite(self.association_temperature)
+            or self.association_temperature <= 0.0
+        ):
+            raise ValueError("sentence-memory association_temperature must be positive")
+        threshold = float(association_threshold_initial)
+        if not math.isfinite(threshold) or not -1.0 < threshold < 1.0:
+            raise ValueError(
+                "sentence-memory association_threshold_initial must be in (-1,1)"
+            )
+
+        self.relevance_gate_mode = str(relevance_gate_mode).lower()
+        if self.relevance_gate_mode not in SENTENCE_RELEVANCE_GATE_MODES:
+            raise ValueError(
+                "sentence-memory relevance_gate_mode must be one of "
+                f"{sorted(SENTENCE_RELEVANCE_GATE_MODES)}, "
+                f"got {self.relevance_gate_mode!r}"
+            )
+        if (
+            self.relevance_gate_mode != NO_SENTENCE_RELEVANCE_GATE_MODE
+            and self.candidate_value_mode != CENTERED_CANDIDATE_VALUE_MODE
+        ):
+            raise ValueError(
+                "absolute relevance gating requires "
+                f"candidate_value_mode={CENTERED_CANDIDATE_VALUE_MODE!r}"
+            )
+        if self.relevance_gate_mode == FROZEN_ABSOLUTE_RELEVANCE_GATE_MODE:
+            if relevance_slope is None or relevance_intercept is None:
+                raise ValueError(
+                    "frozen absolute relevance gating requires resolved "
+                    "relevance_slope and relevance_intercept"
+                )
+            if not math.isfinite(float(relevance_slope)) or float(relevance_slope) <= 0:
+                raise ValueError("sentence-memory relevance_slope must be positive")
+            if not math.isfinite(float(relevance_intercept)):
+                raise ValueError("sentence-memory relevance_intercept must be finite")
+        self.relevance_slope = (
+            None if relevance_slope is None else float(relevance_slope)
+        )
+        self.relevance_intercept = (
+            None if relevance_intercept is None else float(relevance_intercept)
+        )
+        self._last_debug: dict[str, torch.Tensor] = {}
 
         if self.key_value_mode == LEGACY_SENTENCE_KEY_VALUE_MODE:
             # Keep this branch byte-for-byte equivalent in topology and module
@@ -409,6 +820,28 @@ class SentenceMemorySlotEncoder(nn.Module):
                 nn.SiLU(),
                 nn.Linear(self.hidden_dim, self.hidden_dim),
             )
+        if self.association_mode == ABSOLUTE_TEXT_MOTION_ASSOCIATION_MODE:
+            # These target-independent descriptors have no affine shortcut:
+            # sentence text is the sole key input and VAE motion is the sole
+            # motion input.  Creating them only for the opt-in mode preserves
+            # strict legacy/raw state-dict compatibility.
+            self.association_key_projection = nn.Linear(
+                self.key_dim,
+                self.association_dim,
+                bias=False,
+            )
+            self.association_motion_norm = nn.LayerNorm(
+                self.motion_dim,
+                elementwise_affine=False,
+            )
+            self.association_motion_projection = nn.Linear(
+                self.motion_dim,
+                self.association_dim,
+                bias=False,
+            )
+            self.association_threshold_raw = nn.Parameter(
+                torch.tensor(math.atanh(threshold), dtype=torch.float32)
+            )
         self.part_query_embeddings = nn.Parameter(
             torch.zeros(PART_COUNT, self.hidden_dim)
         )
@@ -441,6 +874,7 @@ class SentenceMemorySlotEncoder(nn.Module):
                         hidden_dim=self.hidden_dim,
                         head_count=int(head_count),
                         dropout=float(dropout),
+                        candidate_value_mode=self.candidate_value_mode,
                     )
                 )
                 for _ in range(max(int(layer_count), 1))
@@ -458,6 +892,7 @@ class SentenceMemorySlotEncoder(nn.Module):
         candidate_mask: torch.Tensor,
         motion_tau: torch.Tensor | None = None,
         part_validity: torch.Tensor | None = None,
+        candidate_ids: torch.Tensor | None = None,
     ):
         if motion_tokens.ndim != 4 or motion_tokens.shape[-1] != self.motion_dim:
             raise ValueError(
@@ -489,7 +924,105 @@ class SentenceMemorySlotEncoder(nn.Module):
             PART_COUNT,
         ):
             raise ValueError("sentence_part_validity must have shape [B,K,U,4]")
+        if candidate_ids is not None:
+            if candidate_ids.shape != (batch, candidates):
+                raise ValueError("sentence_candidate_ids must have shape [B,K]")
+            if candidate_ids.dtype == torch.bool or torch.is_floating_point(
+                candidate_ids
+            ):
+                raise ValueError("sentence_candidate_ids must use an integer dtype")
+        elif self.candidate_value_mode == CENTERED_CANDIDATE_VALUE_MODE:
+            raise ValueError(
+                "sentence_candidate_ids are required for "
+                f"candidate_value_mode={CENTERED_CANDIDATE_VALUE_MODE!r}"
+            )
         return batch, candidates, tokens
+
+    def _association_statistics(
+        self,
+        *,
+        text_keys: torch.Tensor,
+        motion_tokens: torch.Tensor,
+        motion_mask: torch.Tensor,
+        candidate_mask: torch.Tensor,
+    ):
+        """Return target-independent absolute key/motion compatibility."""
+
+        valid = candidate_mask & motion_mask.any(dim=-1)
+        if self.association_mode == NO_SENTENCE_ASSOCIATION_MODE:
+            return {
+                "mask": valid,
+                "effective_gate": valid.to(dtype=motion_tokens.dtype),
+            }
+
+        key_descriptor = self.association_key_projection(text_keys)
+        key_descriptor = F.normalize(key_descriptor, dim=-1, eps=1e-8)
+        normalized_motion = self.association_motion_norm(motion_tokens)
+        token_weight = motion_mask.to(dtype=normalized_motion.dtype)
+        mean_motion = (
+            normalized_motion * token_weight[..., None]
+        ).sum(dim=-2)
+        mean_motion = mean_motion / token_weight.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1.0)
+        motion_descriptor = self.association_motion_projection(mean_motion)
+        motion_descriptor = F.normalize(motion_descriptor, dim=-1, eps=1e-8)
+        key_descriptor = torch.where(
+            valid[..., None],
+            key_descriptor,
+            torch.zeros_like(key_descriptor),
+        )
+        motion_descriptor = torch.where(
+            valid[..., None],
+            motion_descriptor,
+            torch.zeros_like(motion_descriptor),
+        )
+        cosine = (key_descriptor * motion_descriptor).sum(dim=-1)
+        threshold = torch.tanh(self.association_threshold_raw).to(
+            dtype=cosine.dtype
+        )
+        logit = (cosine - threshold) / self.association_temperature
+        gate = torch.sigmoid(logit)
+        cosine = torch.where(valid, cosine, torch.zeros_like(cosine))
+        logit = torch.where(valid, logit, torch.zeros_like(logit))
+        gate = torch.where(valid, gate, torch.zeros_like(gate))
+        return {
+            "key_descriptor": key_descriptor,
+            "motion_descriptor": motion_descriptor,
+            "cosine": cosine,
+            "logit": logit,
+            "gate": gate,
+            "mask": valid,
+            "threshold": threshold,
+            "effective_gate": gate,
+        }
+
+    def _relevance_statistics(
+        self,
+        adjusted_scores: torch.Tensor,
+        candidate_mask: torch.Tensor,
+    ):
+        if self.relevance_gate_mode == NO_SENTENCE_RELEVANCE_GATE_MODE:
+            logit = torch.zeros_like(adjusted_scores)
+            gate = candidate_mask.to(dtype=adjusted_scores.dtype)
+        else:
+            logit = (
+                float(self.relevance_slope) * adjusted_scores
+                + float(self.relevance_intercept)
+            )
+            gate = torch.sigmoid(logit)
+            logit = torch.where(
+                candidate_mask,
+                logit,
+                torch.zeros_like(logit),
+            )
+            gate = torch.where(
+                candidate_mask,
+                gate,
+                torch.zeros_like(gate),
+            )
+        return logit, gate
 
     def _retrieval_statistics(
         self,
@@ -684,6 +1217,11 @@ class SentenceMemorySlotEncoder(nn.Module):
         part_validity: torch.Tensor | None,
         slot_tau: torch.Tensor | None,
         attention_mode: str,
+        candidate_ids: torch.Tensor | None,
+        restore_candidate_order: torch.Tensor | None,
+        association: dict[str, torch.Tensor],
+        relevance_logit: torch.Tensor,
+        relevance_gate: torch.Tensor,
     ):
         batch, candidates, tokens, _motion_dim = motion_tokens.shape
         slot_count = int(text_slots.shape[1])
@@ -729,6 +1267,19 @@ class SentenceMemorySlotEncoder(nn.Module):
             slot_count=slot_count,
         )
 
+        centered = (
+            self.candidate_value_mode == CENTERED_CANDIDATE_VALUE_MODE
+        )
+        if centered:
+            association_effective_gate = association["effective_gate"]
+            if attention_mode == "association_disabled":
+                association_effective_gate = association["mask"].to(dtype)
+            candidate_acceptance_gate = (
+                relevance_gate * association_effective_gate
+            )
+        else:
+            candidate_acceptance_gate = None
+
         part_queries = self._part_queries(text_slots)
         state = part_queries.new_zeros(part_queries.shape)
         null_mass = text_slots.new_ones(batch, slot_count * PART_COUNT)
@@ -743,8 +1294,12 @@ class SentenceMemorySlotEncoder(nn.Module):
             candidates,
             tokens,
         )
-        query_has_memory = token_mask.any(dim=(-1, -2))
+        if centered:
+            query_has_memory = token_mask.any(dim=-1).sum(dim=-1) > 1
+        else:
+            query_has_memory = token_mask.any(dim=(-1, -2))
         null_bias = self.null_confidence(confidence).squeeze(-1)
+        centered_updates = []
         for layer in self.layers:
             state, null_mass, candidate_mass, token_mass = layer(
                 part_queries,
@@ -757,7 +1312,12 @@ class SentenceMemorySlotEncoder(nn.Module):
                 candidates,
                 tokens,
                 attention_mode=attention_mode,
+                candidate_ids=candidate_ids,
+                candidate_acceptance_gate=candidate_acceptance_gate,
+                restore_candidate_order=restore_candidate_order,
             )
+            if centered:
+                centered_updates.append(layer._last_debug["centered_update"])
             state = torch.where(
                 query_has_memory[..., None],
                 state,
@@ -777,16 +1337,82 @@ class SentenceMemorySlotEncoder(nn.Module):
             slot_count,
             PART_COUNT,
         ).to(dtype)
-        return {
+        output = {
             "slots": state,
             "part_null_mass": part_null_mass,
             "null_mass": part_null_mass.mean(dim=2),
             "candidate_mass": part_candidate_mass.mean(dim=2),
             "part_validity": part_available,
             "confidence": confidence,
-            "available": candidate_mask.any(dim=-1),
+            "available": (
+                query_has_memory.any(dim=-1)
+                if centered
+                else candidate_mask.any(dim=-1)
+            ),
             "adjusted_scores": adjusted_scores,
         }
+        if centered:
+            final_debug = self.layers[-1]._last_debug
+            self._last_debug = {
+                "sentence_memory_association_mask": association["mask"],
+                "sentence_memory_relevance_logit": relevance_logit,
+                "sentence_memory_relevance_gate": relevance_gate,
+                "sentence_memory_final_part_candidate_mass": (
+                    final_debug["final_part_candidate_mass"].reshape(
+                        batch,
+                        slot_count,
+                        PART_COUNT,
+                        candidates,
+                    )
+                ),
+                "sentence_memory_final_part_null_mass": (
+                    final_debug["final_part_null_mass"].reshape(
+                        batch,
+                        slot_count,
+                        PART_COUNT,
+                    )
+                ),
+                "sentence_memory_candidate_support": (
+                    final_debug["candidate_support"].reshape(
+                        batch,
+                        slot_count,
+                        PART_COUNT,
+                        candidates,
+                    )
+                ),
+                "sentence_memory_uniform_candidate_mass": (
+                    final_debug["uniform_candidate_mass"].reshape(
+                        batch,
+                        slot_count,
+                        PART_COUNT,
+                        candidates,
+                    )
+                ),
+                "sentence_memory_centered_update": torch.stack(
+                    centered_updates,
+                    dim=1,
+                ).reshape(
+                    batch,
+                    len(centered_updates),
+                    slot_count,
+                    PART_COUNT,
+                    self.hidden_dim,
+                ),
+            }
+            association_debug_names = {
+                "key_descriptor": "sentence_memory_association_key_descriptor",
+                "motion_descriptor": "sentence_memory_association_motion_descriptor",
+                "cosine": "sentence_memory_association_cosine",
+                "logit": "sentence_memory_association_logit",
+                "gate": "sentence_memory_association_gate",
+                "threshold": "sentence_memory_association_threshold",
+            }
+            for source, destination in association_debug_names.items():
+                if source in association:
+                    self._last_debug[destination] = association[source]
+        else:
+            self._last_debug = {}
+        return output
 
     def forward(
         self,
@@ -803,6 +1429,7 @@ class SentenceMemorySlotEncoder(nn.Module):
         part_validity: torch.Tensor | None = None,
         slot_tau: torch.Tensor | None = None,
         attention_mode: str = "learned",
+        candidate_ids: torch.Tensor | None = None,
     ):
         attention_mode = str(attention_mode).lower()
         if attention_mode not in SENTENCE_ATTENTION_MODES:
@@ -818,6 +1445,15 @@ class SentenceMemorySlotEncoder(nn.Module):
                 "analytic_prior attention requires "
                 f"key_value_mode={FACTORIZED_SENTENCE_KEY_VALUE_MODE!r}"
             )
+        if (
+            attention_mode
+            in {"uniform_final_candidate_mass", "association_disabled"}
+            and self.candidate_value_mode != CENTERED_CANDIDATE_VALUE_MODE
+        ):
+            raise ValueError(
+                f"attention_mode={attention_mode!r} requires "
+                f"candidate_value_mode={CENTERED_CANDIDATE_VALUE_MODE!r}"
+            )
         batch, candidates, tokens = self.validate_inputs(
             motion_tokens,
             motion_mask,
@@ -827,6 +1463,7 @@ class SentenceMemorySlotEncoder(nn.Module):
             candidate_mask,
             motion_tau=motion_tau,
             part_validity=part_validity,
+            candidate_ids=candidate_ids,
         )
         device = text_slots.device
         dtype = text_slots.dtype
@@ -839,12 +1476,79 @@ class SentenceMemorySlotEncoder(nn.Module):
         motion_mask = motion_mask & candidate_mask[:, :, None]
         candidate_mask = candidate_mask & motion_mask.any(dim=-1)
         motion_mask = motion_mask & candidate_mask[:, :, None]
+        centered = self.candidate_value_mode == CENTERED_CANDIDATE_VALUE_MODE
+        if candidate_ids is not None:
+            candidate_ids = candidate_ids.to(device=device)
+            if bool((candidate_ids[candidate_mask] < 0).any()):
+                raise ValueError(
+                    "valid sentence-memory candidates require non-negative "
+                    "sentence_candidate_ids"
+                )
 
         if motion_tau is None:
             tau = _token_tau(motion_mask, dtype)
         else:
             tau = motion_tau.to(device=device, dtype=dtype).clamp(-1.0, 1.0)
             tau = tau * motion_mask.to(dtype)
+
+        restore_candidate_order = None
+        if centered:
+            # Candidate reductions are mathematically permutation equivariant,
+            # but their floating-point accumulation order otherwise depends on
+            # physical provider rank.  Canonicalizing only the numerical order
+            # by stable item ID keeps IDs out of every learned score/logit and
+            # makes the joint-tuple control reproducible.  Candidate-indexed
+            # public diagnostics are restored to the caller's physical order.
+            sentinel = torch.iinfo(candidate_ids.dtype).max
+            numerical_ids = torch.where(
+                candidate_mask,
+                candidate_ids,
+                torch.full_like(candidate_ids, sentinel),
+            )
+            canonical_order = torch.argsort(
+                numerical_ids,
+                dim=-1,
+                stable=True,
+            )
+            restore_candidate_order = torch.argsort(canonical_order, dim=-1)
+            motion_tokens = _gather_candidate_axis(
+                motion_tokens,
+                canonical_order,
+                axis=1,
+            )
+            motion_mask = _gather_candidate_axis(
+                motion_mask,
+                canonical_order,
+                axis=1,
+            )
+            text_keys = _gather_candidate_axis(
+                text_keys,
+                canonical_order,
+                axis=1,
+            )
+            scores = _gather_candidate_axis(scores, canonical_order, axis=1)
+            durations = _gather_candidate_axis(
+                durations,
+                canonical_order,
+                axis=1,
+            )
+            candidate_mask = _gather_candidate_axis(
+                candidate_mask,
+                canonical_order,
+                axis=1,
+            )
+            candidate_ids = _gather_candidate_axis(
+                candidate_ids,
+                canonical_order,
+                axis=1,
+            )
+            tau = _gather_candidate_axis(tau, canonical_order, axis=1)
+            if part_validity is not None:
+                part_validity = _gather_candidate_axis(
+                    part_validity.to(device=device, dtype=dtype),
+                    canonical_order,
+                    axis=1,
+                )
 
         adjusted, probabilities, duration_gap, confidence = self._retrieval_statistics(
             scores,
@@ -874,7 +1578,17 @@ class SentenceMemorySlotEncoder(nn.Module):
         )
 
         if self.key_value_mode == FACTORIZED_SENTENCE_KEY_VALUE_MODE:
-            return self._forward_factorized(
+            association = self._association_statistics(
+                text_keys=text_keys,
+                motion_tokens=motion_tokens,
+                motion_mask=motion_mask,
+                candidate_mask=candidate_mask,
+            )
+            relevance_logit, relevance_gate = self._relevance_statistics(
+                adjusted,
+                candidate_mask,
+            )
+            output = self._forward_factorized(
                 text_slots=text_slots,
                 motion_tokens=motion_tokens,
                 motion_mask=motion_mask,
@@ -887,7 +1601,58 @@ class SentenceMemorySlotEncoder(nn.Module):
                 part_validity=part_validity,
                 slot_tau=slot_tau,
                 attention_mode=attention_mode,
+                candidate_ids=candidate_ids,
+                restore_candidate_order=restore_candidate_order,
+                association=association,
+                relevance_logit=relevance_logit,
+                relevance_gate=relevance_gate,
             )
+            if restore_candidate_order is not None:
+                output["adjusted_scores"] = _gather_candidate_axis(
+                    output["adjusted_scores"],
+                    restore_candidate_order,
+                    axis=1,
+                )
+                for name in (
+                    "sentence_memory_association_mask",
+                    "sentence_memory_relevance_logit",
+                    "sentence_memory_relevance_gate",
+                    "sentence_memory_association_key_descriptor",
+                    "sentence_memory_association_motion_descriptor",
+                    "sentence_memory_association_cosine",
+                    "sentence_memory_association_logit",
+                    "sentence_memory_association_gate",
+                ):
+                    if name in self._last_debug:
+                        self._last_debug[name] = _gather_candidate_axis(
+                            self._last_debug[name],
+                            restore_candidate_order,
+                            axis=1,
+                        )
+                for name in (
+                    "sentence_memory_final_part_candidate_mass",
+                    "sentence_memory_candidate_support",
+                    "sentence_memory_uniform_candidate_mass",
+                ):
+                    self._last_debug[name] = _gather_candidate_axis(
+                        self._last_debug[name],
+                        restore_candidate_order,
+                        axis=-1,
+                    )
+                for layer in self.layers:
+                    for name in (
+                        "candidate_support",
+                        "uniform_candidate_mass",
+                        "final_part_candidate_mass",
+                    ):
+                        layer._last_debug[name] = _gather_candidate_axis(
+                            layer._last_debug[name],
+                            restore_candidate_order,
+                            axis=-1,
+                        )
+            return output
+
+        self._last_debug = {}
 
         memory = self.motion_projection(motion_tokens)
         memory = memory + self.key_projection(text_keys)[:, :, None, :]
@@ -1016,9 +1781,17 @@ class SentenceMemoryTrajectoryHypernetwork(DualModeTrajectoryHypernetwork):
         sentence_retrieval_prior_scale: float = 1.0,
         sentence_gate_initial_bias: float = -2.2,
         sentence_key_value_mode: str | None = None,
+        sentence_candidate_value_mode: str | None = None,
         sentence_temporal_prior_mode: str = "none",
         sentence_temporal_prior_sigma: float = 0.25,
         sentence_temporal_prior_scale: float = 1.0,
+        sentence_association_mode: str = NO_SENTENCE_ASSOCIATION_MODE,
+        sentence_association_dim: int = SENTENCE_ASSOCIATION_DIM,
+        sentence_association_temperature: float = 0.10,
+        sentence_association_threshold_initial: float = 0.0,
+        sentence_relevance_gate_mode: str = NO_SENTENCE_RELEVANCE_GATE_MODE,
+        sentence_relevance_slope: float | None = None,
+        sentence_relevance_intercept: float | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -1035,10 +1808,21 @@ class SentenceMemoryTrajectoryHypernetwork(DualModeTrajectoryHypernetwork):
             duration_weight=float(sentence_duration_weight),
             retrieval_prior_scale=float(sentence_retrieval_prior_scale),
             key_value_mode=sentence_key_value_mode,
+            candidate_value_mode=sentence_candidate_value_mode,
             temporal_prior_mode=str(sentence_temporal_prior_mode),
             temporal_prior_sigma=float(sentence_temporal_prior_sigma),
             temporal_prior_scale=float(sentence_temporal_prior_scale),
+            association_mode=str(sentence_association_mode),
+            association_dim=int(sentence_association_dim),
+            association_temperature=float(sentence_association_temperature),
+            association_threshold_initial=float(
+                sentence_association_threshold_initial
+            ),
+            relevance_gate_mode=str(sentence_relevance_gate_mode),
+            relevance_slope=sentence_relevance_slope,
+            relevance_intercept=sentence_relevance_intercept,
         )
+        self._last_sentence_memory_debug: dict[str, torch.Tensor] = {}
         factorized = (
             self.sentence_memory_encoder.key_value_mode
             == FACTORIZED_SENTENCE_KEY_VALUE_MODE
@@ -1074,6 +1858,12 @@ class SentenceMemoryTrajectoryHypernetwork(DualModeTrajectoryHypernetwork):
         # exactly the v2 model even when valid memories are supplied.
         nn.init.zeros_(self.sentence_memory_fusion.weight)
 
+    @property
+    def last_sentence_memory_debug(self) -> dict[str, torch.Tensor]:
+        """Differentiable diagnostics from the most recent memory forward."""
+
+        return self._last_sentence_memory_debug
+
     @staticmethod
     def _sentence_inputs(
         sentence_motion_tokens,
@@ -1093,6 +1883,7 @@ class SentenceMemoryTrajectoryHypernetwork(DualModeTrajectoryHypernetwork):
         )
 
     def _off_diagnostics(self, trajectory: TrajectoryInstance):
+        self._last_sentence_memory_debug = {}
         batch = trajectory.batch_size
         slots = self.temporal_slot_count
         dtype = trajectory.dtype
@@ -1121,6 +1912,7 @@ class SentenceMemoryTrajectoryHypernetwork(DualModeTrajectoryHypernetwork):
         sentence_scores: torch.Tensor | None = None,
         sentence_durations: torch.Tensor | None = None,
         sentence_candidate_mask: torch.Tensor | None = None,
+        sentence_candidate_ids: torch.Tensor | None = None,
         sentence_part_validity: torch.Tensor | None = None,
         sentence_memory_available: torch.Tensor | None = None,
         sentence_memory_attention_mode: str = "learned",
@@ -1151,7 +1943,11 @@ class SentenceMemoryTrajectoryHypernetwork(DualModeTrajectoryHypernetwork):
                 "must be supplied together"
             )
         if not all(value is not None for value in sentence_inputs):
-            if sentence_motion_tau is not None or sentence_part_validity is not None:
+            if (
+                sentence_motion_tau is not None
+                or sentence_part_validity is not None
+                or sentence_candidate_ids is not None
+            ):
                 raise ValueError("sentence motion auxiliaries require sentence-memory tensors")
             if sentence_memory_available is not None:
                 if sentence_memory_available.shape != (text_tokens.shape[0],):
@@ -1250,6 +2046,10 @@ class SentenceMemoryTrajectoryHypernetwork(DualModeTrajectoryHypernetwork):
             part_validity=sentence_part_validity,
             slot_tau=slot_tau,
             attention_mode=sentence_memory_attention_mode,
+            candidate_ids=sentence_candidate_ids,
+        )
+        self._last_sentence_memory_debug = dict(
+            self.sentence_memory_encoder._last_debug
         )
         if sentence_memory_available is None:
             sentence_memory_available = sentence["available"]

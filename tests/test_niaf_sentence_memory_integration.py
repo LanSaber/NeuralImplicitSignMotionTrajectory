@@ -67,6 +67,7 @@ from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field 
     sentence_memory_provider_required,
     sentence_memory_query_key,
     sentence_memory_query_ids,
+    sentence_memory_association_losses,
     sentence_memory_objective_identity,
     sentence_memory_resume_identity,
     set_sentence_memory_provider_epoch_from_checkpoint,
@@ -1394,6 +1395,15 @@ def _gloo_paired_corruption_single_forward_worker(rank, world_size, init_file):
                     temporal_prior_sigma=0.25,
                     temporal_prior_scale=1.0,
                 )
+                self.sentence_memory_association_key = torch.nn.Linear(
+                    3, 4, bias=False
+                )
+                self.sentence_memory_association_motion = torch.nn.Linear(
+                    4, 4, bias=False
+                )
+                self.sentence_memory_association_threshold = torch.nn.Parameter(
+                    torch.tensor(0.0)
+                )
                 self.forward_calls = 0
 
             def forward(self, text_tokens, query_times, **kwargs):
@@ -1424,10 +1434,40 @@ def _gloo_paired_corruption_single_forward_worker(rank, world_size, init_file):
                     ),
                 )
                 signal = evidence["slots"].mean(dim=(1, 2, 3))
+                key_descriptor = F.normalize(
+                    self.sentence_memory_association_key(
+                        kwargs["sentence_text_keys"]
+                    ),
+                    dim=-1,
+                )
+                motion_descriptor = F.normalize(
+                    self.sentence_memory_association_motion(
+                        kwargs["sentence_motion_tokens"].mean(dim=2)
+                    ),
+                    dim=-1,
+                )
+                association_cosine = (key_descriptor * motion_descriptor).sum(
+                    dim=-1
+                )
+                association_logit = (
+                    association_cosine
+                    - self.sentence_memory_association_threshold
+                ) / 0.10
                 prediction = (
                     self.base + self.scale * signal[:, None, None]
                 ).expand(-1, query_times.shape[1], 256)
-                return {"prediction": prediction}
+                return {
+                    "prediction": prediction,
+                    "sentence_memory_association_key_descriptor": key_descriptor,
+                    "sentence_memory_association_motion_descriptor": motion_descriptor,
+                    "sentence_memory_association_logit": association_logit,
+                    "sentence_memory_association_mask": kwargs[
+                        "sentence_candidate_mask"
+                    ],
+                    "sentence_memory_association_threshold": (
+                        self.sentence_memory_association_threshold
+                    ),
+                }
 
         module = PairedModule()
         model = DistributedDataParallel(module)
@@ -1440,18 +1480,24 @@ def _gloo_paired_corruption_single_forward_worker(rank, world_size, init_file):
             motion_value = torch.tensor(
                 [value, value**2, -0.3 * value, 0.5], dtype=torch.float32
             )
+            candidate_motion = torch.stack(
+                (motion_value, torch.roll(motion_value, shifts=1)), dim=0
+            )
             return {
-                "sentence_motion_tokens": motion_value.view(1, 1, 1, 4).expand(
-                    1, 2, 2, 4
-                ).clone(),
+                "sentence_motion_tokens": candidate_motion.view(
+                    1, 2, 1, 4
+                ).expand(1, 2, 2, 4).clone(),
                 "sentence_motion_mask": torch.ones(1, 2, 2, dtype=torch.bool),
                 "sentence_motion_tau": torch.zeros(1, 2, 2),
-                "sentence_text_keys": torch.ones(1, 2, 3),
+                "sentence_text_keys": torch.tensor(
+                    [[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]
+                ),
                 "sentence_scores": torch.ones(1, 2),
                 "sentence_durations": torch.ones(1, 2),
                 "sentence_candidate_mask": torch.ones(1, 2, dtype=torch.bool),
                 "sentence_part_validity": torch.ones(1, 2, 2, 4),
                 "sentence_memory_available": torch.ones(1, dtype=torch.bool),
+                "sentence_candidate_ids": torch.tensor([[10, 11]]),
             }
 
         memory = SentenceMemoryBatch(
@@ -1467,6 +1513,11 @@ def _gloo_paired_corruption_single_forward_worker(rank, world_size, init_file):
             ids=torch.tensor([[10, 11, 12]]),
             available=torch.ones(1, dtype=torch.bool),
             provenance={"mode": "on"},
+            group_ids=torch.tensor([[0, 1, 2]]),
+            source_group_ids=torch.tensor([[100, 101, 102]]),
+            motion_source_ids=torch.tensor([[10, 11, 12]]),
+            motion_source_group_ids=torch.tensor([[0, 1, 2]]),
+            motion_source_source_group_ids=torch.tensor([[100, 101, 102]]),
         )
         _shuffled, permutation_before, informative = (
             motion_only_shuffle_sentence_memory_batch(
@@ -1520,6 +1571,64 @@ def _gloo_paired_corruption_single_forward_worker(rank, world_size, init_file):
             full_shuffle_mask=torch.tensor([rank == 1]),
             cfg=_paired_phase_a_cfg(),
         )
+        association_cfg = _paired_phase_a_cfg()
+        association_cfg["sentence_memory"]["association_mode"] = (
+            "absolute_text_motion_v1"
+        )
+        association_cfg["objective"].update(
+            lambda_sentence_association_bce=0.10,
+            lambda_sentence_association_infonce=0.05,
+            association_temperature=0.10,
+        )
+        correct_memory = SentenceMemoryBatch(
+            tokens=branch(token_value)["sentence_motion_tokens"],
+            token_mask=torch.ones(1, 2, 2, dtype=torch.bool),
+            token_tau=torch.zeros(1, 2, 2),
+            candidate_mask=torch.ones(1, 2, dtype=torch.bool),
+            candidate_keys=torch.ones(1, 2, 3),
+            scores=torch.ones(1, 2),
+            durations=torch.ones(1, 2),
+            duration_log_gap=torch.zeros(1, 2),
+            part_validity=torch.ones(1, 2, 2, 4),
+            ids=torch.tensor([[10, 11]]),
+            available=torch.ones(1, dtype=torch.bool),
+            provenance={"mode": "on"},
+            group_ids=torch.tensor([[0, 1]]),
+            source_group_ids=torch.tensor([[100, 101]]),
+            motion_source_ids=torch.tensor([[10, 11]]),
+            motion_source_group_ids=torch.tensor([[0, 1]]),
+            motion_source_source_group_ids=torch.tensor([[100, 101]]),
+        )
+        if rank == 0:
+            corrupt_memory, _association_permutation, _ = (
+                motion_only_shuffle_sentence_memory_batch(
+                    correct_memory,
+                    query_ids=["stable-query"],
+                    epoch=3,
+                    seed=1234,
+                )
+            )
+        else:
+            corrupt_memory = copy.deepcopy(correct_memory)
+            corrupt_memory.ids = torch.tensor([[20, 21]])
+            corrupt_memory.group_ids = torch.tensor([[2, 3]])
+            corrupt_memory.source_group_ids = torch.tensor([[200, 201]])
+            corrupt_memory.motion_source_ids = corrupt_memory.ids.clone()
+            corrupt_memory.motion_source_group_ids = corrupt_memory.group_ids.clone()
+            corrupt_memory.motion_source_source_group_ids = (
+                corrupt_memory.source_group_ids.clone()
+            )
+        association_losses, association_diagnostics = (
+            sentence_memory_association_losses(
+                correct_outputs=correct,
+                corrupt_outputs=corrupt,
+                correct_memory=correct_memory,
+                corrupt_memory=corrupt_memory,
+                motion_row_mask=torch.tensor([rank == 0]),
+                full_row_mask=torch.tensor([rank == 1]),
+                cfg=association_cfg,
+            )
+        )
         local_counts = torch.tensor(
             [
                 float(rank == 0),
@@ -1540,12 +1649,26 @@ def _gloo_paired_corruption_single_forward_worker(rank, world_size, init_file):
         assert gathered_counts[1][2] == 0
         assert torch.isfinite(gathered_counts[1][3])
         assert float(gathered_counts[1][3]) > 0.0
-        sum(losses.values()).backward()
+        (
+            sum(losses.values())
+            + 0.10 * association_losses["loss_sentence_association_bce"]
+            + 0.05 * association_losses["loss_sentence_association_infonce"]
+        ).backward()
         assert module.forward_calls == 1
         assert module.scale.grad is not None
         assert torch.isfinite(module.scale.grad)
         assert module.base.grad is None
         assert module.text_projection.weight.grad is None
+        assert association_diagnostics["bce"]["positive_count"].item() == 6
+        assert association_diagnostics["bce"]["negative_count"].item() == 4
+        for parameter in (
+            module.sentence_memory_association_key.weight,
+            module.sentence_memory_association_motion.weight,
+            module.sentence_memory_association_threshold,
+        ):
+            assert parameter.grad is not None
+            assert torch.isfinite(parameter.grad).all()
+            assert float(parameter.grad.abs().sum()) > 0.0
         assert all(
             parameter.grad is not None and torch.isfinite(parameter.grad).all()
             for parameter in module.sentence_memory_encoder.parameters()
@@ -1584,6 +1707,55 @@ def test_two_rank_gloo_factorized_paired_corruption_uses_one_ddp_forward(tmp_pat
         nprocs=2,
         join=True,
     )
+
+
+def test_centered_stage_b_resume_rejects_prior_factorized_objective():
+    legacy = _paired_phase_a_cfg()
+    legacy["sentence_memory"].update(
+        key_value_mode="factorized_metadata_motion_v1",
+        temporal_prior_mode="none",
+    )
+    checkpoint = {
+        "sentence_memory_resume_identity": sentence_memory_resume_identity(legacy)
+    }
+    centered = copy.deepcopy(legacy)
+    centered["sentence_memory"].update(
+        candidate_value_mode="centered_candidate_covariance_v1",
+        relevance_gate_mode="frozen_absolute_adjusted_score_v1",
+        relevance_slope=2.0,
+        relevance_intercept=-0.5,
+        resolved_relevance_calibration_identity={"digest": "c" * 64},
+        association_mode="absolute_text_motion_v1",
+    )
+    centered["objective"].update(
+        lambda_sentence_association_bce=0.10,
+        lambda_sentence_association_infonce=0.05,
+        association_temperature=0.10,
+    )
+    centered["selection"] = {
+        "aggregation": "normalized_text_cluster_equal_v1"
+    }
+    centered["eval"] = {
+        "sentence_memory_modes": [
+            "off",
+            "on",
+            "motion_shuffled_n0",
+            "motion_shuffled_n1",
+            "motion_shuffled_n2",
+            "cross_query_motion",
+            "full_replacement",
+            "joint_tuple_permuted",
+            "uniform_final_mass",
+            "analytic_prior",
+            "association_disabled",
+        ],
+        "evaluation_corruption": {
+            "mode": "fixed_evidence_controls_v1",
+            "seed": 1234,
+        },
+    }
+    with pytest.raises(RuntimeError, match="cannot be resumed exactly"):
+        validate_sentence_memory_resume_identity(checkpoint, centered)
 
 
 def test_sentence_memory_behavior_identity_covers_non_state_factory_options():

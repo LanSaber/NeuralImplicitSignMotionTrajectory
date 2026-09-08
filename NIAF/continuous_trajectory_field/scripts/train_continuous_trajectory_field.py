@@ -82,9 +82,28 @@ SENTENCE_MEMORY_EVAL_MODES = {
     "shuffled",
     "motion_shuffled",
     "analytic_prior",
+    "motion_shuffled_n0",
+    "motion_shuffled_n1",
+    "motion_shuffled_n2",
+    "cross_query_motion",
+    "full_replacement",
+    "joint_tuple_permuted",
+    "uniform_final_mass",
+    "association_disabled",
 }
 LEGACY_EVALUATION_CORRUPTION_MODE = "checkpoint_epoch_v1"
 FIXED_EVALUATION_CORRUPTION_MODE = "fixed_query_condition_v1"
+FIXED_EVIDENCE_CONTROLS_MODE = "fixed_evidence_controls_v1"
+FIXED_EVIDENCE_CONTROL_NONCES = {
+    "motion_shuffled_n0": "csl_daily_pair_derangement_v1_n0",
+    "motion_shuffled_n1": "csl_daily_pair_derangement_v1_n1",
+    "motion_shuffled_n2": "csl_daily_pair_derangement_v1_n2",
+    "cross_query_motion": "csl_daily_cross_query_motion_v1",
+    "full_replacement": "csl_daily_full_candidate_replacement_v1",
+    "joint_tuple_permuted": "csl_daily_joint_tuple_permutation_v1",
+}
+CENTERED_CANDIDATE_VALUE_MODE = "centered_candidate_covariance_v1"
+ABSOLUTE_ASSOCIATION_MODE = "absolute_text_motion_v1"
 LEGACY_SELECTION_AGGREGATION = "sample_weighted_rows_v1"
 CLUSTER_EQUAL_SELECTION_AGGREGATION = "normalized_text_cluster_equal_v1"
 WORD_PRIOR_PART_NAMES = ("body", "left_hand", "right_hand", "face")
@@ -125,6 +144,73 @@ def sentence_memory_enabled(cfg):
     """Return the global v3 retrieval switch, independent of requested modes."""
 
     return bool(cfg.get("sentence_memory", {}).get("enabled", True))
+
+
+def centered_sentence_memory_enabled(cfg):
+    """Return whether the opt-in candidate-centered A''' path is active."""
+
+    return str(
+        cfg.get("sentence_memory", {}).get("candidate_value_mode", "")
+    ).lower() == CENTERED_CANDIDATE_VALUE_MODE
+
+
+def configured_sentence_memory_association(cfg):
+    """Resolve the optional absolute text-motion association objective."""
+
+    memory = dict(cfg.get("sentence_memory", {}) or {})
+    configured = memory.get("association", {})
+    if configured is None:
+        configured = {}
+    if not isinstance(configured, dict):
+        raise ValueError("sentence_memory.association must be a mapping")
+    mode = str(
+        memory.get("association_mode", configured.get("mode", "none"))
+    ).lower()
+    if mode not in {"none", ABSOLUTE_ASSOCIATION_MODE}:
+        raise ValueError(
+            "sentence_memory.association_mode must be 'none' or "
+            f"{ABSOLUTE_ASSOCIATION_MODE!r}"
+        )
+    # In Stage A the association branch and objective do not exist. Dormant
+    # association hyperparameters therefore must neither be validated nor enter
+    # its objective/architecture/resume identity.
+    if mode == "none":
+        return {"enabled": False, "mode": "none"}
+    temperature = float(
+        cfg.get("objective", {}).get(
+            "association_temperature",
+            memory.get(
+                "association_temperature", configured.get("temperature", 0.10)
+            ),
+        )
+    )
+    descriptor_dim = int(
+        memory.get("association_dim", configured.get("descriptor_dim", 128))
+    )
+    threshold_initial = float(
+        memory.get(
+            "association_threshold_initial",
+            configured.get("threshold_initial", 0.0),
+        )
+    )
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("sentence_memory.association.temperature must be positive")
+    if descriptor_dim < 1:
+        raise ValueError(
+            "sentence_memory.association.descriptor_dim must be positive"
+        )
+    if not math.isfinite(threshold_initial) or not -1.0 < threshold_initial < 1.0:
+        raise ValueError(
+            "sentence_memory.association.threshold_initial must be finite and "
+            "strictly between -1 and 1"
+        )
+    return {
+        "enabled": True,
+        "mode": mode,
+        "temperature": temperature,
+        "descriptor_dim": descriptor_dim,
+        "threshold_initial": threshold_initial,
+    }
 
 
 def configured_word_prior_train_mode(cfg):
@@ -207,6 +293,26 @@ def configured_sentence_memory_eval_modes(cfg):
             "eval.sentence_memory_modes supports only deterministic "
             f"{sorted(SENTENCE_MEMORY_EVAL_MODES)} modes, got {invalid}"
         )
+    if centered_sentence_memory_enabled(cfg):
+        expected = (
+            "off",
+            "on",
+            "motion_shuffled_n0",
+            "motion_shuffled_n1",
+            "motion_shuffled_n2",
+            "cross_query_motion",
+            "full_replacement",
+            "joint_tuple_permuted",
+            "uniform_final_mass",
+            "analytic_prior",
+        )
+        if configured_sentence_memory_association(cfg)["enabled"]:
+            expected = (*expected, "association_disabled")
+        if modes != expected:
+            raise ValueError(
+                "Centered sentence-memory evaluation modes must exactly match "
+                f"the ordered protocol list {list(expected)}, got {list(modes)}"
+            )
     return modes
 
 
@@ -217,7 +323,15 @@ def sentence_memory_provider_required(modes):
         modes = (modes,)
     return any(
         str(mode).lower()
-        in {"on", "shuffled", "motion_shuffled", "analytic_prior"}
+        in (
+            {
+                "on",
+                "shuffled",
+                "motion_shuffled",
+                "analytic_prior",
+            }
+            | (SENTENCE_MEMORY_EVAL_MODES - {"off"})
+        )
         for mode in modes
     )
 
@@ -234,7 +348,7 @@ def configured_evaluation_corruption(cfg):
         }
     if not isinstance(configured, dict):
         raise ValueError("eval.evaluation_corruption must be a mapping")
-    unsupported = sorted(set(configured) - {"mode", "seed", "nonce"})
+    unsupported = sorted(set(configured) - {"mode", "seed", "nonce", "nonces"})
     if unsupported:
         raise ValueError(
             "eval.evaluation_corruption has unsupported fields: "
@@ -244,14 +358,42 @@ def configured_evaluation_corruption(cfg):
     if mode not in {
         LEGACY_EVALUATION_CORRUPTION_MODE,
         FIXED_EVALUATION_CORRUPTION_MODE,
+        FIXED_EVIDENCE_CONTROLS_MODE,
     }:
         raise ValueError(
             "eval.evaluation_corruption.mode must be one of "
-            f"{[LEGACY_EVALUATION_CORRUPTION_MODE, FIXED_EVALUATION_CORRUPTION_MODE]}, "
+            f"{[LEGACY_EVALUATION_CORRUPTION_MODE, FIXED_EVALUATION_CORRUPTION_MODE, FIXED_EVIDENCE_CONTROLS_MODE]}, "
             f"got {mode!r}"
         )
     seed = int(configured.get("seed", cfg.get("seed", 1234)))
     nonce = configured.get("nonce")
+    if mode == FIXED_EVIDENCE_CONTROLS_MODE:
+        if seed != 1234:
+            raise ValueError("fixed evidence controls require seed 1234")
+        if nonce is not None:
+            raise ValueError(
+                "fixed evidence controls use named condition nonces; "
+                "eval.evaluation_corruption.nonce must be absent"
+            )
+        configured_nonces = configured.get("nonces")
+        if configured_nonces is not None and dict(configured_nonces) != (
+            FIXED_EVIDENCE_CONTROL_NONCES
+        ):
+            raise ValueError(
+                "fixed evidence-control nonces are protocol constants and may "
+                "not be changed"
+            )
+        return {
+            "mode": mode,
+            "seed": seed,
+            "nonce": None,
+            "nonces": dict(FIXED_EVIDENCE_CONTROL_NONCES),
+        }
+    if configured.get("nonces") is not None:
+        raise ValueError(
+            "eval.evaluation_corruption.nonces is valid only for "
+            "fixed_evidence_controls_v1"
+        )
     if mode == FIXED_EVALUATION_CORRUPTION_MODE:
         if seed != 1234:
             raise ValueError(
@@ -296,6 +438,55 @@ def _digest_named_identity(payload):
 
 def sentence_memory_evaluation_control_identity(cfg):
     control = configured_evaluation_corruption(cfg)
+    if control["mode"] == FIXED_EVIDENCE_CONTROLS_MODE:
+        return _digest_named_identity(
+            {
+                "schema_name": "sentence_memory_evaluation_control",
+                "schema_version": 2,
+                "mode": control["mode"],
+                "seed": int(control["seed"]),
+                "condition_nonces": dict(control["nonces"]),
+                "query_identity": "source_name_motion_path_or_index_v1",
+                "condition_separation": "explicit_condition_token_v1",
+                "motion_pair_controls": (
+                    "three_fixed_valid_rank_cyclic_derangements_v1"
+                ),
+                "cross_query_motion": (
+                    "normal_keys_plus_fixed_alternative_query_motion_v1"
+                ),
+                "full_replacement": "fixed_alternative_candidate_bundle_v1",
+                "joint_tuple_permutation": (
+                    "complete_valid_candidate_tuple_cyclic_permutation_v1"
+                ),
+                "joint_tuple_invariant": (
+                    "global_max_prediction_and_duration_abs_at_most_1e-7"
+                ),
+                "uniform_final_mass": (
+                    "same_structural_u_used_by_centering_v1"
+                ),
+                "broadcast_complete_motion_audit": {
+                    "nonce": "csl_daily_broadcast_motion_payload_audit_v1",
+                    "source_rule": (
+                        "sha256_query_seed_nonce_select_one_valid_rank_then_"
+                        "broadcast_tokens_mask_tau_part_validity_v1"
+                    ),
+                    "provider_reads": 0,
+                    "expected": "prediction_and_duration_exact_memory_off",
+                },
+                "all_null_audit": {
+                    "construction": (
+                        "arbitrary_retrieved_payload_with_candidate_token_part_"
+                        "masks_zero_and_candidate_ids_minus_one_v1"
+                    ),
+                    "provider_reads": 0,
+                    "expected": (
+                        "prediction_duration_gate_candidate_mass_exact_off_and_"
+                        "null_mass_exact_one"
+                    ),
+                },
+                "training_corruption": "epoch_dependent_unchanged",
+            }
+        )
     return _digest_named_identity(
         {
             "schema_name": "sentence_memory_evaluation_control",
@@ -321,8 +512,19 @@ def sentence_memory_validation_corruption_map_identity(
     """Bind a deterministic validation map to its queries and motion bank."""
 
     control = sentence_memory_evaluation_control_identity(cfg)
-    return _digest_named_identity(
-        {
+    if control["mode"] == FIXED_EVIDENCE_CONTROLS_MODE:
+        payload = {
+            "schema_name": "sentence_memory_validation_corruption_map",
+            "schema_version": 2,
+            "evaluation_control_digest": control["digest"],
+            "validation_partition_digest": str(partition_digest),
+            "bank_id": str(bank_id),
+            "conditions": list(FIXED_EVIDENCE_CONTROL_NONCES),
+            "condition_nonces": dict(FIXED_EVIDENCE_CONTROL_NONCES),
+            "query_identity": control["query_identity"],
+        }
+    else:
+        payload = {
             "schema_name": "sentence_memory_validation_corruption_map",
             "schema_version": 1,
             "evaluation_control_digest": control["digest"],
@@ -332,11 +534,64 @@ def sentence_memory_validation_corruption_map_identity(
             "motion_query_identity": control["motion_query_identity"],
             "full_query_identity": control["full_query_identity"],
         }
-    )
+    return _digest_named_identity(payload)
 
 
 def sentence_memory_selection_aggregation_identity(cfg):
     mode = configured_selection_aggregation(cfg)
+    if centered_sentence_memory_enabled(cfg):
+        return _digest_named_identity(
+            {
+                "schema_name": "sentence_memory_selection_aggregation",
+                "schema_version": 2,
+                "mode": mode,
+                "definition": {
+                    "normalization": "NFKC_casefold_whitespace_collapse",
+                    "metric_reduction": (
+                        "mean_rows_within_text_then_equal_mean_texts"
+                    ),
+                    "distributed_partition": (
+                        "whole_cluster_round_robin_no_padding_v1"
+                    ),
+                    "Rpair": (
+                        "sqrt(mean_three_nonces(equal_text_mean(row_element_mse_"
+                        "correct_vs_pair_nonce))/equal_text_mean(row_element_mse_"
+                        "correct_vs_off))"
+                    ),
+                    "identity_utility_fraction": (
+                        "(mean_nonce(pair_composite)-correct_composite)/(text_only_"
+                        "composite-correct_composite); denominator>1e-8"
+                    ),
+                    "association_matching": (
+                        "within_correct_row_symmetric_K_to_V_and_V_to_K; equal_"
+                        "semantic_groups_or_source_sign_variants_or_duplicate_"
+                        "items_positive; all_excluded_from_negatives; anchors_"
+                        "require_true_negative"
+                    ),
+                },
+                "development_gates": {
+                    "correct_relative_gain_over_off": 0.001,
+                    "correct_relative_gain_over_mean_pair": 0.0025,
+                    "correct_relative_gain_over_cross_query_motion": 0.0025,
+                    "correct_relative_gain_over_full_replacement": 0.0025,
+                    "correct_strictly_beats_each_pair_nonce": True,
+                    "Rpair_minimum": 0.10,
+                    "per_nonce_Rpair_minimum": 0.05,
+                    "identity_utility_fraction_minimum": 0.25,
+                    "identity_utility_denominator_minimum": 1e-8,
+                    "hand_path_max_relative_degradation_vs_off": 0.02,
+                    "correct_hand_path_no_worse_than_each_corruption": True,
+                    "joint_tuple_prediction_max_abs": 1e-7,
+                    "joint_tuple_duration_max_abs": 1e-7,
+                    "uniform_final_prediction_and_duration_exact_off": True,
+                    "broadcast_complete_prediction_and_duration_exact_off": True,
+                    "all_null_prediction_duration_gate_mass_exact": True,
+                    "stored_v2_prediction_and_duration_max_abs": 1e-7,
+                    "stage_b_matching_top1_minimum": 0.25,
+                    "stage_b_true_minus_best_negative_margin_strictly_positive": True,
+                },
+            }
+        )
     if mode == CLUSTER_EQUAL_SELECTION_AGGREGATION:
         definition = {
             "normalization": "NFKC_casefold_whitespace_collapse",
@@ -406,8 +661,7 @@ def sentence_memory_architecture_identity(cfg):
             "normalized over motion tokens separately for each "
             "batch-slot-part-candidate"
         )
-    return _digest_named_identity(
-        {
+    payload = {
             "schema_name": "sentence_memory_architecture",
             "schema_version": 1,
             "key_value_mode": mode,
@@ -489,7 +743,166 @@ def sentence_memory_architecture_identity(cfg):
                 "part fusion, and frozen generator"
             ),
         }
-    )
+    if centered_sentence_memory_enabled(cfg):
+        if temporal_mode != "none":
+            raise ValueError(
+                "Centered candidate covariance requires temporal_prior_mode='none'"
+            )
+        association = configured_sentence_memory_association(cfg)
+        if association["enabled"] and association["descriptor_dim"] != 128:
+            raise ValueError(
+                "Centered absolute association requires descriptor_dim=128"
+            )
+        relevance_mode = str(memory.get("relevance_gate_mode", "none")).lower()
+        if relevance_mode != "frozen_absolute_adjusted_score_v1":
+            raise ValueError(
+                "Centered candidate covariance requires the frozen absolute "
+                "adjusted-score relevance gate"
+            )
+        calibration_identity = memory.get(
+            "resolved_relevance_calibration_identity"
+        )
+        if not isinstance(calibration_identity, dict):
+            raise RuntimeError(
+                "Centered sentence memory has no resolved relevance-calibration "
+                "identity"
+            )
+        payload.update(
+            {
+                "schema_version": 3,
+                "candidate_value_mode": CENTERED_CANDIDATE_VALUE_MODE,
+                "candidate_value": {
+                    "centering": (
+                        "effective_candidate_summary_minus_exact_structural_"
+                        "uniform_u_mean_after_last_nonlinearity_v1"
+                    ),
+                    "candidate_ids_required": True,
+                    "candidate_ids_enter_learned_scores": False,
+                    "structural_token_distribution": {
+                        "support": (
+                            "post_candidate_dropout_candidate_mask AND motion_mask "
+                            "AND part_validity>0, separately per batch-slot-part-"
+                            "candidate"
+                        ),
+                        "q": (
+                            "q[s,p,k,u]=1/count_u(support[s,p,k,:]) on support; "
+                            "otherwise 0"
+                        ),
+                    },
+                    "per_layer_candidate_summary": (
+                        "x[k,u]=P_motion(LN_0_motion(vae_motion_mu[k,u])); "
+                        "v[l,h,k,u]=P_value[l,h](LN_0_value[l](x[k,u])); "
+                        "m[l,h,s,p,k]=sum_u(q[s,p,k,u]*v[l,h,k,u])"
+                    ),
+                    "supported_candidate_set": (
+                        "A[s,p]={k:any_u support[s,p,k,u]}; N[s,p]=|A[s,p]|; "
+                        "u[s,p,k]=1/N[s,p] for k in A[s,p], else 0"
+                    ),
+                    "base_candidate_mass": (
+                        "b[l,h,s,p,k]=sum_u(base_null_plus_real_softmax_mass"
+                        "[l,h,s,p,k,u])"
+                    ),
+                    "evidence_application": {
+                        "relevance": (
+                            "g_rel[k]=sigmoid(relevance_slope*adjusted_score[k]+"
+                            "relevance_intercept)"
+                        ),
+                        "association": (
+                            "g_assoc[k]=sigmoid(absolute_association_logit[k]) "
+                            "when enabled, else 1 on valid candidates"
+                        ),
+                        "final_mass": (
+                            "a[l,h,s,p,k]=b[l,h,s,p,k]*g_rel[k]*g_assoc[k]"
+                        ),
+                        "placement": (
+                            "multiply after base null+real softmax without "
+                            "renormalizing surviving candidates"
+                        ),
+                        "rejection": "all rejected real mass is routed to null",
+                    },
+                    "rho": "rho[l,h,s,p]=sum_k(a[l,h,s,p,k])",
+                    "reference": (
+                        "m_ref[l,h,s,p]=m of the supported candidate with "
+                        "minimum stable item ID"
+                    ),
+                    "residual": (
+                        "r[l,h,s,p]=sum_{k in A[s,p]}((a[l,h,s,p,k]-"
+                        "rho[l,h,s,p]*u[s,p,k])*(m[l,h,s,p,k]-"
+                        "m_ref[l,h,s,p]))"
+                    ),
+                    "zero_or_one_supported_candidate": (
+                        "N[s,p]<=1 gives null_mass=1, candidate_mass=0, "
+                        "state=0, gate=0, residual=0 exactly"
+                    ),
+                    "uniform_control": (
+                        "set final a=rho*u using the same exact structural u "
+                        "tensor and set centered coefficients to exact zero"
+                    ),
+                    "broadcast_control": (
+                        "identical complete motion payload gives identical m and "
+                        "exact zero centered residual"
+                    ),
+                },
+                "relevance_gate": {
+                    "mode": relevance_mode,
+                    "feature": "cosine-0.05*duration_log_gap",
+                    "slope": float(memory["relevance_slope"]),
+                    "intercept": float(memory["relevance_intercept"]),
+                    "frozen": True,
+                    "calibration_identity": calibration_identity,
+                },
+                "association": (
+                    {
+                        **association,
+                        "descriptors": "l2_normalized_text_key_and_motion_v1",
+                        "descriptor_formula": {
+                            "eK": (
+                                "l2_normalize(P_K(candidate_mt5_mean_key)); "
+                                "P_K_is_bias_free"
+                            ),
+                            "eV": (
+                                "l2_normalize(P_V(mask_normalized_mean_u("
+                                "LN_0(vae_motion_mu[k,u])))); LN_0_is_non_affine; "
+                                "P_V_is_bias_free"
+                            ),
+                            "motion_pool_mask": (
+                                "binary_sentence_motion_mask_after_candidate_mask"
+                            ),
+                            "descriptor_dim": 128,
+                            "projections_bias_free": True,
+                            "excluded_from_descriptors": [
+                                "target_text_slots",
+                                "query_duration",
+                                "retrieval_scores",
+                                "candidate_durations",
+                                "motion_tau",
+                                "part_validity_magnitude",
+                                "candidate_ids",
+                            ],
+                        },
+                        "absolute_logit": (
+                            "(cosine-tanh(trainable_threshold))/temperature"
+                        ),
+                        "threshold_parameterization": (
+                            "tanh(trainable_scalar), strictly bounded to [-1,1]"
+                        ),
+                        "attention_gate": "sigmoid(absolute_logit)",
+                    }
+                    if association["enabled"]
+                    else {"enabled": False, "mode": "none"}
+                ),
+                "attention_controls": {
+                    "association_disabled": (
+                        "remove_only_association_gate_keep_relevance_v1"
+                    ),
+                    "uniform_final_candidate_mass": (
+                        "replace_all_learned_retrieval_evidence_redistribution_"
+                        "with_exact_structural_u_v1"
+                    ),
+                },
+            }
+        )
+    return _digest_named_identity(payload)
 
 
 def validate_sentence_memory_architecture_identity(
@@ -603,6 +1016,16 @@ def sentence_memory_evaluation_corruption_kwargs(
     control = configured_evaluation_corruption(cfg)
     condition = str(condition).lower()
     if (
+        not bool(training)
+        and control["mode"] == FIXED_EVIDENCE_CONTROLS_MODE
+        and condition in control["nonces"]
+    ):
+        return {
+            "corruption_nonce": control["nonces"][condition],
+            "corruption_seed": int(control["seed"]),
+            "corruption_condition": condition,
+        }
+    if (
         bool(training)
         or condition not in {"shuffled", "motion_shuffled"}
         or control["mode"] != FIXED_EVALUATION_CORRUPTION_MODE
@@ -647,6 +1070,162 @@ def build_sentence_memory_provider(cfg, text_encoder, dataset=None):
     if "dataset" in constructor_parameters:
         kwargs["dataset"] = dataset
     return SentenceMemoryProvider(cfg, **kwargs)
+
+
+def resolve_sentence_memory_relevance_calibration(cfg):
+    """Validate and bind the frozen absolute-relevance calibration.
+
+    This runs before model construction.  Only plain scalar coefficients and a
+    content identity are copied into the runtime config; the model never reads
+    or discovers calibration artifacts itself.
+    """
+
+    memory = cfg.get("sentence_memory", {})
+    mode = str(memory.get("relevance_gate_mode", "none")).lower()
+    if mode in {"", "none"}:
+        return None
+    if mode != "frozen_absolute_adjusted_score_v1":
+        raise ValueError(f"Unsupported sentence_memory.relevance_gate_mode {mode!r}")
+    if not centered_sentence_memory_enabled(cfg):
+        raise ValueError(
+            "Frozen absolute relevance requires "
+            "candidate_value_mode=centered_candidate_covariance_v1"
+        )
+    configured = memory.get("relevance_calibration")
+    if not isinstance(configured, dict):
+        raise ValueError(
+            "sentence_memory.relevance_calibration must be a mapping"
+        )
+    expected_fields = {
+        "artifact_dir",
+        "artifact_identity",
+        "schema_name",
+        "schema_version",
+        "minimum_heldout_auroc",
+        "minimum_heldout_probability_gap",
+    }
+    unsupported = sorted(set(configured) - expected_fields)
+    if unsupported:
+        raise ValueError(
+            "sentence_memory.relevance_calibration has unsupported fields: "
+            f"{unsupported}"
+        )
+    if configured.get("schema_name") != (
+        "signtrajfield_sentence_memory_relevance_calibration"
+    ) or int(configured.get("schema_version", -1)) != 1:
+        raise ValueError("Relevance-calibration schema differs from version 1")
+    artifact_dir = configured.get("artifact_dir")
+    if not artifact_dir:
+        raise ValueError(
+            "sentence_memory.relevance_calibration.artifact_dir is required"
+        )
+    minimum_auroc = float(configured.get("minimum_heldout_auroc", 0.75))
+    minimum_gap = float(
+        configured.get("minimum_heldout_probability_gap", 0.20)
+    )
+    if minimum_auroc < 0.75 or minimum_gap < 0.20:
+        raise ValueError(
+            "Relevance calibration may not weaken held-out AUROC 0.75 or "
+            "probability-gap 0.20 gates"
+        )
+    from NIAF.continuous_trajectory_field.relevance_calibration import (
+        canonical_json,
+        sha256_file,
+        validate_relevance_calibration_artifact,
+    )
+
+    calibration = validate_relevance_calibration_artifact(
+        artifact_dir,
+        expected_identity=configured.get("artifact_identity"),
+        minimum_auroc=minimum_auroc,
+        minimum_probability_gap=minimum_gap,
+    )
+    feature = dict(calibration.get("feature", {}) or {})
+    duration_weight = float(memory.get("duration_weight", 0.10))
+    if (
+        feature.get("mode") != "absolute_adjusted_score_v1"
+        or float(feature.get("duration_weight", math.nan)) != duration_weight
+    ):
+        raise RuntimeError(
+            "Relevance calibration feature/duration contract differs from "
+            "sentence-memory retrieval"
+        )
+    directory = Path(artifact_dir)
+    ready = json.loads((directory / "READY").read_text(encoding="utf-8"))
+    coefficients = dict(calibration.get("coefficients", {}) or {})
+    try:
+        parameter_a = float(coefficients["a"])
+        parameter_b = float(coefficients["b"])
+        slope = float(coefficients["slope"])
+        intercept = float(coefficients["intercept"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "Sealed relevance calibration lacks finite a/b and "
+            "slope/intercept coefficients"
+        ) from error
+    formula = coefficients.get("formula")
+    intercept_derivation = coefficients.get("intercept_derivation")
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (parameter_a, parameter_b, slope, intercept)
+        )
+        or parameter_a <= 0.0
+        or slope <= 0.0
+        or parameter_a != slope
+        or intercept != float(-parameter_a * parameter_b)
+        or formula != "sigmoid(a*(adjusted_score-b))"
+        or intercept_derivation != "float64(-a*b)"
+    ):
+        raise RuntimeError(
+            "Sealed relevance-calibration coefficient parameterizations "
+            "are not exactly equivalent"
+        )
+    resolved_identity_payload = {
+        "schema_name": calibration["schema_name"],
+        "schema_version": int(calibration["schema_version"]),
+        "artifact_identity": calibration["identity"],
+        "calibration_sha256": sha256_file(directory / "calibration.json"),
+        "map_sha256": str(ready["map_sha256"]),
+        "map_content_digest": str(calibration["map"]["content_digest"]),
+        "heldout_auroc": float(calibration["holdout"]["auroc"]),
+        "heldout_probability_gap": float(
+            calibration["holdout"]["probability_gap"]
+        ),
+        "minimum_heldout_auroc": minimum_auroc,
+        "minimum_heldout_probability_gap": minimum_gap,
+        "coefficients": {
+            "a": parameter_a,
+            "b": parameter_b,
+            "formula": formula,
+            "intercept": intercept,
+            "intercept_derivation": intercept_derivation,
+            "slope": slope,
+        },
+    }
+    resolved_identity = {
+        **resolved_identity_payload,
+        "digest": hashlib.sha256(
+            canonical_json(resolved_identity_payload).encode("utf-8")
+        ).hexdigest(),
+    }
+    for name, resolved in (
+        ("relevance_slope", slope),
+        ("relevance_intercept", intercept),
+    ):
+        existing = memory.get(name)
+        if existing is not None and float(existing) != resolved:
+            raise RuntimeError(
+                f"Configured sentence_memory.{name} differs from sealed calibration"
+            )
+        memory[name] = resolved
+    existing_identity = memory.get("resolved_relevance_calibration_identity")
+    if existing_identity is not None and existing_identity != resolved_identity:
+        raise RuntimeError(
+            "Resolved relevance-calibration identity differs from sealed artifact"
+        )
+    memory["resolved_relevance_calibration_identity"] = resolved_identity
+    return resolved_identity
 
 
 def configured_text_encoder_identity(cfg):
@@ -921,10 +1500,12 @@ def validate_paired_sentence_memory_training_contract(cfg):
             "memory-off teacher"
         )
     epochs = int(train_cfg.get("epochs", 0))
-    if epochs < 1 or epochs > 4:
+    maximum_epochs = 6 if centered_sentence_memory_enabled(cfg) else 4
+    if epochs < 1 or epochs > maximum_epochs:
         raise ValueError(
-            "Paired corruption requires an explicit train.epochs in [1, 4]; "
-            "this mechanism experiment must never train after epoch 4"
+            "Paired corruption requires an explicit train.epochs in "
+            f"[1, {maximum_epochs}]; this mechanism experiment must never "
+            f"train after epoch {maximum_epochs}"
         )
     objective_cfg = cfg.get("objective", {})
     for name in _PAIRED_SENTENCE_OBJECTIVE_WEIGHTS:
@@ -938,6 +1519,63 @@ def validate_paired_sentence_memory_training_contract(cfg):
         raise ValueError(
             "objective.lambda_sentence_sparsity must be finite and non-negative"
         )
+    if centered_sentence_memory_enabled(cfg):
+        if configured_selection_aggregation(cfg) != (
+            CLUSTER_EQUAL_SELECTION_AGGREGATION
+        ):
+            raise ValueError(
+                "Centered sentence-memory experiments require normalized-text "
+                "cluster-equal checkpoint selection"
+            )
+        if configured_evaluation_corruption(cfg)["mode"] != (
+            FIXED_EVIDENCE_CONTROLS_MODE
+        ):
+            raise ValueError(
+                "Centered sentence-memory experiments require fixed evidence "
+                "evaluation controls"
+            )
+        configured_sentence_memory_eval_modes(cfg)
+        if bool(cfg.get("selection", {}).get("require_feasible", False)):
+            if int(train_cfg.get("early_stopping_patience", -1)) != 2 or int(
+                train_cfg.get(
+                    "early_stopping_min_epochs",
+                    train_cfg.get("early_stopping_min_epoch", -1),
+                )
+            ) != 3:
+                raise ValueError(
+                    "Centered production runs require patience two and minimum "
+                    "epoch three"
+                )
+        memory_cfg = cfg.get("sentence_memory", {})
+        if str(memory_cfg.get("key_value_mode", "")).lower() != (
+            "factorized_metadata_motion_v1"
+        ):
+            raise ValueError(
+                "Centered candidate covariance requires factorized metadata/motion K/V"
+            )
+        if str(memory_cfg.get("temporal_prior_mode", "none")).lower() != "none":
+            raise ValueError(
+                "Centered candidate covariance does not permit a temporal prior"
+            )
+        association = configured_sentence_memory_association(cfg)
+        if association["enabled"]:
+            bce_weight = float(
+                objective_cfg.get("lambda_sentence_association_bce", math.nan)
+            )
+            infonce_weight = float(
+                objective_cfg.get(
+                    "lambda_sentence_association_infonce", math.nan
+                )
+            )
+            if (
+                bce_weight != 0.10
+                or infonce_weight != 0.05
+                or association["temperature"] != 0.10
+            ):
+                raise ValueError(
+                    "Absolute association requires BCE weight 0.10, InfoNCE "
+                    "weight 0.05, and temperature 0.10"
+                )
     return paired_cfg
 
 
@@ -945,7 +1583,66 @@ def sentence_memory_objective_identity(cfg):
     """Describe the training-only sentence-memory objective independently."""
 
     paired_cfg = paired_sentence_memory_corruption_config(cfg)
-    if paired_cfg["enabled"]:
+    association = configured_sentence_memory_association(cfg)
+    if (
+        paired_cfg["enabled"]
+        and centered_sentence_memory_enabled(cfg)
+        and association["enabled"]
+    ):
+        objective_cfg = cfg.get("objective", {})
+        payload = {
+            "schema_version": 3,
+            "mode": "paired_centered_absolute_association_v1",
+            "paired_corruption": paired_cfg,
+            "weights": {
+                **{
+                    name: float(objective_cfg.get(name, 1.0))
+                    for name in _PAIRED_SENTENCE_OBJECTIVE_WEIGHTS
+                },
+                "lambda_sentence_sparsity": float(
+                    objective_cfg.get("lambda_sentence_sparsity", 1e-4)
+                ),
+                "lambda_sentence_association_bce": float(
+                    objective_cfg.get("lambda_sentence_association_bce", 0.10)
+                ),
+                "lambda_sentence_association_infonce": float(
+                    objective_cfg.get(
+                        "lambda_sentence_association_infonce", 0.05
+                    )
+                ),
+            },
+            "association": association,
+            "formula": {
+                "ordinary_and_pair_losses": "paired_correct_motion_or_full_v1",
+                "absolute_bce": (
+                    "class_balanced_global_means; correct_diagonal_positive; "
+                    "motion_deranged_diagonal_negative; full_internal_diagonal_"
+                    "positive; original_key_plus_full_motion_negative"
+                ),
+                "infonce": (
+                    "symmetric_K_to_V_and_V_to_K_masked_multi_positive_v1"
+                ),
+                "infonce_pool": (
+                    "all_valid_correct_candidates_on_each_DDP_rank; equal_"
+                    "semantic_group_positive; different_group_negative"
+                ),
+                "identity_masking": (
+                    "semantic_group_index_from_bank_item_group_ids_is_multi_"
+                    "positive; source_sign_variant_index_is_sorted_unique_"
+                    "canonical_source_group_id_and_is_multi_positive; duplicate_"
+                    "concrete_bank_item_id_is_multi_positive; all_are_excluded_"
+                    "from_negatives"
+                ),
+                "infonce_anchor": "requires_positive_and_true_negative",
+                "distributed_reduction": (
+                    "global_exact_differentiable_numerator_and_valid_count_v1"
+                ),
+                "training_corruption_schedule": (
+                    "query_identity_epoch_seed_v1; evaluation controls excluded"
+                ),
+            },
+        }
+    elif paired_cfg["enabled"]:
         objective_cfg = cfg.get("objective", {})
         payload = {
             "schema_version": 2,
@@ -991,7 +1688,7 @@ def validate_sentence_memory_objective_identity(checkpoint, cfg, source="checkpo
 
     expected = sentence_memory_objective_identity(cfg)
     actual = checkpoint.get("sentence_memory_objective_identity")
-    if actual is None and expected["mode"] == "paired_correct_motion_or_full_v1":
+    if actual is None and int(expected.get("schema_version", 0)) >= 2:
         raise RuntimeError(
             f"{source} has no persisted sentence-memory objective identity; "
             "paired Phase-A resume requires the named schema produced by the "
@@ -1035,6 +1732,19 @@ def sentence_memory_resume_identity(cfg):
     payload.pop("experiment_name", None)
     payload.pop("output", None)
 
+    if (
+        centered_sentence_memory_enabled(cfg)
+        and not configured_sentence_memory_association(cfg)["enabled"]
+    ):
+        dormant_objective = payload.get("objective")
+        if isinstance(dormant_objective, dict):
+            for name in (
+                "lambda_sentence_association_bce",
+                "lambda_sentence_association_infonce",
+                "association_temperature",
+            ):
+                dormant_objective.pop(name, None)
+
     train_cfg = payload.get("train")
     if isinstance(train_cfg, dict):
         # Extending the terminal epoch does not alter any epoch-indexed update.
@@ -1057,6 +1767,11 @@ def sentence_memory_resume_identity(cfg):
             "resolved_behavior_identity",
         ):
             memory_cfg.pop(key, None)
+        relevance_cfg = memory_cfg.get("relevance_calibration")
+        if isinstance(relevance_cfg, dict):
+            # Placement is operational; the resolved sealed content identity
+            # and copied coefficients remain in the exact-resume digest.
+            relevance_cfg.pop("artifact_dir", None)
 
     safety_cfg = payload.get("sentence_memory_safety")
     if isinstance(safety_cfg, dict):
@@ -2560,6 +3275,408 @@ def paired_sentence_memory_losses(
     return losses, diagnostics
 
 
+def _globally_synchronized_loss_mean(local_numerator, local_count):
+    """Return one global mean with the correct gradient under DDP averaging.
+
+    The detached value is identical on every rank.  Its surrogate gradient is
+    scaled by world size because DDP averages parameter gradients after each
+    rank contributes its local numerator.
+    """
+
+    if local_numerator.ndim != 0:
+        raise ValueError("A synchronized loss numerator must be scalar")
+    count = torch.as_tensor(
+        local_count,
+        dtype=local_numerator.dtype,
+        device=local_numerator.device,
+    ).reshape(())
+    if bool(dist.is_available() and dist.is_initialized()):
+        world_size = dist.get_world_size()
+        global_count = count.detach().clone()
+        global_value = local_numerator.detach().clone()
+        dist.all_reduce(global_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(global_value, op=dist.ReduceOp.SUM)
+        if float(global_count) <= 0.0:
+            return local_numerator * 0.0, global_count, global_value
+        loss = global_value / global_count + (
+            float(world_size)
+            * (local_numerator - local_numerator.detach())
+            / global_count
+        )
+        return loss, global_count, global_value
+    if float(count) <= 0.0:
+        return local_numerator * 0.0, count, local_numerator.detach()
+    return local_numerator / count, count, local_numerator.detach()
+
+
+def balanced_absolute_association_bce(
+    positive_logits,
+    positive_mask,
+    negative_logits,
+    negative_mask,
+):
+    """Class-balanced absolute match BCE with global valid-pair reductions."""
+
+    positive_mask = positive_mask.to(device=positive_logits.device).bool()
+    negative_mask = negative_mask.to(device=negative_logits.device).bool()
+    if positive_mask.shape != positive_logits.shape:
+        raise ValueError("Positive association mask/logits shapes differ")
+    if negative_mask.shape != negative_logits.shape:
+        raise ValueError("Negative association mask/logits shapes differ")
+    positive_sum = F.softplus(-positive_logits[positive_mask]).sum()
+    negative_sum = F.softplus(negative_logits[negative_mask]).sum()
+    positive_mean, positive_count, _ = _globally_synchronized_loss_mean(
+        positive_sum, positive_mask.sum()
+    )
+    negative_mean, negative_count, _ = _globally_synchronized_loss_mean(
+        negative_sum, negative_mask.sum()
+    )
+    # Both classes carry exactly one half of the objective regardless of the
+    # 90/10 corruption mixture or unequal per-rank valid counts.
+    loss = 0.5 * (positive_mean + negative_mean)
+    return loss, {
+        "positive_count": positive_count,
+        "negative_count": negative_count,
+        "positive_mean": positive_mean.detach(),
+        "negative_mean": negative_mean.detach(),
+    }
+
+
+def _masked_multi_positive_direction(logits, positives, negatives):
+    candidate_set = positives | negatives
+    valid_anchor = positives.any(dim=1) & negatives.any(dim=1)
+    if bool(valid_anchor.any()):
+        negative_infinity = torch.finfo(logits.dtype).min
+        positive_lse = torch.logsumexp(
+            logits.masked_fill(~positives, negative_infinity), dim=1
+        )
+        candidate_lse = torch.logsumexp(
+            logits.masked_fill(~candidate_set, negative_infinity), dim=1
+        )
+        values = candidate_lse - positive_lse
+        numerator = values[valid_anchor].sum()
+    else:
+        numerator = logits.sum() * 0.0
+    mean, count, _ = _globally_synchronized_loss_mean(
+        numerator, valid_anchor.sum()
+    )
+    return mean, count, valid_anchor
+
+
+def symmetric_masked_multi_positive_infonce(
+    key_descriptor,
+    motion_descriptor,
+    candidate_mask,
+    semantic_group_ids,
+    candidate_ids,
+    *,
+    temperature,
+    source_group_ids=None,
+):
+    """Contrast all valid correct candidates in the local physical B*K pool."""
+
+    if key_descriptor.shape != motion_descriptor.shape or key_descriptor.ndim != 3:
+        raise ValueError("Association descriptors must share shape [B,K,D]")
+    if candidate_mask.shape != key_descriptor.shape[:2]:
+        raise ValueError("Association candidate mask must have shape [B,K]")
+    for name, value in (
+        ("semantic_group_ids", semantic_group_ids),
+        ("candidate_ids", candidate_ids),
+    ):
+        if value is None or value.shape != candidate_mask.shape:
+            raise ValueError(f"Association {name} must have shape [B,K]")
+    temperature = float(temperature)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("Association InfoNCE temperature must be positive")
+    keys = key_descriptor.reshape(-1, key_descriptor.shape[-1])
+    motions = motion_descriptor.reshape(-1, motion_descriptor.shape[-1])
+    valid = candidate_mask.reshape(-1).bool()
+    groups = semantic_group_ids.to(device=keys.device).reshape(-1)
+    items = candidate_ids.to(device=keys.device).reshape(-1)
+    if source_group_ids is None:
+        source_groups = torch.full_like(items, -1)
+    else:
+        if source_group_ids.shape != candidate_mask.shape:
+            raise ValueError(
+                "Association source_group_ids must have shape [B,K]"
+            )
+        source_groups = source_group_ids.to(device=keys.device).reshape(-1)
+    pair_valid = valid[:, None] & valid[None, :]
+    same_semantics = (groups[:, None] == groups[None, :]) & (
+        groups[:, None] >= 0
+    )
+    same_source_variant = (
+        (source_groups[:, None] == source_groups[None, :])
+        & (source_groups[:, None] >= 0)
+    )
+    same_item = (items[:, None] == items[None, :]) & (items[:, None] >= 0)
+    # All known equivalent realizations are multi-positives. The complement
+    # among valid pairs is the true-negative pool, so none can silently become
+    # a false negative.
+    positives = pair_valid & (same_semantics | same_source_variant | same_item)
+    negatives = pair_valid & ~(
+        same_semantics | same_source_variant | same_item
+    )
+    logits = (keys @ motions.transpose(0, 1)) / temperature
+    key_loss, key_count, key_valid = _masked_multi_positive_direction(
+        logits, positives, negatives
+    )
+    motion_loss, motion_count, motion_valid = _masked_multi_positive_direction(
+        logits.transpose(0, 1), positives.transpose(0, 1), negatives.transpose(0, 1)
+    )
+    return 0.5 * (key_loss + motion_loss), {
+        "key_anchor_count": key_count,
+        "motion_anchor_count": motion_count,
+        "key_valid_anchor": key_valid,
+        "motion_valid_anchor": motion_valid,
+        "positive_pair_count": positives.sum().detach(),
+        "negative_pair_count": negatives.sum().detach(),
+    }
+
+
+def _association_tensor(outputs, suffix):
+    name = f"sentence_memory_association_{suffix}"
+    value = outputs.get(name)
+    if value is None:
+        raise RuntimeError(
+            f"Absolute-association model output is missing {name!r}"
+        )
+    return value
+
+
+def sentence_memory_association_losses(
+    *,
+    correct_outputs,
+    corrupt_outputs,
+    correct_memory,
+    corrupt_memory,
+    motion_row_mask,
+    full_row_mask,
+    cfg,
+):
+    """Build the Stage-B absolute BCE and correct-pool InfoNCE losses."""
+
+    association = configured_sentence_memory_association(cfg)
+    if not association["enabled"]:
+        raise ValueError("Absolute-association losses require Stage B")
+    correct_logits = _association_tensor(correct_outputs, "logit")
+    corrupt_logits = _association_tensor(corrupt_outputs, "logit")
+    correct_mask = _association_tensor(correct_outputs, "mask").bool()
+    corrupt_mask = _association_tensor(corrupt_outputs, "mask").bool()
+    if correct_logits.shape != correct_mask.shape or (
+        corrupt_logits.shape != corrupt_mask.shape
+    ):
+        raise RuntimeError("Association aligned logits/masks have different shapes")
+    motion_rows = motion_row_mask.to(device=correct_logits.device).bool()
+    full_rows = full_row_mask.to(device=correct_logits.device).bool()
+    if motion_rows.shape != correct_logits.shape[:1] or (
+        full_rows.shape != correct_logits.shape[:1]
+    ):
+        raise ValueError("Association corruption masks must have shape [B]")
+
+    correct_ids = _sentence_memory_field(correct_memory, "ids")
+    corrupt_ids = _sentence_memory_field(corrupt_memory, "ids")
+    correct_groups = _sentence_memory_field(correct_memory, "group_ids")
+    corrupt_groups = _sentence_memory_field(corrupt_memory, "group_ids")
+    correct_source_groups = _sentence_memory_field(
+        correct_memory, "source_group_ids"
+    )
+    corrupt_source_groups = _sentence_memory_field(
+        corrupt_memory, "source_group_ids"
+    )
+    corrupt_motion_ids = _sentence_memory_field(
+        corrupt_memory, "motion_source_ids"
+    )
+    corrupt_motion_groups = _sentence_memory_field(
+        corrupt_memory, "motion_source_group_ids"
+    )
+    corrupt_motion_source_groups = _sentence_memory_field(
+        corrupt_memory, "motion_source_source_group_ids"
+    )
+    if (
+        correct_ids is None
+        or corrupt_ids is None
+        or correct_groups is None
+        or correct_source_groups is None
+        or corrupt_source_groups is None
+        or corrupt_motion_ids is None
+        or corrupt_motion_groups is None
+        or corrupt_motion_source_groups is None
+    ):
+        raise RuntimeError(
+            "Absolute association requires candidate item, semantic-group, and "
+            "source/sign-variant IDs"
+        )
+    correct_ids = correct_ids.to(correct_logits.device)
+    corrupt_ids = corrupt_ids.to(correct_logits.device)
+    correct_groups = correct_groups.to(correct_logits.device)
+    corrupt_groups = corrupt_groups.to(correct_logits.device)
+    correct_source_groups = correct_source_groups.to(correct_logits.device)
+    corrupt_source_groups = corrupt_source_groups.to(correct_logits.device)
+    corrupt_motion_ids = corrupt_motion_ids.to(correct_logits.device)
+    corrupt_motion_groups = corrupt_motion_groups.to(correct_logits.device)
+    corrupt_motion_source_groups = corrupt_motion_source_groups.to(
+        correct_logits.device
+    )
+
+    equivalent_to_destination = (
+        (
+            (correct_groups == corrupt_motion_groups)
+            & (correct_groups >= 0)
+        )
+        | (
+            (correct_source_groups == corrupt_motion_source_groups)
+            & (correct_source_groups >= 0)
+        )
+        | ((correct_ids == corrupt_motion_ids) & (correct_ids >= 0))
+    )
+    internally_equivalent = (
+        ((corrupt_groups == corrupt_motion_groups) & (corrupt_groups >= 0))
+        | (
+            (corrupt_source_groups == corrupt_motion_source_groups)
+            & (corrupt_source_groups >= 0)
+        )
+        | ((corrupt_ids == corrupt_motion_ids) & (corrupt_ids >= 0))
+    )
+    malformed_full = (
+        corrupt_mask & full_rows[:, None] & ~internally_equivalent
+    )
+    if bool(malformed_full.any()):
+        raise RuntimeError(
+            "A full-replacement tuple does not match its recorded motion source"
+        )
+
+    # Correct candidate tuples and internally matched full-replacement tuples
+    # are positives.  A motion-only derangement breaks each destination
+    # diagonal, and original keys paired with full-replacement motion provide
+    # the absolute cross-query negatives.
+    positive_logits = torch.cat((correct_logits, corrupt_logits), dim=1)
+    positive_mask = torch.cat(
+        (
+            correct_mask,
+            corrupt_mask
+            & (
+                full_rows[:, None]
+                | (motion_rows[:, None] & equivalent_to_destination)
+            ),
+        ),
+        dim=1,
+    )
+    motion_negative_mask = (
+        corrupt_mask
+        & motion_rows[:, None]
+        & ~equivalent_to_destination
+    )
+    correct_key = _association_tensor(correct_outputs, "key_descriptor")
+    corrupt_motion = _association_tensor(corrupt_outputs, "motion_descriptor")
+    threshold = _association_tensor(correct_outputs, "threshold")
+    cross_cosine = (correct_key * corrupt_motion).sum(dim=-1)
+    cross_logits = (
+        cross_cosine - threshold.to(cross_cosine.device)
+    ) / association["temperature"]
+    cross_negative_mask = (
+        correct_mask
+        & corrupt_mask
+        & full_rows[:, None]
+        & ~equivalent_to_destination
+    )
+    negative_logits = torch.cat((corrupt_logits, cross_logits), dim=1)
+    negative_mask = torch.cat(
+        (motion_negative_mask, cross_negative_mask), dim=1
+    )
+    bce, bce_diagnostics = balanced_absolute_association_bce(
+        positive_logits,
+        positive_mask,
+        negative_logits,
+        negative_mask,
+    )
+    infonce, infonce_diagnostics = symmetric_masked_multi_positive_infonce(
+        correct_key,
+        _association_tensor(correct_outputs, "motion_descriptor"),
+        correct_mask,
+        correct_groups,
+        correct_ids,
+        temperature=association["temperature"],
+        source_group_ids=correct_source_groups,
+    )
+    return {
+        "loss_sentence_association_bce": bce,
+        "loss_sentence_association_infonce": infonce,
+    }, {
+        "bce": bce_diagnostics,
+        "infonce": infonce_diagnostics,
+        "cross_full_cosine": cross_cosine,
+        "cross_full_mask": cross_negative_mask,
+    }
+
+
+def sentence_memory_association_matching_metrics(outputs, memory_batch):
+    """Measure within-row symmetric correct-at-1 and positive/negative margin."""
+
+    keys = _association_tensor(outputs, "key_descriptor")
+    motions = _association_tensor(outputs, "motion_descriptor")
+    support = _association_tensor(outputs, "mask").bool()
+    groups = _sentence_memory_field(memory_batch, "group_ids")
+    items = _sentence_memory_field(memory_batch, "ids")
+    source_groups = _sentence_memory_field(memory_batch, "source_group_ids")
+    if groups is None or items is None or source_groups is None:
+        raise RuntimeError(
+            "Association matching requires semantic-group, source-group, and "
+            "item identities"
+        )
+    groups = groups.to(keys.device)
+    items = items.to(keys.device)
+    source_groups = source_groups.to(keys.device)
+    cosine = torch.einsum("bkd,bjd->bkj", keys, motions)
+    pair_valid = support[:, :, None] & support[:, None, :]
+    same_semantics = (groups[:, :, None] == groups[:, None, :]) & (
+        groups[:, :, None] >= 0
+    )
+    same_source_variant = (
+        (source_groups[:, :, None] == source_groups[:, None, :])
+        & (source_groups[:, :, None] >= 0)
+    )
+    same_item = (items[:, :, None] == items[:, None, :]) & (
+        items[:, :, None] >= 0
+    )
+    positives = pair_valid & (same_semantics | same_source_variant | same_item)
+    negatives = pair_valid & ~(same_semantics | same_source_variant | same_item)
+
+    def direction(values, positive_mask, negative_mask):
+        valid_anchor = positive_mask.any(dim=-1) & negative_mask.any(dim=-1)
+        negative_infinity = torch.finfo(values.dtype).min
+        best_positive = values.masked_fill(
+            ~positive_mask, negative_infinity
+        ).max(dim=-1).values
+        best_negative = values.masked_fill(
+            ~negative_mask, negative_infinity
+        ).max(dim=-1).values
+        permitted = positive_mask | negative_mask
+        best_index = values.masked_fill(~permitted, negative_infinity).argmax(dim=-1)
+        at_one = torch.gather(positive_mask, -1, best_index[..., None]).squeeze(-1)
+        return at_one.float(), best_positive - best_negative, valid_anchor
+
+    key_top1, key_margin, key_valid = direction(cosine, positives, negatives)
+    motion_top1, motion_margin, motion_valid = direction(
+        cosine.transpose(1, 2),
+        positives.transpose(1, 2),
+        negatives.transpose(1, 2),
+    )
+    top1_sum = (
+        key_top1[key_valid].sum() + motion_top1[motion_valid].sum()
+    )
+    margin_sum = (
+        key_margin[key_valid].sum() + motion_margin[motion_valid].sum()
+    )
+    count = key_valid.sum() + motion_valid.sum()
+    denominator = count.to(dtype=cosine.dtype).clamp_min(1.0)
+    return {
+        "association_matching_top1": top1_sum / denominator,
+        "association_matching_margin": margin_sum / denominator,
+        "association_matching_valid_anchor_count": count.to(cosine.dtype),
+    }
+
+
 def _prepared_word_forward_kwargs(prepared, batch, cfg):
     if not is_word_prior_model(cfg):
         return {}
@@ -2684,12 +3801,12 @@ def _sentence_memory_availability(
     if not sentence_memory_enabled(cfg):
         return torch.zeros(int(batch_size), dtype=torch.bool, device=device)
     mode = str(mode).lower()
-    if mode in {"shuffled", "motion_shuffled", "analytic_prior"}:
+    if mode in SENTENCE_MEMORY_EVAL_MODES - {"off", "on"}:
         return torch.ones(int(batch_size), dtype=torch.bool, device=device)
     if mode not in SENTENCE_MEMORY_TRAIN_MODES:
         allowed = sorted(
             SENTENCE_MEMORY_TRAIN_MODES
-            | {"shuffled", "motion_shuffled", "analytic_prior"}
+            | (SENTENCE_MEMORY_EVAL_MODES - {"off", "on"})
         )
         raise ValueError(
             f"sentence_memory_mode must be one of {allowed}, got {mode!r}"
@@ -2752,7 +3869,7 @@ def sentence_memory_forward_kwargs(memory_batch):
     available = _sentence_memory_field(memory_batch, "available")
     if available is None:
         raise ValueError("Sentence-memory retrieval result is missing 'available'")
-    return {
+    kwargs = {
         "sentence_motion_tokens": _sentence_memory_field(memory_batch, "tokens"),
         "sentence_motion_mask": _sentence_memory_field(memory_batch, "token_mask"),
         "sentence_motion_tau": _sentence_memory_field(memory_batch, "token_tau"),
@@ -2769,6 +3886,10 @@ def sentence_memory_forward_kwargs(memory_batch):
         ),
         "sentence_memory_available": available,
     }
+    candidate_ids = _sentence_memory_field(memory_batch, "ids")
+    if candidate_ids is not None:
+        kwargs["sentence_candidate_ids"] = candidate_ids
+    return kwargs
 
 
 def retrieve_sentence_memory(
@@ -2909,6 +4030,42 @@ def merge_sentence_memory_batches(normal, shuffled, shuffled_mask):
             ),
         }
     )
+    if "motion_source_ids" in normal_provenance:
+        selected_rows = shuffled_mask.detach().cpu().bool().tolist()
+        item_sources = copy.deepcopy(normal_provenance["motion_source_ids"])
+        shuffled_ids = _sentence_memory_field(shuffled, "ids").detach().cpu().tolist()
+        group_sources = copy.deepcopy(
+            normal_provenance.get("motion_source_group_ids")
+        )
+        variant_sources = copy.deepcopy(
+            normal_provenance.get("motion_source_variant_ids")
+        )
+        shuffled_groups = _sentence_memory_field(shuffled, "group_ids")
+        shuffled_groups = (
+            shuffled_groups.detach().cpu().tolist()
+            if shuffled_groups is not None
+            else _sentence_memory_field(shuffled, "provenance", default={}).get(
+                "candidate_group_ids"
+            )
+        )
+        shuffled_variants = _sentence_memory_field(
+            shuffled, "source_group_ids"
+        )
+        shuffled_variants = (
+            shuffled_variants.detach().cpu().tolist()
+            if shuffled_variants is not None
+            else None
+        )
+        for row, selected in enumerate(selected_rows):
+            if selected:
+                item_sources[row] = shuffled_ids[row]
+                if group_sources is not None and shuffled_groups is not None:
+                    group_sources[row] = shuffled_groups[row]
+                if variant_sources is not None and shuffled_variants is not None:
+                    variant_sources[row] = shuffled_variants[row]
+        normal_provenance["motion_source_ids"] = item_sources
+        normal_provenance["motion_source_group_ids"] = group_sources
+        normal_provenance["motion_source_variant_ids"] = variant_sources
     updates["provenance"] = normal_provenance
     if is_dataclass(normal):
         return replace(normal, **updates)
@@ -3138,6 +4295,50 @@ def paired_sentence_memory_model_forward(
     return correct_outputs, corrupt_outputs
 
 
+def sentence_memory_integrity_audit_forwards(
+    model,
+    *,
+    prepared,
+    batch,
+    cfg,
+    broadcast_memory,
+):
+    """Replay broadcast and arbitrary-payload all-null controls in-process."""
+
+    common = {
+        "text_tokens": prepared["text_tokens"],
+        "query_times": prepared["tau"],
+        "text_mask": prepared["text_mask"],
+        "time_domain": "normalized",
+        "query_mask": batch["mask"],
+        **_prepared_word_forward_kwargs(prepared, batch, cfg),
+    }
+    broadcast_outputs = model(
+        **common,
+        **sentence_memory_forward_kwargs(broadcast_memory),
+    )
+    null_kwargs = sentence_memory_forward_kwargs(
+        prepared["sentence_memory_batch"]
+    )
+    # A true all-null structural input: keep arbitrary payload values in memory
+    # but mask every candidate/token/part and invalidate its stable ID.  This
+    # exercises the null path without another provider read.
+    null_kwargs["sentence_motion_mask"] = torch.zeros_like(
+        null_kwargs["sentence_motion_mask"], dtype=torch.bool
+    )
+    null_kwargs["sentence_part_validity"] = torch.zeros_like(
+        null_kwargs["sentence_part_validity"]
+    )
+    null_kwargs["sentence_candidate_mask"] = torch.zeros_like(
+        null_kwargs["sentence_candidate_mask"], dtype=torch.bool
+    )
+    null_kwargs["sentence_candidate_ids"] = torch.full_like(
+        null_kwargs["sentence_candidate_ids"], -1
+    )
+    all_null_outputs = model(**common, **null_kwargs)
+    return broadcast_outputs, all_null_outputs
+
+
 def prepare_field_batch(
     model,
     text_encoder,
@@ -3168,6 +4369,9 @@ def prepare_field_batch(
     sentence_memory_corrupt_batch = None
     sentence_memory_corrupt_outputs = None
     sentence_memory_motion_permutation = None
+    sentence_memory_control_informative = torch.zeros(
+        target.shape[0], dtype=torch.bool, device=device
+    )
     sentence_memory_motion_mask = torch.zeros(
         target.shape[0], dtype=torch.bool, device=device
     )
@@ -3245,7 +4449,7 @@ def prepare_field_batch(
                 device=device,
                 mode=(
                     "shuffled"
-                    if resolved_sentence_mode == "shuffled"
+                    if resolved_sentence_mode in {"shuffled", "full_replacement"}
                     else "on"
                 ),
                 **sentence_memory_evaluation_corruption_kwargs(
@@ -3254,7 +4458,10 @@ def prepare_field_batch(
                     condition=resolved_sentence_mode,
                 ),
             )
-            if not training and resolved_sentence_mode == "shuffled":
+            if not training and resolved_sentence_mode in {
+                "shuffled",
+                "full_replacement",
+            }:
                 # Evaluation retrieves a fully shuffled candidate bundle for
                 # every available row.  Keep the diagnostic masks faithful to
                 # that control even though no training corruption branch runs.
@@ -3264,7 +4471,15 @@ def prepare_field_batch(
                 sentence_memory_shuffled_mask = (
                     sentence_memory_full_shuffle_mask.clone()
                 )
-            if resolved_sentence_mode == "motion_shuffled":
+                sentence_memory_control_informative = (
+                    sentence_memory_full_shuffle_mask.clone()
+                )
+            if resolved_sentence_mode in {
+                "motion_shuffled",
+                "motion_shuffled_n0",
+                "motion_shuffled_n1",
+                "motion_shuffled_n2",
+            }:
                 from NIAF.continuous_trajectory_field.sentence_memory import (
                     motion_only_shuffle_sentence_memory_batch,
                 )
@@ -3296,6 +4511,59 @@ def prepare_field_batch(
                     _sentence_memory_field(sentence_memory_batch, "available").bool()
                     & motion_informative.bool()
                 )
+                sentence_memory_control_informative = (
+                    sentence_memory_motion_mask.clone()
+                )
+            if not training and resolved_sentence_mode == "cross_query_motion":
+                from NIAF.continuous_trajectory_field.sentence_memory import (
+                    replace_sentence_memory_motion_payload,
+                )
+
+                cross_kwargs = sentence_memory_evaluation_corruption_kwargs(
+                    cfg, training=False, condition=resolved_sentence_mode
+                )
+                source_batch = retrieve_sentence_memory(
+                    sentence_memory_provider,
+                    dataset=dataset,
+                    batch=batch,
+                    text_tokens=text_tokens,
+                    text_mask=text_mask,
+                    predicted_duration=predicted_duration.detach(),
+                    available=sentence_availability,
+                    training=False,
+                    device=device,
+                    mode="shuffled",
+                    **cross_kwargs,
+                )
+                sentence_memory_batch, cross_informative = (
+                    replace_sentence_memory_motion_payload(
+                        sentence_memory_batch,
+                        source_batch,
+                        corruption_nonce=cross_kwargs["corruption_nonce"],
+                        corruption_condition=resolved_sentence_mode,
+                    )
+                )
+                sentence_memory_control_informative = cross_informative.bool()
+            if not training and resolved_sentence_mode == "joint_tuple_permuted":
+                from NIAF.continuous_trajectory_field.sentence_memory import (
+                    joint_tuple_permute_sentence_memory_batch,
+                )
+
+                joint_kwargs = sentence_memory_evaluation_corruption_kwargs(
+                    cfg, training=False, condition=resolved_sentence_mode
+                )
+                (
+                    sentence_memory_batch,
+                    sentence_memory_motion_permutation,
+                    joint_informative,
+                ) = joint_tuple_permute_sentence_memory_batch(
+                    sentence_memory_batch,
+                    query_ids=sentence_memory_query_ids(batch),
+                    seed=int(joint_kwargs["corruption_seed"]),
+                    corruption_nonce=joint_kwargs["corruption_nonce"],
+                    corruption_condition=resolved_sentence_mode,
+                )
+                sentence_memory_control_informative = joint_informative.bool()
             if bool(
                 training
                 and cfg.get("sentence_memory_safety", {}).get("enabled", False)
@@ -3383,10 +4651,15 @@ def prepare_field_batch(
             sentence_kwargs = sentence_memory_forward_kwargs(
                 sentence_memory_batch
             )
-            if resolved_sentence_mode == "analytic_prior":
-                sentence_kwargs["sentence_memory_attention_mode"] = (
-                    "analytic_prior"
-                )
+            attention_modes = {
+                "analytic_prior": "analytic_prior",
+                "uniform_final_mass": "uniform_final_candidate_mass",
+                "association_disabled": "association_disabled",
+            }
+            if resolved_sentence_mode in attention_modes:
+                sentence_kwargs["sentence_memory_attention_mode"] = attention_modes[
+                    resolved_sentence_mode
+                ]
             sentence_availability = sentence_kwargs[
                 "sentence_memory_available"
             ]
@@ -3474,6 +4747,7 @@ def prepare_field_batch(
         "sentence_memory_corrupt_batch": sentence_memory_corrupt_batch,
         "sentence_memory_corrupt_outputs": sentence_memory_corrupt_outputs,
         "sentence_memory_motion_permutation": sentence_memory_motion_permutation,
+        "sentence_memory_control_informative": sentence_memory_control_informative,
         "sentence_memory_motion_mask": sentence_memory_motion_mask,
         "sentence_memory_full_shuffle_mask": sentence_memory_full_shuffle_mask,
         "sentence_memory_shuffled_mask": sentence_memory_shuffled_mask,
@@ -3631,6 +4905,11 @@ def compute_batch_losses(
         )
     }
     paired_diagnostics = None
+    association_loss_values = {
+        "loss_sentence_association_bce": target.new_tensor(0.0),
+        "loss_sentence_association_infonce": target.new_tensor(0.0),
+    }
+    association_diagnostics = None
     sentence_safety_cfg = cfg.get("sentence_memory_safety", {})
     paired_cfg = paired_sentence_memory_corruption_config(cfg)
     phase_b_cfg = sentence_safety_cfg.get("phase_b", {})
@@ -3686,6 +4965,23 @@ def compute_batch_losses(
                 ].bool(),
                 cfg=cfg,
             )
+            if configured_sentence_memory_association(cfg)["enabled"]:
+                (
+                    association_loss_values,
+                    association_diagnostics,
+                ) = sentence_memory_association_losses(
+                    correct_outputs=outputs,
+                    corrupt_outputs=corrupt_outputs,
+                    correct_memory=prepared["sentence_memory_batch"],
+                    corrupt_memory=prepared["sentence_memory_corrupt_batch"],
+                    motion_row_mask=prepared[
+                        "sentence_memory_motion_mask"
+                    ].bool(),
+                    full_row_mask=prepared[
+                        "sentence_memory_full_shuffle_mask"
+                    ].bool(),
+                    cfg=cfg,
+                )
         else:
             memory_error = _per_sample_part_compact_l1(
                 outputs["prediction"], target, mask
@@ -3757,6 +5053,15 @@ def compute_batch_losses(
             total = total + float(objective_cfg.get(weight_name, 1.0)) * (
                 paired_loss_values[loss_name]
             )
+        if configured_sentence_memory_association(cfg)["enabled"]:
+            total = total + float(
+                objective_cfg["lambda_sentence_association_bce"]
+            ) * association_loss_values["loss_sentence_association_bce"]
+            total = total + float(
+                objective_cfg["lambda_sentence_association_infonce"]
+            ) * association_loss_values[
+                "loss_sentence_association_infonce"
+            ]
     else:
         total = total + float(
             objective_cfg.get("lambda_sentence_safe", 1.0)
@@ -3785,6 +5090,8 @@ def compute_batch_losses(
         losses["loss_sentence_safe"] = sentence_safe
         losses["loss_sentence_shuffle"] = sentence_shuffle
         losses.update(paired_loss_values)
+        if centered_sentence_memory_enabled(cfg):
+            losses.update(association_loss_values)
         losses["loss_sentence_gate_sparsity"] = sentence_gate_sparsity
         losses["loss_sentence_delta_sparsity"] = sentence_delta_sparsity
         losses["loss_sentence_off_distill"] = sentence_off_distill
@@ -3813,6 +5120,12 @@ def compute_batch_losses(
                         ).to(target.dtype)
                         * row_selector.to(target.dtype)
                     ).sum() / selected_count
+        if association_diagnostics is not None:
+            for name, value in association_diagnostics["bce"].items():
+                losses[f"sentence_memory_association_bce_{name}"] = value
+            for name, value in association_diagnostics["infonce"].items():
+                if torch.is_tensor(value) and value.ndim == 0:
+                    losses[f"sentence_memory_association_infonce_{name}"] = value
     losses["duration_pred_seconds"] = trajectory.duration_seconds.mean()
     losses["duration_target_seconds"] = batch["duration"].mean()
     losses["residual_rms"] = torch.sqrt(
@@ -3987,6 +5300,68 @@ def compute_batch_losses(
                     selected.abs().mean()
                     if selected.numel()
                     else duration_gap.new_tensor(0.0)
+                )
+        if centered_sentence_memory_enabled(cfg):
+            association_mask = outputs.get("sentence_memory_association_mask")
+            for name in (
+                "sentence_memory_relevance_logit",
+                "sentence_memory_relevance_gate",
+                "sentence_memory_association_cosine",
+                "sentence_memory_association_logit",
+                "sentence_memory_association_gate",
+            ):
+                value = outputs.get(name)
+                if value is None:
+                    continue
+                selector = (
+                    association_mask.bool()
+                    if association_mask is not None
+                    else torch.ones_like(value, dtype=torch.bool)
+                )
+                selected = value[selector]
+                losses[name] = (
+                    selected.mean() if selected.numel() else value.sum() * 0.0
+                )
+            threshold = outputs.get("sentence_memory_association_threshold")
+            if threshold is not None:
+                losses["sentence_memory_association_threshold"] = threshold
+            final_mass = outputs.get(
+                "sentence_memory_final_part_candidate_mass"
+            )
+            final_null = outputs.get("sentence_memory_final_part_null_mass")
+            if final_mass is not None and final_null is not None:
+                candidate_total = final_mass.sum(dim=-1)
+                normalized_mass = final_mass / candidate_total[..., None].clamp_min(
+                    1e-12
+                )
+                entropy = -(
+                    normalized_mass
+                    * normalized_mass.clamp_min(1e-12).log()
+                ).sum(dim=-1)
+                active = candidate_total > 0
+                losses["sentence_memory_final_candidate_mass"] = (
+                    candidate_total.mean()
+                )
+                losses["sentence_memory_final_null_mass"] = final_null.mean()
+                losses["sentence_memory_final_candidate_entropy"] = (
+                    entropy[active].mean()
+                    if bool(active.any())
+                    else entropy.sum() * 0.0
+                )
+                losses["sentence_memory_final_candidate_effective_k"] = (
+                    entropy[active].exp().mean()
+                    if bool(active.any())
+                    else entropy.sum() * 0.0
+                )
+                losses["sentence_memory_final_candidate_max_share"] = (
+                    normalized_mass.max(dim=-1).values[active].mean()
+                    if bool(active.any())
+                    else normalized_mass.sum() * 0.0
+                )
+            centered_update = outputs.get("sentence_memory_centered_update")
+            if centered_update is not None:
+                losses["sentence_memory_centered_update_rms"] = torch.sqrt(
+                    centered_update.float().square().mean().clamp_min(1e-24)
                 )
     losses["loss_total"] = total
     return total, losses, prepared
@@ -4883,6 +6258,19 @@ def evaluate_microbatch(
     finally:
         cfg["analytic_dynamics"] = analytic_cfg
     add_metrics("pred", losses)
+    if (
+        is_sentence_memory_model(cfg)
+        and configured_sentence_memory_association(cfg)["enabled"]
+        and str(sentence_memory_mode or "").lower() == "on"
+        and prepared.get("sentence_memory_batch") is not None
+    ):
+        metrics.update(
+            tensor_dict_to_float(
+                sentence_memory_association_matching_metrics(
+                    prepared["outputs"], prepared["sentence_memory_batch"]
+                )
+            )
+        )
 
     validation_cfg = cfg.get("validation_dynamics", {})
     derivative_duration = (
@@ -5037,6 +6425,7 @@ def evaluate(
 
 
 _PAIRED_USAGE_RAW_PREFIX = "_paired_usage_raw/"
+_PAIRED_CONTROL_MAX_RAW_PREFIX = "_paired_control_max_raw/"
 _PAIRED_USAGE_PART_SLICES = {
     "all": slice(0, 256),
     "body": slice(0, 60),
@@ -5108,6 +6497,78 @@ def cluster_mean_paired_usage_moments(row_moments):
     return output
 
 
+_CENTERED_PAIR_MODES = (
+    "motion_shuffled_n0",
+    "motion_shuffled_n1",
+    "motion_shuffled_n2",
+)
+
+
+def centered_pair_usage_moments(
+    correct_prediction,
+    pair_predictions,
+    off_prediction,
+    frame_masks,
+):
+    """Return additive per-part moments for all three fixed pair controls."""
+
+    if tuple(pair_predictions) != _CENTERED_PAIR_MODES:
+        raise ValueError("Rpair requires the three ordered fixed pair controls")
+    output = {}
+    common_mask = None
+    for mode in _CENTERED_PAIR_MODES:
+        frame_mask = frame_masks[mode].bool()
+        common_mask = frame_mask if common_mask is None else common_mask & frame_mask
+    for part_name, part_slice in _PAIRED_USAGE_PART_SLICES.items():
+        expanded_mask = common_mask[..., None].expand(
+            -1, -1, part_slice.stop - part_slice.start
+        )
+        off_difference = (
+            correct_prediction[..., part_slice] - off_prediction[..., part_slice]
+        ).double()
+        output[f"{part_name}/pair_off_square_sum"] = float(
+            off_difference[expanded_mask].square().sum().cpu()
+        )
+        output[f"{part_name}/pair_off_element_count"] = float(
+            expanded_mask.sum().cpu()
+        )
+        for nonce_index, mode in enumerate(_CENTERED_PAIR_MODES):
+            difference = (
+                correct_prediction[..., part_slice]
+                - pair_predictions[mode][..., part_slice]
+            ).double()
+            output[f"{part_name}/pair_n{nonce_index}_square_sum"] = float(
+                difference[expanded_mask].square().sum().cpu()
+            )
+            output[f"{part_name}/pair_n{nonce_index}_element_count"] = float(
+                expanded_mask.sum().cpu()
+            )
+    return output
+
+
+def cluster_mean_centered_pair_usage_moments(row_moments):
+    """Average row MSE within a text before equal-cluster Rpair reduction."""
+
+    rows = list(row_moments)
+    if not rows:
+        return {}
+    output = {}
+    labels = ("pair_off", "pair_n0", "pair_n1", "pair_n2")
+    for part_name in _PAIRED_USAGE_PART_SLICES:
+        for label in labels:
+            sum_name = f"{part_name}/{label}_square_sum"
+            count_name = f"{part_name}/{label}_element_count"
+            values = [
+                float(row[sum_name]) / float(row[count_name])
+                for row in rows
+                if float(row.get(count_name, 0.0)) > 0.0
+            ]
+            if values:
+                output[sum_name] = float(sum(values) / len(values))
+                output[count_name] = 1.0
+    return output
+
+
 @torch.no_grad()
 def evaluate_paired_sentence_memory_modes(
     model,
@@ -5127,7 +6588,12 @@ def evaluate_paired_sentence_memory_modes(
     """Evaluate all controls together so Rmotion uses exactly paired rows."""
 
     modes = configured_sentence_memory_eval_modes(cfg)
-    required = {"off", "on", "motion_shuffled", "shuffled"}
+    centered_protocol = centered_sentence_memory_enabled(cfg)
+    required = (
+        {"off", "on", *_CENTERED_PAIR_MODES, "cross_query_motion", "full_replacement"}
+        if centered_protocol
+        else {"off", "on", "motion_shuffled", "shuffled"}
+    )
     missing = sorted(required - set(modes))
     if missing:
         raise ValueError(
@@ -5140,6 +6606,14 @@ def evaluate_paired_sentence_memory_modes(
         "shuffled": "shuffled_sentence_memory",
         "motion_shuffled": "motion_shuffled_sentence_memory",
         "analytic_prior": "analytic_prior_sentence_memory",
+        "motion_shuffled_n0": "motion_shuffled_n0_sentence_memory",
+        "motion_shuffled_n1": "motion_shuffled_n1_sentence_memory",
+        "motion_shuffled_n2": "motion_shuffled_n2_sentence_memory",
+        "cross_query_motion": "cross_query_motion_sentence_memory",
+        "full_replacement": "full_replacement_sentence_memory",
+        "joint_tuple_permuted": "joint_tuple_permuted_sentence_memory",
+        "uniform_final_mass": "uniform_final_mass_sentence_memory",
+        "association_disabled": "association_disabled_sentence_memory",
     }
     fixed_word_mode = str(
         cfg.get("eval", {}).get("sentence_memory_word_prior_mode", "off")
@@ -5196,7 +6670,11 @@ def evaluate_paired_sentence_memory_modes(
             end = min(start + microbatch_size, logical_size)
             microbatch = slice_batch(batch, start, end)
             predictions = {}
+            control_predictions = {}
+            control_durations = {}
+            correct_prepared = None
             moved_mask = None
+            pair_masks = {}
             for mode in modes:
                 metrics, prepared = evaluate_microbatch(
                     model,
@@ -5217,7 +6695,12 @@ def evaluate_paired_sentence_memory_modes(
                     cluster_averages[mode].update(metrics, n=1)
                 else:
                     averages[mode].update(metrics, n=end - start)
-                if mode in {"off", "on", "motion_shuffled"}:
+                paired_prediction_modes = (
+                    {"off", "on", *_CENTERED_PAIR_MODES}
+                    if centered_protocol
+                    else {"off", "on", "motion_shuffled"}
+                )
+                if mode in paired_prediction_modes:
                     predictions[mode] = prepared["outputs"]["prediction"].detach()
                     if mode == "motion_shuffled":
                         # Both sides of Rmotion must use exactly the rows on
@@ -5229,17 +6712,140 @@ def evaluate_paired_sentence_memory_modes(
                             microbatch["mask"].to(device).bool()
                             & informative[:, None]
                         )
-            moments = paired_sentence_memory_usage_moments(
-                predictions["on"],
-                predictions["motion_shuffled"],
-                predictions["off"],
-                moved_mask,
-            )
+                    elif mode in _CENTERED_PAIR_MODES:
+                        informative = prepared[
+                            "sentence_memory_control_informative"
+                        ].bool()
+                        pair_masks[mode] = (
+                            microbatch["mask"].to(device).bool()
+                            & informative[:, None]
+                        )
+                if centered_protocol and mode in {
+                    "off",
+                    "on",
+                    "joint_tuple_permuted",
+                    "uniform_final_mass",
+                }:
+                    control_predictions[mode] = prepared["outputs"][
+                        "prediction"
+                    ].detach()
+                    control_durations[mode] = prepared["outputs"][
+                        "trajectory"
+                    ].duration_seconds.detach()
+                    if mode == "on":
+                        correct_prepared = prepared
+            if centered_protocol:
+                moments = centered_pair_usage_moments(
+                    predictions["on"],
+                    {mode: predictions[mode] for mode in _CENTERED_PAIR_MODES},
+                    predictions["off"],
+                    pair_masks,
+                )
+            else:
+                moments = paired_sentence_memory_usage_moments(
+                    predictions["on"],
+                    predictions["motion_shuffled"],
+                    predictions["off"],
+                    moved_mask,
+                )
             if cluster_equal:
                 cluster_row_moments.append(moments)
             else:
                 for name, value in moments.items():
                     raw_moments[name] = raw_moments.get(name, 0.0) + value
+            if centered_protocol:
+                from NIAF.continuous_trajectory_field.sentence_memory import (
+                    broadcast_sentence_memory_motion_payload,
+                )
+
+                broadcast_memory, _broadcast_source, _broadcast_informative = (
+                    broadcast_sentence_memory_motion_payload(
+                        correct_prepared["sentence_memory_batch"],
+                        query_ids=sentence_memory_query_ids(microbatch),
+                        seed=1234,
+                    )
+                )
+                broadcast_outputs, all_null_outputs = (
+                    sentence_memory_integrity_audit_forwards(
+                        model,
+                        prepared=correct_prepared,
+                        batch=microbatch,
+                        cfg=cfg,
+                        broadcast_memory=broadcast_memory,
+                    )
+                )
+
+                def tensor_max_abs(value):
+                    return float(value.detach().abs().max().cpu()) if value.numel() else 0.0
+
+                all_null_trajectory = all_null_outputs["trajectory"]
+                all_null_gates = getattr(
+                    all_null_trajectory, "sentence_memory_gates", None
+                )
+                all_null_candidate_mass = all_null_outputs.get(
+                    "sentence_memory_final_part_candidate_mass"
+                )
+                all_null_null_mass = all_null_outputs.get(
+                    "sentence_memory_final_part_null_mass"
+                )
+                control_maxima = {
+                    "joint_tuple_prediction_max_abs": float(
+                        (
+                            control_predictions["on"]
+                            - control_predictions["joint_tuple_permuted"]
+                        ).abs().max().cpu()
+                    ),
+                    "joint_tuple_duration_max_abs": tensor_max_abs(
+                        control_durations["on"]
+                        - control_durations["joint_tuple_permuted"]
+                    ),
+                    "uniform_final_vs_off_prediction_max_abs": float(
+                        (
+                            control_predictions["off"]
+                            - control_predictions["uniform_final_mass"]
+                        ).abs().max().cpu()
+                    ),
+                    "uniform_final_vs_off_duration_max_abs": tensor_max_abs(
+                        control_durations["uniform_final_mass"]
+                        - control_durations["off"]
+                    ),
+                    "broadcast_complete_vs_off_prediction_max_abs": tensor_max_abs(
+                        broadcast_outputs["prediction"]
+                        - control_predictions["off"]
+                    ),
+                    "broadcast_complete_vs_off_duration_max_abs": tensor_max_abs(
+                        broadcast_outputs["trajectory"].duration_seconds
+                        - control_durations["off"]
+                    ),
+                    "all_null_vs_off_prediction_max_abs": tensor_max_abs(
+                        all_null_outputs["prediction"]
+                        - control_predictions["off"]
+                    ),
+                    "all_null_vs_off_duration_max_abs": tensor_max_abs(
+                        all_null_trajectory.duration_seconds
+                        - control_durations["off"]
+                    ),
+                    "all_null_gate_max_abs": (
+                        tensor_max_abs(all_null_gates)
+                        if all_null_gates is not None
+                        else float("inf")
+                    ),
+                    "all_null_candidate_mass_max_abs": (
+                        tensor_max_abs(all_null_candidate_mass)
+                        if all_null_candidate_mass is not None
+                        else float("inf")
+                    ),
+                    "all_null_one_minus_null_mass_max_abs": (
+                        tensor_max_abs(1.0 - all_null_null_mass)
+                        if all_null_null_mass is not None
+                        else float("inf")
+                    ),
+                }
+                for name, value in control_maxima.items():
+                    raw_name = f"{_PAIRED_CONTROL_MAX_RAW_PREFIX}{name}"
+                    raw_moments[raw_name] = max(
+                        raw_moments.get(raw_name, 0.0), value
+                    )
             if show_progress:
                 progress.set_postfix(
                     logical=f"{batch_index + 1}/{len(loader)}",
@@ -5248,9 +6854,12 @@ def evaluate_paired_sentence_memory_modes(
         if cluster_equal:
             for mode in modes:
                 averages[mode].update(cluster_averages[mode].mean(), n=1)
-            for name, value in cluster_mean_paired_usage_moments(
-                cluster_row_moments
-            ).items():
+            cluster_moments = (
+                cluster_mean_centered_pair_usage_moments(cluster_row_moments)
+                if centered_protocol
+                else cluster_mean_paired_usage_moments(cluster_row_moments)
+            )
+            for name, value in cluster_moments.items():
                 raw_moments[name] = raw_moments.get(name, 0.0) + value
         if (
             bool(cfg.get("eval", {}).get("empty_cache_between_batches", True))
@@ -5263,9 +6872,11 @@ def evaluate_paired_sentence_memory_modes(
         combined.update(
             {f"{namespace}/{name}": value for name, value in average.mean().items()}
         )
-    combined.update(
-        {f"{_PAIRED_USAGE_RAW_PREFIX}{name}": value for name, value in raw_moments.items()}
-    )
+    for name, value in raw_moments.items():
+        if name.startswith(_PAIRED_CONTROL_MAX_RAW_PREFIX):
+            combined[name] = value
+        else:
+            combined[f"{_PAIRED_USAGE_RAW_PREFIX}{name}"] = value
     return combined
 
 
@@ -5277,14 +6888,37 @@ def distributed_validation_metrics(values, local_sample_count, device, dist_info
         for name, value in values.items()
         if name.startswith(_PAIRED_USAGE_RAW_PREFIX)
     }
+    control_maxima = {
+        name.removeprefix(_PAIRED_CONTROL_MAX_RAW_PREFIX): float(value)
+        for name, value in values.items()
+        if name.startswith(_PAIRED_CONTROL_MAX_RAW_PREFIX)
+    }
     ordinary = {
         name: value
         for name, value in values.items()
         if not name.startswith(_PAIRED_USAGE_RAW_PREFIX)
+        and not name.startswith(_PAIRED_CONTROL_MAX_RAW_PREFIX)
     }
     ordinary = distributed_sample_weighted_mean_scalars(
         ordinary, local_sample_count, device, dist_info
     )
+    if control_maxima:
+        control_names = sorted(control_maxima)
+        maxima = torch.tensor(
+            [control_maxima[name] for name in control_names],
+            dtype=torch.float64,
+            device=device,
+        )
+        if dist_info.get("enabled", False):
+            dist.all_reduce(maxima, op=dist.ReduceOp.MAX)
+        ordinary.update(
+            {
+                f"paired_sentence_memory/{name}": float(value)
+                for name, value in zip(
+                    control_names, maxima.detach().cpu().tolist()
+                )
+            }
+        )
     if dist_info.get("enabled", False):
         world_size = int(dist_info.get("world_size") or dist.get_world_size())
         rank_raw_names = [None] * world_size
@@ -5307,6 +6941,45 @@ def distributed_validation_metrics(values, local_sample_count, device, dist_info
         name: float(value)
         for name, value in zip(raw_names, additive.detach().cpu().tolist())
     }
+    if any(name.endswith("/pair_n0_square_sum") for name in reduced_raw):
+        for part_name in _PAIRED_USAGE_PART_SLICES:
+            off_sum = reduced_raw[f"{part_name}/pair_off_square_sum"]
+            off_count = reduced_raw[f"{part_name}/pair_off_element_count"]
+            if off_count <= 0.0:
+                raise RuntimeError(f"Rpair {part_name} has no valid off elements")
+            off_mse = off_sum / off_count
+            nonce_mse = []
+            prefix = f"paired_sentence_memory/{part_name}"
+            ordinary[f"{prefix}_pair_off_rms"] = math.sqrt(off_mse)
+            for nonce_index in range(3):
+                label = f"pair_n{nonce_index}"
+                square_sum = reduced_raw[f"{part_name}/{label}_square_sum"]
+                element_count = reduced_raw[
+                    f"{part_name}/{label}_element_count"
+                ]
+                if element_count <= 0.0:
+                    raise RuntimeError(
+                        f"Rpair {part_name} nonce {nonce_index} has no valid elements"
+                    )
+                mse = square_sum / element_count
+                nonce_mse.append(mse)
+                ordinary[f"{prefix}_{label}_square_sum"] = square_sum
+                ordinary[f"{prefix}_{label}_element_count"] = element_count
+                ordinary[f"{prefix}_{label}_rms"] = math.sqrt(mse)
+                ordinary[f"{prefix}_Rpair_n{nonce_index}"] = math.sqrt(
+                    mse / max(off_mse, 1e-24)
+                )
+            ordinary[f"{prefix}_Rpair"] = math.sqrt(
+                (sum(nonce_mse) / len(nonce_mse)) / max(off_mse, 1e-24)
+            )
+        ordinary["paired_sentence_memory/Rpair"] = ordinary[
+            "paired_sentence_memory/all_Rpair"
+        ]
+        for nonce_index in range(3):
+            ordinary[f"paired_sentence_memory/Rpair_n{nonce_index}"] = ordinary[
+                f"paired_sentence_memory/all_Rpair_n{nonce_index}"
+            ]
+        return ordinary
     for part_name in _PAIRED_USAGE_PART_SLICES:
         motion_sum = reduced_raw[f"{part_name}/motion_square_sum"]
         motion_count = reduced_raw[f"{part_name}/motion_element_count"]
@@ -5533,6 +7206,304 @@ def _metrics_in_namespace(metrics, namespace):
     }
 
 
+def _centered_sentence_memory_selection_diagnostics(
+    metrics, cfg, *, return_details=False
+):
+    """Apply the fixed A''' development gates to cluster-equal metrics."""
+
+    namespaces = {
+        "off": "text_only",
+        "correct": "sentence_memory",
+        "pair_n0": "motion_shuffled_n0_sentence_memory",
+        "pair_n1": "motion_shuffled_n1_sentence_memory",
+        "pair_n2": "motion_shuffled_n2_sentence_memory",
+        "cross": "cross_query_motion_sentence_memory",
+        "full": "full_replacement_sentence_memory",
+    }
+    mode_metrics = {
+        label: _metrics_in_namespace(metrics, namespace)
+        for label, namespace in namespaces.items()
+    }
+    missing = [label for label, values in mode_metrics.items() if not values]
+    if missing:
+        raise ValueError(
+            "Centered sentence-memory selection is missing modes: "
+            + ", ".join(missing)
+        )
+    score, violation, feasible, details = selection_diagnostics(
+        mode_metrics["correct"], cfg, return_details=True
+    )
+    violation = float(violation)
+    reasons = details["rejection_reasons"]
+    scores = {
+        label: float(selection_diagnostics(values, cfg)[0])
+        for label, values in mode_metrics.items()
+    }
+    diagnostic = {
+        "selection_source": "sentence_memory",
+        **{f"{label}_score": value for label, value in scores.items()},
+    }
+
+    def add_minimum(name, value, minimum, scale=None, reason=None):
+        nonlocal violation, feasible
+        scale = max(float(scale if scale is not None else minimum), 1e-8)
+        amount = (
+            max(float(minimum) - float(value), 0.0) / scale
+            if math.isfinite(float(value))
+            else 1.0
+        )
+        violation += amount
+        feasible = bool(feasible and amount <= 1e-12)
+        diagnostic[name] = float(value)
+        diagnostic[f"{name}_minimum"] = float(minimum)
+        diagnostic[f"{name}_violation"] = amount
+        if amount > 0.0:
+            reasons.append(reason or f"{name}={value:.6g} is below {minimum:.6g}")
+
+    def add_relative_win(name, comparator_score, minimum):
+        comparator_score = float(comparator_score)
+        scale = max(abs(comparator_score), 1e-8)
+        gain = (comparator_score - scores["correct"]) / scale
+        add_minimum(
+            name,
+            gain,
+            minimum,
+            scale=max(minimum, 1e-8),
+            reason=(
+                f"correct score {scores['correct']:.6g} does not beat {name} "
+                f"comparator {comparator_score:.6g} by {100*minimum:.2f}%"
+            ),
+        )
+
+    def add_maximum(name, value, maximum, scale=None, reason=None):
+        nonlocal violation, feasible
+        scale = max(float(scale if scale is not None else maximum), 1e-12)
+        amount = (
+            max(float(value) - float(maximum), 0.0) / scale
+            if math.isfinite(float(value))
+            else 1.0
+        )
+        violation += amount
+        feasible = bool(feasible and amount <= 1e-12)
+        diagnostic[name] = float(value)
+        diagnostic[f"{name}_maximum"] = float(maximum)
+        diagnostic[f"{name}_violation"] = amount
+        if amount > 0.0:
+            reasons.append(reason or f"{name}={value:.6g} exceeds {maximum:.6g}")
+
+    add_relative_win("relative_gain_over_off", scores["off"], 0.001)
+    pair_scores = [scores[f"pair_n{index}"] for index in range(3)]
+    mean_pair_score = sum(pair_scores) / 3.0
+    diagnostic["mean_pair_score"] = mean_pair_score
+    add_relative_win("relative_gain_over_mean_pair", mean_pair_score, 0.0025)
+    add_relative_win("relative_gain_over_cross", scores["cross"], 0.0025)
+    add_relative_win("relative_gain_over_full", scores["full"], 0.0025)
+    for nonce_index, pair_score in enumerate(pair_scores):
+        # Strict per-nonce ordering is represented by one machine-epsilon-sized
+        # violation at equality, without imposing an undeclared effect margin.
+        scale = max(abs(pair_score), 1e-8)
+        strict_gain = (pair_score - scores["correct"]) / scale
+        add_minimum(
+            f"relative_gain_over_pair_n{nonce_index}",
+            strict_gain,
+            2e-12,
+            scale=1.0,
+            reason=(
+                f"correct score does not strictly beat pair nonce {nonce_index}"
+            ),
+        )
+
+    utility_denominator = scores["off"] - scores["correct"]
+    utility = (
+        (mean_pair_score - scores["correct"]) / utility_denominator
+        if math.isfinite(utility_denominator) and utility_denominator > 1e-8
+        else float("nan")
+    )
+    diagnostic["identity_utility_denominator"] = utility_denominator
+    add_minimum(
+        "identity_utility_fraction",
+        utility,
+        0.25,
+        scale=0.25,
+        reason=(
+            "identity utility is below 0.25 or correct-vs-off denominator is "
+            "not finite and greater than 1e-8"
+        ),
+    )
+
+    add_minimum(
+        "Rpair",
+        float(metrics.get("paired_sentence_memory/Rpair", math.nan)),
+        0.10,
+        scale=0.10,
+    )
+    for nonce_index in range(3):
+        add_minimum(
+            f"Rpair_n{nonce_index}",
+            float(
+                metrics.get(
+                    f"paired_sentence_memory/Rpair_n{nonce_index}", math.nan
+                )
+            ),
+            0.05,
+            scale=0.05,
+        )
+    add_maximum(
+        "joint_tuple_prediction_max_abs",
+        float(
+            metrics.get(
+                "paired_sentence_memory/joint_tuple_prediction_max_abs",
+                math.nan,
+            )
+        ),
+        1e-7,
+        scale=1e-7,
+        reason="joint tuple permutation is not prediction-equivariant within 1e-7",
+    )
+    add_maximum(
+        "joint_tuple_duration_max_abs",
+        float(
+            metrics.get(
+                "paired_sentence_memory/joint_tuple_duration_max_abs",
+                math.nan,
+            )
+        ),
+        1e-7,
+        scale=1e-7,
+        reason="joint tuple permutation is not duration-equivariant within 1e-7",
+    )
+    add_maximum(
+        "uniform_final_vs_off_prediction_max_abs",
+        float(
+            metrics.get(
+                "paired_sentence_memory/uniform_final_vs_off_prediction_max_abs",
+                math.nan,
+            )
+        ),
+        0.0,
+        scale=1e-12,
+        reason="uniform final candidate mass is not exactly memory-off",
+    )
+    for audit_name in (
+        "uniform_final_vs_off_duration_max_abs",
+        "broadcast_complete_vs_off_prediction_max_abs",
+        "broadcast_complete_vs_off_duration_max_abs",
+        "all_null_vs_off_prediction_max_abs",
+        "all_null_vs_off_duration_max_abs",
+        "all_null_gate_max_abs",
+        "all_null_candidate_mass_max_abs",
+        "all_null_one_minus_null_mass_max_abs",
+    ):
+        add_maximum(
+            audit_name,
+            float(
+                metrics.get(
+                    f"paired_sentence_memory/{audit_name}", math.nan
+                )
+            ),
+            0.0,
+            scale=1e-12,
+            reason=f"integrity audit {audit_name} is not exactly zero",
+        )
+    parity = cfg.get("sentence_memory_safety", {}).get(
+        "v2_to_v3_text_only_parity"
+    )
+    parity_details = {}
+    for parity_name in ("prediction_max_abs", "duration_max_abs"):
+        parity_value = (
+            float(parity.get(parity_name, math.nan))
+            if isinstance(parity, dict) and bool(parity.get("passed", False))
+            else math.nan
+        )
+        add_maximum(
+            f"v2_{parity_name}",
+            parity_value,
+            1e-7,
+            scale=1e-7,
+            reason=f"stored v2 {parity_name} parity proof exceeds 1e-7",
+        )
+        parity_details[parity_name] = parity_value
+    diagnostic["v2_text_only_parity"] = parity_details
+
+    hand_details = {}
+    for hand in ("lhand", "rhand"):
+        metric_name = f"pred_loss_path_{hand}"
+        correct_value = float(mode_metrics["correct"].get(metric_name, math.nan))
+        off_value = float(mode_metrics["off"].get(metric_name, math.nan))
+        hand_scale = max(abs(off_value), 1e-8) if math.isfinite(off_value) else 1.0
+        degradation = (
+            (correct_value - off_value) / hand_scale
+            if math.isfinite(correct_value) and math.isfinite(off_value)
+            else math.nan
+        )
+        # Express an upper bound as a lower-bound gate on its negation.
+        add_minimum(
+            f"{hand}_negative_degradation_vs_off",
+            -degradation,
+            -0.02,
+            scale=0.02,
+            reason=f"correct {hand} path degrades by more than 2% versus off",
+        )
+        corruption_rows = {}
+        for label in ("pair_n0", "pair_n1", "pair_n2", "cross", "full"):
+            corrupt_value = float(mode_metrics[label].get(metric_name, math.nan))
+            gain = (
+                (corrupt_value - correct_value) / max(abs(corrupt_value), 1e-8)
+                if math.isfinite(correct_value) and math.isfinite(corrupt_value)
+                else math.nan
+            )
+            add_minimum(
+                f"{hand}_gain_over_{label}",
+                gain,
+                0.0,
+                scale=1.0,
+                reason=f"correct {hand} path error exceeds {label}",
+            )
+            corruption_rows[label] = corrupt_value
+        hand_details[hand] = {
+            "correct": correct_value,
+            "off": off_value,
+            "relative_degradation_vs_off": degradation,
+            "corruptions": corruption_rows,
+        }
+    diagnostic["hand_path_gates"] = hand_details
+
+    if configured_sentence_memory_association(cfg)["enabled"]:
+        add_minimum(
+            "association_matching_top1",
+            float(
+                mode_metrics["correct"].get(
+                    "association_matching_top1", math.nan
+                )
+            ),
+            0.25,
+            scale=0.25,
+        )
+        add_minimum(
+            "association_matching_margin",
+            float(
+                mode_metrics["correct"].get(
+                    "association_matching_margin", math.nan
+                )
+            ),
+            2e-12,
+            scale=1.0,
+            reason="mean true-minus-best-negative association margin is not positive",
+        )
+
+    nonfinite = sorted(
+        name for name, value in metrics.items() if not math.isfinite(float(value))
+    )
+    if nonfinite:
+        violation += float(len(nonfinite))
+        feasible = False
+        reasons.append("non-finite validation metrics: " + ", ".join(nonfinite))
+        diagnostic["nonfinite_metric_count"] = len(nonfinite)
+    details["dual_mode"] = diagnostic
+    result = (float(score), float(violation), bool(feasible))
+    return (*result, details) if return_details else result
+
+
 def checkpoint_selection_diagnostics(metrics, cfg, return_details=False):
     """Apply contract-specific checkpoint selection and ablation gates."""
 
@@ -5555,6 +7526,10 @@ def checkpoint_selection_diagnostics(metrics, cfg, return_details=False):
             }
             result = (score, violation, feasible)
             return (*result, details) if return_details else result
+        if centered_sentence_memory_enabled(cfg):
+            return _centered_sentence_memory_selection_diagnostics(
+                metrics, cfg, return_details=return_details
+            )
         memory_metrics = _metrics_in_namespace(metrics, "sentence_memory")
         shuffled_metrics = _metrics_in_namespace(
             metrics, "shuffled_sentence_memory"
@@ -6491,6 +8466,13 @@ def save_checkpoint(
                 if is_sentence_memory_model(cfg)
                 else None
             ),
+            "sentence_memory_relevance_calibration_identity": (
+                cfg.get("sentence_memory", {}).get(
+                    "resolved_relevance_calibration_identity"
+                )
+                if is_sentence_memory_model(cfg)
+                else None
+            ),
             "sentence_memory_evaluation_control_identity": (
                 sentence_memory_evaluation_control_identity(cfg)
                 if is_sentence_memory_model(cfg)
@@ -6695,6 +8677,8 @@ def main():
             "--resume, --warm_start, and --base_checkpoint are mutually exclusive"
         )
     cfg = apply_overrides(load_config(args.config), args)
+    if centered_sentence_memory_enabled(cfg):
+        resolve_sentence_memory_relevance_calibration(cfg)
     validate_paired_sentence_memory_training_contract(cfg)
     validate_phase_b_launch(
         cfg,

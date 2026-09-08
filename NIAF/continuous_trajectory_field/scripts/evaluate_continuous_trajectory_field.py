@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import hashlib
 import json
+import os
+import re
+import subprocess
+import tempfile
 from pathlib import Path
 
 import torch
@@ -27,6 +33,7 @@ from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field 
     build_development_validation_loader,
     build_isolated_development_validation_loader,
     checkpoint_selection_diagnostics,
+    centered_sentence_memory_enabled,
     configured_sentence_memory_eval_modes,
     configured_selection_aggregation,
     CLUSTER_EQUAL_SELECTION_AGGREGATION,
@@ -39,9 +46,11 @@ from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field 
     is_sentence_memory_model,
     load_isolated_development_validation_runtime,
     paired_sentence_memory_corruption_config,
+    resolve_sentence_memory_relevance_calibration,
     sentence_memory_enabled,
     sentence_memory_architecture_identity,
     sentence_memory_evaluation_control_identity,
+    sentence_memory_objective_identity,
     sentence_memory_provider_required,
     sentence_memory_selection_aggregation_identity,
     selection_diagnostics,
@@ -102,6 +111,14 @@ def parse_args():
             "shuffled",
             "motion_shuffled",
             "analytic_prior",
+            "motion_shuffled_n0",
+            "motion_shuffled_n1",
+            "motion_shuffled_n2",
+            "cross_query_motion",
+            "full_replacement",
+            "joint_tuple_permuted",
+            "uniform_final_mass",
+            "association_disabled",
         ),
         help=(
             "For v3, evaluate configured modes (auto), off, on, off+on "
@@ -149,6 +166,219 @@ def reduce_external_evaluation_metrics(
         device,
         dist_info,
     )
+
+
+def validate_centered_public_evaluation_scope(
+    cfg, *, limit, max_batches, sentence_memory_mode="auto"
+):
+    """Reject any partial query set for a provenance-bearing centered replay."""
+
+    if not centered_sentence_memory_enabled(cfg):
+        return
+    if (
+        int(limit) != 0
+        or int(max_batches) != 0
+        or str(sentence_memory_mode).lower() != "auto"
+    ):
+        raise ValueError(
+            "Centered public evaluation requires the complete sealed 347-row "
+            "development set and exact configured control suite; --limit and "
+            "--max_batches must both be zero and --sentence_memory must be auto"
+        )
+
+
+def _write_json_atomic(path, payload):
+    """Durably replace one JSON artifact without truncating a prior version."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = None
+    temporary = None
+    try:
+        descriptor, name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+        )
+        temporary = Path(name)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError as error:
+                if error.errno not in {
+                    errno.EINVAL,
+                    getattr(errno, "ENOTSUP", errno.EINVAL),
+                    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+                }:
+                    raise
+        os.replace(temporary, path)
+        temporary = None
+        try:
+            directory_descriptor = os.open(
+                path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+        except OSError:
+            directory_descriptor = None
+        if directory_descriptor is not None:
+            try:
+                try:
+                    os.fsync(directory_descriptor)
+                except OSError as error:
+                    if error.errno not in {
+                        errno.EINVAL,
+                        getattr(errno, "ENOTSUP", errno.EINVAL),
+                        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+                    }:
+                        raise
+            finally:
+                os.close(directory_descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_digest(value):
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def centered_public_evaluation_provenance(
+    *,
+    config_path,
+    checkpoint_path,
+    checkpoint,
+    development_runtime,
+    development_query_binding,
+    cfg,
+):
+    """Bind a centered selected-checkpoint replay to its attested source."""
+
+    config_path = Path(config_path).resolve()
+    checkpoint_path = Path(checkpoint_path).resolve()
+    run_dir = checkpoint_path.parent.parent
+    launch_path = Path(
+        os.environ.get(
+            "SIGNTRAJ_RUN_LAUNCH_IDENTITY",
+            str(Path(f"{run_dir}.prerequisites") / "run_launch_identity.json"),
+        )
+    ).resolve()
+    if not launch_path.is_file():
+        raise RuntimeError(
+            "Centered evaluation requires its sealed run_launch_identity.json"
+        )
+    launch = json.loads(launch_path.read_text(encoding="utf-8"))
+    if not isinstance(launch, dict):
+        raise RuntimeError("Centered run-launch identity is malformed")
+    launch_without_identity = {
+        name: value for name, value in launch.items() if name != "launch_identity"
+    }
+    if launch.get("launch_identity") != _canonical_digest(launch_without_identity):
+        raise RuntimeError("Centered run-launch identity digest is invalid")
+    source = dict(launch.get("source", {}) or {})
+    expected_head = str(
+        os.environ.get("SIGNTRAJ_SOURCE_GIT_HEAD")
+        or os.environ.get("SOURCE_GIT_HEAD")
+        or ""
+    ).lower()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_head):
+        raise RuntimeError(
+            "Centered evaluation requires SIGNTRAJ_SOURCE_GIT_HEAD from the "
+            "attested launcher"
+        )
+    if (
+        str(source.get("git_head", "")).lower() != expected_head
+        or str(source.get("remote_head", "")).lower() != expected_head
+        or not bool(source.get("remote_ref_exact_match_checked", False))
+        or not bool(source.get("standalone_shared_clone_checked", False))
+        or not bool(source.get("worktree_clean_checked", False))
+    ):
+        raise RuntimeError(
+            "Centered evaluation source differs from the run-launch attestation"
+        )
+    source_root = Path(__file__).resolve().parents[3]
+    if source_root != Path(str(source.get("repository_root", ""))).resolve():
+        raise RuntimeError(
+            "Centered evaluator checkout differs from the attested source root"
+        )
+    actual_head = subprocess.run(
+        ["git", "-C", str(source_root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip().lower()
+    dirty = subprocess.run(
+        ["git", "-C", str(source_root), "status", "--porcelain", "--untracked-files=all"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if actual_head != expected_head or dirty:
+        raise RuntimeError(
+            "Centered evaluation requires the exact clean attested source checkout"
+        )
+    config_sha256 = _sha256_file(config_path)
+    launch_config = dict(launch.get("config", {}) or {})
+    if launch_config.get("sha256") != config_sha256:
+        raise RuntimeError(
+            "Centered evaluation config differs from the run-launch attestation"
+        )
+    if development_runtime is None or development_query_binding is None:
+        raise RuntimeError(
+            "Centered evaluation requires sealed development runtime/query binding"
+        )
+    payload = {
+        "schema_name": "signtrajfield_centered_public_evaluation_provenance",
+        "schema_version": 1,
+        "source": {
+            "git_head": expected_head,
+            "run_launch_identity": launch["launch_identity"],
+            "run_launch_path": str(launch_path),
+            "run_launch_sha256": _sha256_file(launch_path),
+        },
+        "config": {"path": str(config_path), "sha256": config_sha256},
+        "checkpoint": {
+            "path": str(checkpoint_path),
+            "sha256": _sha256_file(checkpoint_path),
+            "epoch": int(checkpoint.get("epoch", -1)),
+            "global_step": int(checkpoint.get("global_step", 0)),
+        },
+        "development_validation_runtime": development_runtime.artifact_payload,
+        "development_validation_query_binding": development_query_binding,
+        "relevance_calibration_identity": cfg.get("sentence_memory", {}).get(
+            "resolved_relevance_calibration_identity"
+        ),
+        "identities": {
+            "objective": sentence_memory_objective_identity(cfg),
+            "architecture": sentence_memory_architecture_identity(cfg),
+            "evaluation_control": sentence_memory_evaluation_control_identity(cfg),
+            "selection_aggregation": sentence_memory_selection_aggregation_identity(cfg),
+            "validation_control_map": cfg.get("validation_text_partition", {}).get(
+                "evaluation_corruption_map_identity"
+            ),
+        },
+        "test_data_accessed": False,
+        "confirmation_manifest_opened": False,
+    }
+    return {**payload, "identity": _canonical_digest(payload)}
 
 
 def build_public_evaluation_loader(cfg, *, split, limit, dist_info):
@@ -236,6 +466,16 @@ def main():
     if args.text_device is not None:
         cfg.setdefault("text", {})["device"] = args.text_device
     cfg.setdefault("data", {})["random_crop"] = False
+    validate_centered_public_evaluation_scope(
+        cfg,
+        limit=args.limit,
+        max_batches=args.max_batches,
+        sentence_memory_mode=args.sentence_memory_mode,
+    )
+    if centered_sentence_memory_enabled(cfg):
+        # Never trust copied checkpoint scalars without revalidating the sealed
+        # calibration artifact used to construct the model.
+        resolve_sentence_memory_relevance_calibration(cfg)
     scaffold_cfg = cfg.setdefault("scaffold", {})
     if args.scaffold_mode == "online":
         scaffold_cfg["cache_only"] = False
@@ -393,6 +633,16 @@ def main():
             cfg, text_dim=text_encoder.text_dim
         ).to(device)
         checkpoint = torch.load(args.checkpoint, map_location="cpu")
+        if centered_sentence_memory_enabled(cfg):
+            parity = checkpoint.get("v2_to_v3_text_only_parity")
+            if not isinstance(parity, dict) or not bool(parity.get("passed", False)):
+                raise RuntimeError(
+                    "Centered sentence-memory checkpoint has no passing stored "
+                    "v2 text-only parity proof"
+                )
+            cfg.setdefault("sentence_memory_safety", {})[
+                "v2_to_v3_text_only_parity"
+            ] = parity
         validate_checkpoint_contract(checkpoint, cfg, source=str(args.checkpoint))
         validate_sentence_memory_checkpoint_identity(
             checkpoint,
@@ -531,12 +781,30 @@ def main():
             "selection_details": selection_details,
             "metrics": metrics,
         }
+        if centered_sentence_memory_enabled(cfg):
+            result["sentence_memory_relevance_calibration_identity"] = cfg.get(
+                "sentence_memory", {}
+            ).get("resolved_relevance_calibration_identity")
+            if dist_info["is_main"]:
+                result["centered_evaluation_provenance"] = (
+                    centered_public_evaluation_provenance(
+                        config_path=args.config,
+                        checkpoint_path=args.checkpoint,
+                        checkpoint=checkpoint,
+                        development_runtime=development_runtime,
+                        development_query_binding=development_query_binding,
+                        cfg=cfg,
+                    )
+                )
         if dist_info["is_main"]:
-            args.out_json.parent.mkdir(parents=True, exist_ok=True)
-            args.out_json.write_text(
-                json.dumps(result, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            if centered_sentence_memory_enabled(cfg):
+                _write_json_atomic(args.out_json, result)
+            else:
+                args.out_json.parent.mkdir(parents=True, exist_ok=True)
+                args.out_json.write_text(
+                    json.dumps(result, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
             print(json.dumps(result, sort_keys=True))
         barrier(dist_info)
     finally:

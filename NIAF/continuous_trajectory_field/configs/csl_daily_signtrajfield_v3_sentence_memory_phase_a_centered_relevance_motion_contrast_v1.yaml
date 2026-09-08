@@ -1,0 +1,47 @@
+_base_: csl_daily_signtrajfield_v3_sentence_memory_phase_a_split_kv_motion_contrast_v1.yaml
+
+# Stage A of the ordered Phase-A''' experiment.  Motion values are centered
+# within each candidate and the relevance gate is frozen from a sealed,
+# train-only calibration.  No association/binding objective is active.
+experiment_name: csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1
+
+sentence_memory:
+  key_value_mode: factorized_metadata_motion_v1
+  candidate_value_mode: centered_candidate_covariance_v1
+  relevance_gate_mode: frozen_absolute_adjusted_score_v1
+  association_mode: none
+  temporal_prior_mode: none
+  temporal_prior_sigma: 0.25
+  temporal_prior_scale: 1.0
+  relevance_calibration:
+    artifact_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_v1
+    schema_name: signtrajfield_sentence_memory_relevance_calibration
+    schema_version: 1
+    minimum_heldout_auroc: 0.75
+    minimum_heldout_probability_gap: 0.20
+
+eval:
+  sentence_memory_modes:
+    - "off"
+    - "on"
+    - motion_shuffled_n0
+    - motion_shuffled_n1
+    - motion_shuffled_n2
+    - cross_query_motion
+    - full_replacement
+    - joint_tuple_permuted
+    - uniform_final_mass
+    - analytic_prior
+  export_sentence_memory_mode: "on"
+  evaluation_corruption:
+    mode: fixed_evidence_controls_v1
+    seed: 1234
+    nonce: null
+
+train:
+  epochs: 6
+  early_stopping_patience: 2
+  early_stopping_min_epochs: 3
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1

@@ -33,17 +33,22 @@ from NIAF.continuous_sign_field.scripts.train_residual_flow import (
 from NIAF.continuous_trajectory_field.models import build_continuous_trajectory_field
 from NIAF.continuous_trajectory_field.sentence_memory import (
     SentenceMemoryBatch,
+    broadcast_sentence_memory_motion_payload,
+    joint_tuple_permute_sentence_memory_batch,
     motion_only_shuffle_sentence_memory_batch,
+    replace_sentence_memory_motion_payload,
     sha256_file,
 )
 from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field import (
     _sentence_memory_field,
     build_sentence_memory_provider,
+    centered_sentence_memory_enabled,
     checkpoint_contract,
     configured_evaluation_corruption,
     is_dual_mode,
     is_sentence_memory_model,
     retrieve_sentence_memory,
+    resolve_sentence_memory_relevance_calibration,
     sentence_memory_enabled,
     sentence_memory_evaluation_corruption_kwargs,
     sentence_memory_forward_kwargs,
@@ -51,7 +56,11 @@ from NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field 
     sentence_memory_query_ids,
     set_sentence_memory_provider_epoch_from_checkpoint,
     validate_checkpoint_contract,
+    validate_sentence_memory_architecture_identity,
     validate_sentence_memory_checkpoint_identity,
+    validate_sentence_memory_evaluation_control_identity,
+    validate_sentence_memory_selection_aggregation_identity,
+    validate_sentence_memory_validation_corruption_map_identity,
 )
 from NIAF.retrieval_confidence_field.scripts.export_retrieval_adaptive_samples import (
     generation_batch,
@@ -70,6 +79,18 @@ ISOLATED_DEVELOPMENT_MANIFEST_ENV = (
 ISOLATED_DEVELOPMENT_ROWS_ENV = "SIGNTRAJ_ISOLATED_DEVELOPMENT_ROWS"
 ISOLATED_DEVELOPMENT_ARTIFACT_ENV = (
     "SIGNTRAJ_ISOLATED_DEVELOPMENT_PARTITION_ARTIFACT_IDENTITY"
+)
+
+CENTERED_EXPORT_MODES = (
+    "motion_shuffled_n0",
+    "motion_shuffled_n1",
+    "motion_shuffled_n2",
+    "cross_query_motion",
+    "full_replacement",
+    "joint_tuple_permuted",
+    "uniform_final_mass",
+    "association_disabled",
+    "broadcast_complete",
 )
 
 
@@ -557,14 +578,23 @@ def parse_args():
             "on",
             "shuffled",
             "motion_shuffled",
+            "motion_shuffled_n0",
+            "motion_shuffled_n1",
+            "motion_shuffled_n2",
+            "cross_query_motion",
+            "full_replacement",
+            "joint_tuple_permuted",
+            "uniform_final_mass",
             "analytic_prior",
+            "association_disabled",
+            "broadcast_complete",
             "all_null",
         ),
         help=(
             "For v3, export with memory off, retrieved memory on, or the "
-            "deterministic full- or motion-only-shuffled controls, the "
-            "analytic retrieval-prior diagnostic, or the all-null integrity "
-            "control. auto uses the configured export mode (on by default)."
+            "configured deterministic corruption/ablation controls. The "
+            "broadcast-complete and all-null modes are integrity controls. "
+            "auto uses the configured export mode (on by default)."
         ),
     )
     parser.add_argument("--context_fps", type=float, default=20.0)
@@ -635,6 +665,33 @@ def _memory_row_numpy(memory_batch, field, index, *aliases):
     return np.asarray(row)
 
 
+def _sentence_memory_motion_payload_digests(memory_batch, index):
+    """Hash each complete candidate motion package for causal-control audits."""
+
+    fields = ("tokens", "token_mask", "token_tau", "part_validity")
+    values = {
+        name: np.asarray(_memory_row_numpy(memory_batch, name, index))
+        for name in fields
+    }
+    candidate_count = int(values["tokens"].shape[0])
+    if candidate_count < 1 or any(
+        value.ndim < 1 or int(value.shape[0]) != candidate_count
+        for value in values.values()
+    ):
+        raise ValueError("Malformed centered candidate motion package")
+    digests = []
+    for candidate in range(candidate_count):
+        hasher = hashlib.sha256()
+        for name in fields:
+            value = np.ascontiguousarray(values[name][candidate])
+            hasher.update(name.encode("utf-8"))
+            hasher.update(value.dtype.str.encode("ascii"))
+            hasher.update(json.dumps(value.shape).encode("ascii"))
+            hasher.update(value.tobytes(order="C"))
+        digests.append(hasher.hexdigest())
+    return np.asarray(digests, dtype="<U64")
+
+
 def sentence_memory_diagnostics_row(instance, index):
     """Return compact per-sample gate/null summaries for paired reports."""
 
@@ -669,22 +726,55 @@ def sentence_memory_diagnostics_row(instance, index):
 
 
 class FactorizedAttentionCapture:
-    """Temporarily retain final factorized attention masses for one export batch."""
+    """Retain attention and centered-evidence diagnostics for one export batch.
+
+    Historical factorized exports keep their final-layer fields unchanged.  A
+    centered configuration additionally exposes every layer plus the frozen
+    relevance and optional absolute-association diagnostics.  The latter are
+    read only after the complete encoder forward, so hooks never alter model
+    inputs or outputs.
+    """
 
     def __init__(self, model, cfg):
         self.value = None
         self.handle = None
+        self.handles = []
+        self.layer_values = {}
+        self.encoder = None
+        self.centered = False
         memory_cfg = dict(cfg.get("sentence_memory", {}) or {})
         if memory_cfg.get("key_value_mode") != "factorized_metadata_motion_v1":
             return
-        encoder = model.hypernetwork.sentence_memory_encoder
-        if not encoder.layers:
+        self.encoder = model.hypernetwork.sentence_memory_encoder
+        self.centered = (
+            memory_cfg.get("candidate_value_mode")
+            == "centered_candidate_covariance_v1"
+        )
+        if not self.encoder.layers:
             raise ValueError("Factorized sentence memory has no attention layer")
         self.slot_count = int(model.hypernetwork.temporal_slot_count)
         self.part_count = 4
-        self.handle = encoder.layers[-1].register_forward_hook(self._hook)
+        layer_indices = (
+            range(len(self.encoder.layers))
+            if self.centered
+            else (len(self.encoder.layers) - 1,)
+        )
+        for layer_index in layer_indices:
+            layer = self.encoder.layers[layer_index]
+            handle = layer.register_forward_hook(
+                self._layer_hook(layer_index)
+            )
+            self.handles.append(handle)
+        # Preserve the public legacy attribute used by existing callers/tests.
+        self.handle = self.handles[-1]
 
-    def _hook(self, _module, _inputs, output):
+    def _layer_hook(self, layer_index):
+        def hook(module, inputs, output):
+            self._capture_layer(layer_index, module, inputs, output)
+
+        return hook
+
+    def _capture_layer(self, layer_index, _module, _inputs, output):
         if not isinstance(output, tuple) or len(output) != 4:
             raise ValueError("Malformed factorized attention-layer output")
         _state, null_mass, candidate_mass, token_mass = output
@@ -692,7 +782,7 @@ class FactorizedAttentionCapture:
         expected_queries = self.slot_count * self.part_count
         if null_mass.shape[1] != expected_queries:
             raise ValueError("Factorized attention query count changed")
-        self.value = {
+        self.layer_values[int(layer_index)] = {
             "null_mass": null_mass.detach().reshape(
                 batch, self.slot_count, self.part_count
             ).cpu(),
@@ -710,23 +800,54 @@ class FactorizedAttentionCapture:
                 token_mass.shape[-1],
             ).cpu(),
         }
+        self.value = self.layer_values[int(layer_index)]
+
+    def _hook(self, _module, _inputs, output):
+        # Backward-compatible direct hook used by existing unit tests.
+        self._capture_layer(0, _module, _inputs, output)
 
     def clear(self):
         self.value = None
+        self.layer_values = {}
 
     def row(self, index):
         if self.handle is None:
             return None
         if self.value is None:
             raise RuntimeError("Factorized attention hook did not observe a forward")
-        return {
+        result = {
             name: value[int(index)].numpy() for name, value in self.value.items()
         }
+        if self.centered:
+            if len(self.layer_values) != len(self.encoder.layers):
+                raise RuntimeError("Centered export did not capture every memory layer")
+            result.update(
+                {
+                    "layer_null_mass": torch.stack(
+                        [self.layer_values[layer]["null_mass"] for layer in sorted(self.layer_values)],
+                        dim=1,
+                    )[int(index)].numpy(),
+                    "layer_candidate_mass": torch.stack(
+                        [self.layer_values[layer]["candidate_mass"] for layer in sorted(self.layer_values)],
+                        dim=1,
+                    )[int(index)].numpy(),
+                    "layer_token_mass": torch.stack(
+                        [self.layer_values[layer]["token_mass"] for layer in sorted(self.layer_values)],
+                        dim=1,
+                    )[int(index)].numpy(),
+                }
+            )
+            debug = dict(getattr(self.encoder, "_last_debug", {}) or {})
+            for name, value in debug.items():
+                if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] > int(index):
+                    result[name] = value[int(index)].detach().cpu().numpy()
+        return result
 
     def close(self):
-        if self.handle is not None:
-            self.handle.remove()
-            self.handle = None
+        for handle in self.handles:
+            handle.remove()
+        self.handles = []
+        self.handle = None
 
 
 def sentence_memory_text_subset(memory_batch, provider, index, text):
@@ -771,6 +892,12 @@ def all_null_sentence_memory_batch(batch, cfg, device):
             batch_size, candidate_count, 1, 4, device=device
         ),
         ids=torch.full(
+            (batch_size, candidate_count), -1, dtype=torch.int64, device=device
+        ),
+        group_ids=torch.full(
+            (batch_size, candidate_count), -1, dtype=torch.int64, device=device
+        ),
+        source_group_ids=torch.full(
             (batch_size, candidate_count), -1, dtype=torch.int64, device=device
         ),
         available=torch.ones(batch_size, dtype=torch.bool, device=device),
@@ -858,10 +985,19 @@ def prepare_inference_batch(
         "motion_shuffled",
         "analytic_prior",
         "all_null",
+        *CENTERED_EXPORT_MODES,
     }:
         raise ValueError(
-            "v3 sentence_memory_mode must be 'off', 'on', 'shuffled', or "
-            "'motion_shuffled', 'analytic_prior', or 'all_null'"
+            "Unsupported v3 sentence_memory_mode "
+            f"{resolved_sentence_mode!r}"
+        )
+    if (
+        resolved_sentence_mode in CENTERED_EXPORT_MODES
+        and not centered_sentence_memory_enabled(cfg)
+    ):
+        raise ValueError(
+            f"sentence_memory_mode={resolved_sentence_mode!r} requires the "
+            "centered-candidate architecture"
         )
 
     adapter_context = None
@@ -925,6 +1061,25 @@ def prepare_inference_batch(
                         "Retrieval-backed inference requires a "
                         "SentenceMemoryProvider"
                     )
+                retrieval_mode = (
+                    "shuffled"
+                    if resolved_sentence_mode == "full_replacement"
+                    else "on"
+                    if resolved_sentence_mode
+                    in {
+                        "motion_shuffled",
+                        "motion_shuffled_n0",
+                        "motion_shuffled_n1",
+                        "motion_shuffled_n2",
+                        "cross_query_motion",
+                        "joint_tuple_permuted",
+                        "uniform_final_mass",
+                        "analytic_prior",
+                        "association_disabled",
+                        "broadcast_complete",
+                    }
+                    else resolved_sentence_mode
+                )
                 sentence_memory_batch = retrieve_sentence_memory(
                     sentence_memory_provider,
                     dataset=dataset,
@@ -935,21 +1090,21 @@ def prepare_inference_batch(
                     available=sentence_available,
                     training=False,
                     device=device,
-                    mode=(
-                        "on"
-                        if resolved_sentence_mode
-                        in {"motion_shuffled", "analytic_prior"}
-                        else resolved_sentence_mode
-                    ),
+                    mode=retrieval_mode,
                     **sentence_memory_evaluation_corruption_kwargs(
                         cfg,
                         training=False,
                         condition=resolved_sentence_mode,
                     ),
                 )
-            if resolved_sentence_mode == "motion_shuffled":
+            if resolved_sentence_mode in {
+                "motion_shuffled",
+                "motion_shuffled_n0",
+                "motion_shuffled_n1",
+                "motion_shuffled_n2",
+            }:
                 corruption_kwargs = sentence_memory_evaluation_corruption_kwargs(
-                    cfg, training=False, condition="motion_shuffled"
+                    cfg, training=False, condition=resolved_sentence_mode
                 )
                 sentence_memory_batch, _permutation, _informative = (
                     motion_only_shuffle_sentence_memory_batch(
@@ -971,9 +1126,62 @@ def prepare_inference_batch(
                         ),
                     )
                 )
+            if resolved_sentence_mode == "cross_query_motion":
+                corruption_kwargs = sentence_memory_evaluation_corruption_kwargs(
+                    cfg, training=False, condition=resolved_sentence_mode
+                )
+                source_batch = retrieve_sentence_memory(
+                    sentence_memory_provider,
+                    dataset=dataset,
+                    batch=batch,
+                    text_tokens=text_tokens,
+                    text_mask=text_mask,
+                    predicted_duration=predicted_duration.detach(),
+                    available=sentence_available,
+                    training=False,
+                    device=device,
+                    mode="shuffled",
+                    **corruption_kwargs,
+                )
+                sentence_memory_batch, _informative = (
+                    replace_sentence_memory_motion_payload(
+                        sentence_memory_batch,
+                        source_batch,
+                        corruption_nonce=corruption_kwargs["corruption_nonce"],
+                        corruption_condition=resolved_sentence_mode,
+                    )
+                )
+            if resolved_sentence_mode == "joint_tuple_permuted":
+                corruption_kwargs = sentence_memory_evaluation_corruption_kwargs(
+                    cfg, training=False, condition=resolved_sentence_mode
+                )
+                sentence_memory_batch, _permutation, _informative = (
+                    joint_tuple_permute_sentence_memory_batch(
+                        sentence_memory_batch,
+                        query_ids=sentence_memory_query_ids(batch),
+                        seed=int(corruption_kwargs["corruption_seed"]),
+                        corruption_nonce=corruption_kwargs["corruption_nonce"],
+                        corruption_condition=resolved_sentence_mode,
+                    )
+                )
+            if resolved_sentence_mode == "broadcast_complete":
+                sentence_memory_batch, _source_rank, _informative = (
+                    broadcast_sentence_memory_motion_payload(
+                        sentence_memory_batch,
+                        query_ids=sentence_memory_query_ids(batch),
+                        seed=int(cfg.get("seed", 1234)),
+                    )
+                )
             sentence_kwargs = sentence_memory_forward_kwargs(sentence_memory_batch)
-            if resolved_sentence_mode == "analytic_prior":
-                sentence_kwargs["sentence_memory_attention_mode"] = "analytic_prior"
+            attention_modes = {
+                "analytic_prior": "analytic_prior",
+                "uniform_final_mass": "uniform_final_candidate_mass",
+                "association_disabled": "association_disabled",
+            }
+            if resolved_sentence_mode in attention_modes:
+                sentence_kwargs["sentence_memory_attention_mode"] = attention_modes[
+                    resolved_sentence_mode
+                ]
     if dual_mode:
         trajectory = model.encode_trajectory(
             text_tokens=text_tokens,
@@ -1000,9 +1208,11 @@ def prepare_inference_batch(
         ),
         "sentence_memory_batch": sentence_memory_batch,
         "sentence_memory_attention_mode": (
-            "analytic_prior"
-            if resolved_sentence_mode == "analytic_prior"
-            else "learned"
+            {
+                "analytic_prior": "analytic_prior",
+                "uniform_final_mass": "uniform_final_candidate_mass",
+                "association_disabled": "association_disabled",
+            }.get(resolved_sentence_mode, "learned")
         ),
         "sentence_memory_motion_shuffle_epoch": (
             int(sentence_memory_epoch)
@@ -1013,7 +1223,13 @@ def prepare_inference_batch(
         ),
         "sentence_memory_motion_shuffle_seed": (
             int(evaluation_corruption["seed"])
-            if resolved_sentence_mode == "motion_shuffled"
+            if resolved_sentence_mode
+            in {
+                "motion_shuffled",
+                "motion_shuffled_n0",
+                "motion_shuffled_n1",
+                "motion_shuffled_n2",
+            }
             else None
         ),
         "sentence_memory_evaluation_corruption": evaluation_corruption,
@@ -1062,6 +1278,11 @@ def sample_trajectory_fps(
 def main():
     args = parse_args()
     cfg = load_config(args.config)
+    if centered_sentence_memory_enabled(cfg):
+        # Re-open and hash the sealed train-only calibration before model
+        # construction.  Export never trusts coefficients copied into a
+        # checkpoint or an unsealed config.
+        resolve_sentence_memory_relevance_calibration(cfg)
     cfg.setdefault("scaffold", {})["cache_only"] = False
     cfg.setdefault("scaffold", {})["prefer_cache"] = False
     out_dir = Path(args.out_dir)
@@ -1150,6 +1371,15 @@ def main():
         device
     )
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    if centered_sentence_memory_enabled(cfg):
+        parity = checkpoint.get("v2_to_v3_text_only_parity")
+        if not isinstance(parity, dict) or not bool(parity.get("passed", False)):
+            raise RuntimeError(
+                "Centered sentence-memory export requires passing stored v2 parity"
+            )
+        cfg.setdefault("sentence_memory_safety", {})[
+            "v2_to_v3_text_only_parity"
+        ] = parity
     validate_checkpoint_contract(checkpoint, cfg, source=str(args.checkpoint))
     validate_sentence_memory_checkpoint_identity(
         checkpoint,
@@ -1162,6 +1392,22 @@ def main():
             else None
         ),
     )
+    if centered_sentence_memory_enabled(cfg):
+        validate_sentence_memory_architecture_identity(
+            checkpoint, cfg, source=str(args.checkpoint)
+        )
+        validate_sentence_memory_evaluation_control_identity(
+            checkpoint, cfg, source=str(args.checkpoint)
+        )
+        validate_sentence_memory_selection_aggregation_identity(
+            checkpoint, cfg, source=str(args.checkpoint)
+        )
+        if cfg.get("validation_text_partition", {}).get(
+            "evaluation_corruption_map_identity"
+        ) is not None:
+            validate_sentence_memory_validation_corruption_map_identity(
+                checkpoint, cfg, source=str(args.checkpoint)
+            )
     checkpoint_epoch = set_sentence_memory_provider_epoch_from_checkpoint(
         sentence_memory_provider, checkpoint
     )
@@ -1317,6 +1563,24 @@ def main():
                     )
                     if value is not None:
                         extra[output_name] = value
+                if centered_sentence_memory_enabled(cfg):
+                    for output_name, field_name in (
+                        ("sentence_memory_group_ids", "group_ids"),
+                        (
+                            "sentence_memory_source_group_ids",
+                            "source_group_ids",
+                        ),
+                    ):
+                        value = _memory_row_numpy(
+                            memory_batch, field_name, local_index
+                        )
+                        if value is not None:
+                            extra[output_name] = value
+                    extra["sentence_memory_motion_payload_digest"] = (
+                        _sentence_memory_motion_payload_digests(
+                            memory_batch, local_index
+                        )
+                    )
                 memory_provenance = getattr(memory_batch, "provenance", {}) or {}
                 candidate_group_ids = memory_provenance.get("candidate_group_ids", [])
                 candidate_exact_text = memory_provenance.get("candidate_exact_text", [])
@@ -1345,6 +1609,26 @@ def main():
                     (
                         "motion_only_shuffle_informative",
                         "sentence_memory_motion_shuffle_informative",
+                    ),
+                    (
+                        "joint_tuple_candidate_permutation",
+                        "sentence_memory_joint_tuple_candidate_permutation",
+                    ),
+                    (
+                        "joint_tuple_informative",
+                        "sentence_memory_joint_tuple_informative",
+                    ),
+                    (
+                        "cross_query_motion_informative",
+                        "sentence_memory_cross_query_motion_informative",
+                    ),
+                    (
+                        "broadcast_motion_source_rank",
+                        "sentence_memory_broadcast_motion_source_rank",
+                    ),
+                    (
+                        "broadcast_motion_informative",
+                        "sentence_memory_broadcast_motion_informative",
                     ),
                 ):
                     provenance_rows = memory_provenance.get(provenance_name, [])
@@ -1380,6 +1664,10 @@ def main():
                         "evaluation_corruption_condition",
                         "sentence_memory_evaluation_corruption_condition",
                     ),
+                    (
+                        "broadcast_motion_audit_nonce",
+                        "sentence_memory_broadcast_motion_audit_nonce",
+                    ),
                 ):
                     provenance_value = memory_provenance.get(provenance_name)
                     if provenance_value is not None:
@@ -1390,19 +1678,25 @@ def main():
                 else None
             )
             if attention_row is not None:
-                extra.update(
-                    {
-                        "sentence_memory_part_null_mass": attention_row[
-                            "null_mass"
-                        ].astype(np.float32),
-                        "sentence_memory_part_candidate_mass": attention_row[
-                            "candidate_mass"
-                        ].astype(np.float32),
-                        "sentence_memory_part_token_mass": attention_row[
-                            "token_mass"
-                        ].astype(np.float32),
-                    }
-                )
+                attention_fields = {
+                    "null_mass": "sentence_memory_part_null_mass",
+                    "candidate_mass": "sentence_memory_part_candidate_mass",
+                    "token_mass": "sentence_memory_part_token_mass",
+                    "layer_null_mass": "sentence_memory_layer_part_null_mass",
+                    "layer_candidate_mass": (
+                        "sentence_memory_layer_part_candidate_mass"
+                    ),
+                    "layer_token_mass": "sentence_memory_layer_part_token_mass",
+                }
+                for source_name, output_name in attention_fields.items():
+                    if source_name in attention_row:
+                        extra[output_name] = np.asarray(
+                            attention_row[source_name], dtype=np.float32
+                        )
+                for source_name, value in attention_row.items():
+                    if not source_name.startswith("sentence_memory_"):
+                        continue
+                    extra[source_name] = np.asarray(value, dtype=np.float32)
             extra.update(_trajectory_numpy(inference["trajectory"], local_index))
             for branch_name, branch_prediction in branch_samples.items():
                 branch_rot6d, branch_axis, branch_smplx = rot6d_to_axis_and_smplx(
@@ -1486,6 +1780,27 @@ def main():
         abs(row["predicted_duration_seconds"] - row["ground_truth_duration_seconds"])
         for row in rows
     ]
+    factorized_attention_artifacts = None
+    if factorized_attention.handle is not None:
+        factorized_attention_artifacts = {
+            "schema": "final_layer_part_attention_mass_v1",
+            "part_order": ["body", "lhand", "rhand", "face"],
+            "slot_count": int(model.hypernetwork.temporal_slot_count),
+            "layer": "final",
+            "head_reduction": "mean",
+            "null_mass_field": "sentence_memory_part_null_mass",
+            "candidate_mass_field": "sentence_memory_part_candidate_mass",
+            "token_mass_field": "sentence_memory_part_token_mass",
+        }
+        if centered_sentence_memory_enabled(cfg):
+            factorized_attention_artifacts.update(
+                {
+                    "centered_layerwise_schema": "centered_evidence_layers_v1",
+                    "layer_count": len(
+                        model.hypernetwork.sentence_memory_encoder.layers
+                    ),
+                }
+            )
     summary = {
         "checkpoint": str(args.checkpoint),
         "checkpoint_epoch": int(checkpoint.get("epoch", -1)),
@@ -1499,10 +1814,13 @@ def main():
             resolved_sentence_memory_mode if sentence_memory_model else "not_applicable"
         ),
         "sentence_memory_attention_mode": (
-            "analytic_prior"
+            {
+                "analytic_prior": "analytic_prior",
+                "uniform_final_mass": "uniform_final_candidate_mass",
+                "association_disabled": "association_disabled",
+            }.get(resolved_sentence_memory_mode, "learned")
             if sentence_memory_model
-            and resolved_sentence_memory_mode == "analytic_prior"
-            else ("learned" if sentence_memory_model else "not_applicable")
+            else "not_applicable"
         ),
         "sentence_memory_motion_shuffle_epoch": (
             int(checkpoint_epoch)
@@ -1515,7 +1833,13 @@ def main():
         "sentence_memory_motion_shuffle_seed": (
             int(configured_evaluation_corruption(cfg)["seed"])
             if sentence_memory_model
-            and resolved_sentence_memory_mode == "motion_shuffled"
+            and resolved_sentence_memory_mode
+            in {
+                "motion_shuffled",
+                "motion_shuffled_n0",
+                "motion_shuffled_n1",
+                "motion_shuffled_n2",
+            }
             else None
         ),
         "sentence_memory_evaluation_corruption": (
@@ -1533,20 +1857,7 @@ def main():
             )
         ),
         "sentence_memory_query_binding": sentence_memory_query_binding,
-        "factorized_attention_artifacts": (
-            {
-                "schema": "final_layer_part_attention_mass_v1",
-                "part_order": ["body", "lhand", "rhand", "face"],
-                "slot_count": int(model.hypernetwork.temporal_slot_count),
-                "layer": "final",
-                "head_reduction": "mean",
-                "null_mass_field": "sentence_memory_part_null_mass",
-                "candidate_mass_field": "sentence_memory_part_candidate_mass",
-                "token_mass_field": "sentence_memory_part_token_mass",
-            }
-            if factorized_attention.handle is not None
-            else None
-        ),
+        "factorized_attention_artifacts": factorized_attention_artifacts,
         "context_fps": float(args.context_fps),
         "sample_fps": list(fps_values),
         "retrieval_bank": retrieval_bank,
@@ -1557,6 +1868,23 @@ def main():
         ),
         "rows": rows,
     }
+    if centered_sentence_memory_enabled(cfg):
+        summary["sentence_memory_checkpoint_identities"] = {
+            name: checkpoint.get(f"sentence_memory_{name}_identity")
+            for name in (
+                "architecture",
+                "behavior",
+                "objective",
+                "resume",
+                "evaluation_control",
+                "selection_aggregation",
+                "validation_corruption_map",
+            )
+        } | {
+            "relevance_calibration": checkpoint.get(
+                "sentence_memory_relevance_calibration_identity"
+            )
+        }
     (out_dir / "export_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )

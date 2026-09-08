@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -1143,9 +1144,25 @@ class SentenceMemoryBatch:
     ids: torch.Tensor
     available: torch.Tensor
     provenance: dict[str, Any]
+    # Stable integer identities are structural supervision, not model content.
+    # ``ids`` identifies a concrete motion-bank realization; ``group_ids``
+    # identifies its normalized-text semantic group.  The latter was added as
+    # an optional tail field so historical tests/checkpoints which construct a
+    # SentenceMemoryBatch directly retain their exact call contract.
+    group_ids: torch.Tensor | None = None
+    # Stable trainer-only identity for a source/sign variant.  It is never
+    # forwarded to the model; association losses use it solely to avoid
+    # treating ambiguous variants as negatives.
+    source_group_ids: torch.Tensor | None = None
+    # Actual motion-source identities aligned to each destination rank. They
+    # equal the candidate identities before corruption and change only when a
+    # control moves/replaces motion. These sidecars never enter model kwargs.
+    motion_source_ids: torch.Tensor | None = None
+    motion_source_group_ids: torch.Tensor | None = None
+    motion_source_source_group_ids: torch.Tensor | None = None
 
     def as_model_kwargs(self) -> dict[str, torch.Tensor]:
-        return {
+        kwargs = {
             "sentence_motion_tokens": self.tokens,
             "sentence_motion_mask": self.token_mask,
             "sentence_motion_tau": self.token_tau,
@@ -1155,7 +1172,9 @@ class SentenceMemoryBatch:
             "sentence_durations": self.durations,
             "sentence_part_validity": self.part_validity,
             "sentence_memory_available": self.available,
+            "sentence_candidate_ids": self.ids,
         }
+        return kwargs
 
 
 def motion_only_shuffle_sentence_memory_batch(
@@ -1241,10 +1260,15 @@ def motion_only_shuffle_sentence_memory_batch(
                 raise ValueError("corruption_nonce must be non-empty when provided")
             if not condition:
                 raise ValueError("corruption_condition must be non-empty")
+            fixed_mode = (
+                "fixed_evidence_controls_v1"
+                if condition.startswith("motion_shuffled_n")
+                else "fixed_query_condition_v1"
+            )
             identity = canonical_json(
                 {
                     "condition": condition,
-                    "mode": "fixed_query_condition_v1",
+                    "mode": fixed_mode,
                     "nonce": nonce,
                     "query_id": str(query_id),
                     "seed": int(seed),
@@ -1265,11 +1289,40 @@ def motion_only_shuffle_sentence_memory_batch(
         )
         return torch.gather(value, 1, source.expand_as(value))
 
-    motion_source_ids = torch.gather(
-        memory.ids,
-        1,
-        permutation.to(device=memory.ids.device),
+    base_motion_source_ids = (
+        memory.motion_source_ids
+        if memory.motion_source_ids is not None
+        else memory.ids
     )
+    motion_source_ids = torch.gather(
+        base_motion_source_ids,
+        1,
+        permutation.to(device=base_motion_source_ids.device),
+    )
+    motion_source_group_ids = None
+    base_motion_source_group_ids = (
+        memory.motion_source_group_ids
+        if memory.motion_source_group_ids is not None
+        else memory.group_ids
+    )
+    if base_motion_source_group_ids is not None:
+        motion_source_group_ids = torch.gather(
+            base_motion_source_group_ids,
+            1,
+            permutation.to(device=base_motion_source_group_ids.device),
+        )
+    motion_source_variant_ids = None
+    base_motion_source_variant_ids = (
+        memory.motion_source_source_group_ids
+        if memory.motion_source_source_group_ids is not None
+        else memory.source_group_ids
+    )
+    if base_motion_source_variant_ids is not None:
+        motion_source_variant_ids = torch.gather(
+            base_motion_source_variant_ids,
+            1,
+            permutation.to(device=base_motion_source_variant_ids.device),
+        )
     provenance = dict(memory.provenance)
     provenance_update = {
         "mode": "motion_only_shuffle",
@@ -1278,13 +1331,28 @@ def motion_only_shuffle_sentence_memory_batch(
         "motion_only_shuffle_seed": int(seed),
         "motion_candidate_permutation": permutation.detach().cpu().tolist(),
         "motion_source_ids": motion_source_ids.detach().cpu().tolist(),
+        "motion_source_group_ids": (
+            motion_source_group_ids.detach().cpu().tolist()
+            if motion_source_group_ids is not None
+            else None
+        ),
+        "motion_source_variant_ids": (
+            motion_source_variant_ids.detach().cpu().tolist()
+            if motion_source_variant_ids is not None
+            else None
+        ),
         "motion_only_shuffle_informative": informative.detach().cpu().tolist(),
     }
     if corruption_nonce is not None:
+        fixed_mode = (
+            "fixed_evidence_controls_v1"
+            if str(corruption_condition).lower().startswith("motion_shuffled_n")
+            else "fixed_query_condition_v1"
+        )
         provenance_update.update(
             {
                 "motion_only_shuffle_epoch": None,
-                "evaluation_corruption_mode": "fixed_query_condition_v1",
+                "evaluation_corruption_mode": fixed_mode,
                 "evaluation_corruption_nonce": str(corruption_nonce),
                 "evaluation_corruption_condition": str(
                     corruption_condition
@@ -1298,9 +1366,365 @@ def motion_only_shuffle_sentence_memory_batch(
         token_mask=gather_motion(memory.token_mask),
         token_tau=gather_motion(memory.token_tau),
         part_validity=gather_motion(memory.part_validity),
+        motion_source_ids=motion_source_ids,
+        motion_source_group_ids=motion_source_group_ids,
+        motion_source_source_group_ids=motion_source_variant_ids,
         provenance=provenance,
     )
     return corrupted, permutation, informative
+
+
+def _fixed_valid_rank_permutation(
+    candidate_mask: torch.Tensor,
+    *,
+    query_ids: Sequence[str],
+    seed: int,
+    corruption_nonce: str,
+    corruption_condition: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a batch-order-independent cyclic permutation of valid ranks."""
+
+    if candidate_mask.ndim != 2:
+        raise ValueError("candidate_mask must have shape [B,K]")
+    batch_size, candidate_count = candidate_mask.shape
+    if len(query_ids) != batch_size:
+        raise ValueError("query_ids must contain one identity per memory row")
+    nonce = str(corruption_nonce)
+    condition = str(corruption_condition).lower()
+    if not nonce or not condition:
+        raise ValueError("fixed corruption nonce and condition must be non-empty")
+    permutation = torch.arange(
+        candidate_count, dtype=torch.long, device=candidate_mask.device
+    ).unsqueeze(0).expand(batch_size, -1).clone()
+    informative = candidate_mask.bool().sum(dim=-1) >= 2
+    for row, query_id in enumerate(query_ids):
+        valid_ranks = torch.nonzero(candidate_mask[row].bool(), as_tuple=False).flatten()
+        valid_count = int(valid_ranks.numel())
+        if valid_count < 2:
+            continue
+        identity = canonical_json(
+            {
+                "condition": condition,
+                "mode": "fixed_evidence_controls_v1",
+                "nonce": nonce,
+                "query_id": str(query_id),
+                "seed": int(seed),
+            }
+        )
+        draw = int(hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16], 16)
+        shift = 1 + draw % (valid_count - 1)
+        permutation[row, valid_ranks] = torch.roll(valid_ranks, shifts=int(shift))
+    return permutation, informative
+
+
+def _gather_candidate_rank(value: torch.Tensor, permutation: torch.Tensor) -> torch.Tensor:
+    source = permutation.to(device=value.device).reshape(
+        permutation.shape[0],
+        permutation.shape[1],
+        *([1] * (value.ndim - 2)),
+    )
+    return torch.gather(value, 1, source.expand_as(value))
+
+
+def joint_tuple_permute_sentence_memory_batch(
+    memory: SentenceMemoryBatch,
+    *,
+    query_ids: Sequence[str],
+    seed: int,
+    corruption_nonce: str,
+    corruption_condition: str = "joint_tuple_permuted",
+) -> tuple[SentenceMemoryBatch, torch.Tensor, torch.Tensor]:
+    """Permute complete candidate tuples as an exact equivariance control."""
+
+    permutation, informative = _fixed_valid_rank_permutation(
+        memory.candidate_mask,
+        query_ids=query_ids,
+        seed=seed,
+        corruption_nonce=corruption_nonce,
+        corruption_condition=corruption_condition,
+    )
+    candidate_fields = (
+        "tokens",
+        "token_mask",
+        "token_tau",
+        "candidate_mask",
+        "candidate_keys",
+        "scores",
+        "durations",
+        "duration_log_gap",
+        "part_validity",
+        "ids",
+    )
+    updates = {
+        name: _gather_candidate_rank(getattr(memory, name), permutation)
+        for name in candidate_fields
+    }
+    if memory.group_ids is not None:
+        updates["group_ids"] = _gather_candidate_rank(memory.group_ids, permutation)
+    if memory.source_group_ids is not None:
+        updates["source_group_ids"] = _gather_candidate_rank(
+            memory.source_group_ids, permutation
+        )
+    for name in (
+        "motion_source_ids",
+        "motion_source_group_ids",
+        "motion_source_source_group_ids",
+    ):
+        value = getattr(memory, name)
+        if value is not None:
+            updates[name] = _gather_candidate_rank(value, permutation)
+
+    provenance = copy.deepcopy(memory.provenance)
+    # Keep human-readable candidate sidecars aligned with the permuted tuple.
+    for name, rows in tuple(provenance.items()):
+        if not name.startswith("candidate_") or not isinstance(rows, list):
+            continue
+        if len(rows) != permutation.shape[0] or not all(
+            isinstance(row, list) and len(row) == permutation.shape[1]
+            for row in rows
+        ):
+            continue
+        provenance[name] = [
+            [rows[row][source] for source in permutation[row].detach().cpu().tolist()]
+            for row in range(permutation.shape[0])
+        ]
+    provenance.update(
+        {
+            "mode": "joint_tuple_permuted",
+            "joint_tuple_source_mode": memory.provenance.get("mode"),
+            "evaluation_corruption_mode": "fixed_evidence_controls_v1",
+            "evaluation_corruption_nonce": str(corruption_nonce),
+            "evaluation_corruption_condition": str(corruption_condition).lower(),
+            "joint_tuple_candidate_permutation": permutation.detach().cpu().tolist(),
+            "joint_tuple_informative": informative.detach().cpu().tolist(),
+        }
+    )
+    updates["provenance"] = provenance
+    return replace(memory, **updates), permutation, informative
+
+
+def replace_sentence_memory_motion_payload(
+    destination: SentenceMemoryBatch,
+    source: SentenceMemoryBatch,
+    *,
+    corruption_nonce: str,
+    corruption_condition: str = "cross_query_motion",
+) -> tuple[SentenceMemoryBatch, torch.Tensor]:
+    """Pair fixed destination metadata with another query's motion payload.
+
+    Only motion tokens, masks, token times, and part validity are replaced.
+    Candidate keys/scores/durations/ranks/IDs/groups and availability remain at
+    their destination positions.  Token padding is reconciled without changing
+    any valid source values.
+    """
+
+    if destination.candidate_mask.shape != source.candidate_mask.shape:
+        raise ValueError("cross-query memory batches must share [B,K]")
+    batch_size, candidate_count = destination.candidate_mask.shape
+
+    def pad(value: torch.Tensor, token_count: int) -> torch.Tensor:
+        if int(value.shape[2]) == int(token_count):
+            return value
+        shape = list(value.shape)
+        shape[2] = int(token_count)
+        padded = value.new_zeros(shape)
+        slices = [slice(None)] * value.ndim
+        slices[2] = slice(0, value.shape[2])
+        padded[tuple(slices)] = value
+        return padded
+
+    updates = {}
+    for name in ("tokens", "token_mask", "token_tau", "part_validity"):
+        destination_value = getattr(destination, name)
+        source_value = getattr(source, name)
+        if destination_value.shape[:2] != (batch_size, candidate_count) or (
+            source_value.shape[:2] != (batch_size, candidate_count)
+        ):
+            raise ValueError(f"cross-query field {name!r} has incompatible [B,K]")
+        common_tokens = max(destination_value.shape[2], source_value.shape[2])
+        # Every row/rank receives the source payload. Padding beyond the source
+        # span is zero, including its structural masks.
+        updates[name] = pad(source_value, common_tokens)
+
+    source_valid = source.candidate_mask.bool() & source.token_mask.bool().any(dim=-1)
+    destination_valid = (
+        destination.candidate_mask.bool()
+        & destination.token_mask.bool().any(dim=-1)
+    )
+    identity_changed = source.ids.to(destination.ids.device) != destination.ids
+    informative = (
+        destination.available.bool()
+        & source.available.to(destination.available.device).bool()
+        & (destination_valid & source_valid.to(destination_valid.device) & identity_changed).any(dim=-1)
+    )
+    source_ids = (
+        source.motion_source_ids
+        if source.motion_source_ids is not None
+        else source.ids
+    )
+    source_group_ids = (
+        source.motion_source_group_ids
+        if source.motion_source_group_ids is not None
+        else source.group_ids
+    )
+    source_variant_ids = (
+        source.motion_source_source_group_ids
+        if source.motion_source_source_group_ids is not None
+        else source.source_group_ids
+    )
+    provenance = copy.deepcopy(destination.provenance)
+    provenance.update(
+        {
+            "mode": "cross_query_motion",
+            "cross_query_motion_source_mode": source.provenance.get("mode"),
+            "evaluation_corruption_mode": "fixed_evidence_controls_v1",
+            "evaluation_corruption_nonce": str(corruption_nonce),
+            "evaluation_corruption_condition": str(corruption_condition).lower(),
+            "motion_source_ids": source_ids.detach().cpu().tolist(),
+            "motion_source_group_ids": (
+                source_group_ids.detach().cpu().tolist()
+                if source_group_ids is not None
+                else source.provenance.get("candidate_group_ids")
+            ),
+            "motion_source_variant_ids": (
+                source_variant_ids.detach().cpu().tolist()
+                if source_variant_ids is not None
+                else None
+            ),
+            "cross_query_motion_informative": informative.detach().cpu().tolist(),
+            "cross_query_motion_source": copy.deepcopy(source.provenance),
+        }
+    )
+    updates["motion_source_ids"] = source_ids
+    updates["motion_source_group_ids"] = source_group_ids
+    updates["motion_source_source_group_ids"] = source_variant_ids
+    updates["provenance"] = provenance
+    return replace(destination, **updates), informative
+
+
+def broadcast_sentence_memory_motion_payload(
+    memory: SentenceMemoryBatch,
+    *,
+    query_ids: Sequence[str],
+    seed: int = 1234,
+    audit_nonce: str = "csl_daily_broadcast_motion_payload_audit_v1",
+) -> tuple[SentenceMemoryBatch, torch.Tensor, torch.Tensor]:
+    """Broadcast one complete valid motion package across each row's ranks.
+
+    This integrity control reuses an already materialized retrieval batch.  It
+    never asks the provider for another payload and leaves every destination
+    key, score, duration, item/group identity, mask, and availability intact.
+    """
+
+    if memory.candidate_mask.ndim != 2:
+        raise ValueError("candidate_mask must have shape [B,K]")
+    batch_size, candidate_count = memory.candidate_mask.shape
+    if len(query_ids) != batch_size:
+        raise ValueError("query_ids must contain one identity per memory row")
+    effective_valid = memory.candidate_mask.bool() & memory.token_mask.bool().any(
+        dim=-1
+    )
+    source_rank = torch.full(
+        (batch_size,), -1, dtype=torch.long, device=memory.candidate_mask.device
+    )
+    informative = effective_valid.sum(dim=-1) >= 2
+    for row, query_id in enumerate(query_ids):
+        valid = torch.nonzero(effective_valid[row], as_tuple=False).flatten()
+        if not int(valid.numel()):
+            continue
+        identity = canonical_json(
+            {
+                "mode": "broadcast_complete_motion_payload_audit_v1",
+                "nonce": str(audit_nonce),
+                "query_id": str(query_id),
+                "seed": int(seed),
+            }
+        )
+        draw = int(hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16], 16)
+        source_rank[row] = valid[draw % int(valid.numel())]
+
+    rank_grid = torch.arange(
+        candidate_count, dtype=torch.long, device=source_rank.device
+    ).unsqueeze(0).expand(batch_size, -1)
+    source = torch.where(source_rank[:, None] >= 0, source_rank[:, None], rank_grid)
+
+    def broadcast(value: torch.Tensor) -> torch.Tensor:
+        return _gather_candidate_rank(value, source)
+
+    base_motion_source_ids = (
+        memory.motion_source_ids
+        if memory.motion_source_ids is not None
+        else memory.ids
+    )
+    motion_source_ids = torch.gather(
+        base_motion_source_ids,
+        1,
+        source.to(base_motion_source_ids.device),
+    )
+    base_motion_source_groups = (
+        memory.motion_source_group_ids
+        if memory.motion_source_group_ids is not None
+        else memory.group_ids
+    )
+    motion_source_groups = (
+        torch.gather(
+            base_motion_source_groups,
+            1,
+            source.to(base_motion_source_groups.device),
+        )
+        if base_motion_source_groups is not None
+        else None
+    )
+    base_motion_source_variants = (
+        memory.motion_source_source_group_ids
+        if memory.motion_source_source_group_ids is not None
+        else memory.source_group_ids
+    )
+    motion_source_variants = (
+        torch.gather(
+            base_motion_source_variants,
+            1,
+            source.to(base_motion_source_variants.device),
+        )
+        if base_motion_source_variants is not None
+        else None
+    )
+    provenance = copy.deepcopy(memory.provenance)
+    provenance.update(
+        {
+            "mode": "broadcast_motion_payload_audit",
+            "broadcast_motion_source_mode": memory.provenance.get("mode"),
+            "broadcast_motion_audit_nonce": str(audit_nonce),
+            "broadcast_motion_source_rank": source_rank.detach().cpu().tolist(),
+            "motion_source_ids": motion_source_ids.detach().cpu().tolist(),
+            "motion_source_group_ids": (
+                motion_source_groups.detach().cpu().tolist()
+                if motion_source_groups is not None
+                else None
+            ),
+            "motion_source_variant_ids": (
+                motion_source_variants.detach().cpu().tolist()
+                if motion_source_variants is not None
+                else None
+            ),
+            "broadcast_motion_informative": informative.detach().cpu().tolist(),
+        }
+    )
+    return (
+        replace(
+            memory,
+            tokens=broadcast(memory.tokens),
+            token_mask=broadcast(memory.token_mask),
+            token_tau=broadcast(memory.token_tau),
+            part_validity=broadcast(memory.part_validity),
+            motion_source_ids=motion_source_ids,
+            motion_source_group_ids=motion_source_groups,
+            motion_source_source_group_ids=motion_source_variants,
+            provenance=provenance,
+        ),
+        source_rank,
+        informative,
+    )
 
 
 class SentenceMemoryProvider:
@@ -1467,6 +1891,16 @@ class SentenceMemoryProvider:
             str(row.get("semantic_group_id", ""))
             for row in self.groups
             if str(row.get("semantic_group_id", ""))
+        }
+        source_groups = sorted(
+            {
+                str(row.get("source_group_id", ""))
+                for row in self.metadata
+                if str(row.get("source_group_id", ""))
+            }
+        )
+        self._source_group_to_index = {
+            source_group: index for index, source_group in enumerate(source_groups)
         }
         self._neighbor_tables_identity = self._collect_neighbor_tables_identity()
         if dataset is not None:
@@ -2105,10 +2539,15 @@ class SentenceMemoryProvider:
                 raise ValueError("corruption_nonce must be non-empty when provided")
             if not condition:
                 raise ValueError("corruption_condition must be non-empty")
+            fixed_mode = (
+                "fixed_evidence_controls_v1"
+                if condition in {"cross_query_motion", "full_replacement"}
+                else "fixed_query_condition_v1"
+            )
             token = canonical_json(
                 {
                     "condition": condition,
-                    "mode": "fixed_query_condition_v1",
+                    "mode": fixed_mode,
                     "nonce": nonce,
                     "query_identity": {
                         "motion_path": query.get("motion_path"),
@@ -2329,6 +2768,7 @@ class SentenceMemoryProvider:
         candidate_groups: list[list[str | None]] = []
         candidate_source_ids: list[list[str | None]] = []
         candidate_source_groups: list[list[str | None]] = []
+        source_group_ids_array = np.full(ids.shape, -1, dtype=np.int64)
         # The same realization can be selected by multiple examples. Gather
         # each mmap span once, then fan it out into the padded batch arrays.
         item_payloads: dict[int, tuple[np.ndarray, np.ndarray]] = {}
@@ -2381,6 +2821,9 @@ class SentenceMemoryProvider:
                 row_source_groups.append(
                     str(self.metadata[candidate_id].get("source_group_id", ""))
                 )
+                source_group_ids_array[row, column] = self._source_group_to_index.get(
+                    row_source_groups[-1], -1
+                )
             candidate_names.append(row_names)
             candidate_groups.append(row_groups)
             candidate_source_ids.append(row_source_ids)
@@ -2422,6 +2865,7 @@ class SentenceMemoryProvider:
                 "candidate_groups": candidate_groups,
                 "candidate_source_ids": candidate_source_ids,
                 "candidate_source_groups": candidate_source_groups,
+                "candidate_source_group_ids": source_group_ids_array.tolist(),
                 "candidate_group_ids": group_ids_array.tolist(),
             }
         )
@@ -2438,6 +2882,11 @@ class SentenceMemoryProvider:
             ids=tensor(ids),
             available=tensor(effective_available),
             provenance=provenance,
+            group_ids=tensor(group_ids_array),
+            source_group_ids=tensor(source_group_ids_array),
+            motion_source_ids=tensor(ids),
+            motion_source_group_ids=tensor(group_ids_array),
+            motion_source_source_group_ids=tensor(source_group_ids_array),
         )
 
     @torch.no_grad()
@@ -2593,7 +3042,10 @@ class SentenceMemoryProvider:
                 **(
                     {
                         "evaluation_corruption_mode": (
-                            "fixed_query_condition_v1"
+                            "fixed_evidence_controls_v1"
+                            if str(corruption_condition or mode).lower()
+                            in {"cross_query_motion", "full_replacement"}
+                            else "fixed_query_condition_v1"
                         ),
                         "evaluation_corruption_nonce": str(corruption_nonce),
                         "evaluation_corruption_condition": str(

@@ -550,9 +550,17 @@ class SentenceMemoryContinuousTrajectoryField(DualModeContinuousTrajectoryField)
         sentence_retrieval_prior_scale: float = 1.0,
         sentence_gate_initial_bias: float = -2.2,
         sentence_key_value_mode: str | None = None,
+        sentence_candidate_value_mode: str | None = None,
         sentence_temporal_prior_mode: str = "none",
         sentence_temporal_prior_sigma: float = 0.25,
         sentence_temporal_prior_scale: float = 1.0,
+        sentence_association_mode: str = "none",
+        sentence_association_dim: int = 128,
+        sentence_association_temperature: float = 0.10,
+        sentence_association_threshold_initial: float = 0.0,
+        sentence_relevance_gate_mode: str = "none",
+        sentence_relevance_slope: float | None = None,
+        sentence_relevance_intercept: float | None = None,
         **kwargs,
     ):
         # Build v2 first and copy its state into the extended hypernetwork. This
@@ -594,9 +602,21 @@ class SentenceMemoryContinuousTrajectoryField(DualModeContinuousTrajectoryField)
             sentence_retrieval_prior_scale=float(sentence_retrieval_prior_scale),
             sentence_gate_initial_bias=float(sentence_gate_initial_bias),
             sentence_key_value_mode=sentence_key_value_mode,
+            sentence_candidate_value_mode=sentence_candidate_value_mode,
             sentence_temporal_prior_mode=str(sentence_temporal_prior_mode),
             sentence_temporal_prior_sigma=float(sentence_temporal_prior_sigma),
             sentence_temporal_prior_scale=float(sentence_temporal_prior_scale),
+            sentence_association_mode=str(sentence_association_mode),
+            sentence_association_dim=int(sentence_association_dim),
+            sentence_association_temperature=float(
+                sentence_association_temperature
+            ),
+            sentence_association_threshold_initial=float(
+                sentence_association_threshold_initial
+            ),
+            sentence_relevance_gate_mode=str(sentence_relevance_gate_mode),
+            sentence_relevance_slope=sentence_relevance_slope,
+            sentence_relevance_intercept=sentence_relevance_intercept,
         )
         incompatible = extended.load_state_dict(legacy.state_dict(), strict=False)
         if incompatible.unexpected_keys or any(
@@ -625,6 +645,7 @@ class SentenceMemoryContinuousTrajectoryField(DualModeContinuousTrajectoryField)
         sentence_scores: torch.Tensor | None = None,
         sentence_durations: torch.Tensor | None = None,
         sentence_candidate_mask: torch.Tensor | None = None,
+        sentence_candidate_ids: torch.Tensor | None = None,
         sentence_part_validity: torch.Tensor | None = None,
         sentence_memory_available: torch.Tensor | None = None,
         sentence_memory_attention_mode: str = "learned",
@@ -643,6 +664,7 @@ class SentenceMemoryContinuousTrajectoryField(DualModeContinuousTrajectoryField)
             sentence_scores=sentence_scores,
             sentence_durations=sentence_durations,
             sentence_candidate_mask=sentence_candidate_mask,
+            sentence_candidate_ids=sentence_candidate_ids,
             sentence_part_validity=sentence_part_validity,
             sentence_memory_available=sentence_memory_available,
             sentence_memory_attention_mode=sentence_memory_attention_mode,
@@ -667,6 +689,7 @@ class SentenceMemoryContinuousTrajectoryField(DualModeContinuousTrajectoryField)
         sentence_scores: torch.Tensor | None = None,
         sentence_durations: torch.Tensor | None = None,
         sentence_candidate_mask: torch.Tensor | None = None,
+        sentence_candidate_ids: torch.Tensor | None = None,
         sentence_part_validity: torch.Tensor | None = None,
         sentence_memory_available: torch.Tensor | None = None,
         sentence_memory_attention_mode: str = "learned",
@@ -685,22 +708,26 @@ class SentenceMemoryContinuousTrajectoryField(DualModeContinuousTrajectoryField)
             sentence_scores=sentence_scores,
             sentence_durations=sentence_durations,
             sentence_candidate_mask=sentence_candidate_mask,
+            sentence_candidate_ids=sentence_candidate_ids,
             sentence_part_validity=sentence_part_validity,
             sentence_memory_available=sentence_memory_available,
             sentence_memory_attention_mode=sentence_memory_attention_mode,
         )
-        return self.query_trajectory(
+        output = self.query_trajectory(
             trajectory,
             query_times,
             time_domain=time_domain,
             query_mask=query_mask,
             return_details=True,
         )
+        output.update(self.hypernetwork.last_sentence_memory_debug)
+        return output
 
 
 def build_continuous_trajectory_field(cfg, text_dim: int):
     model_cfg = cfg.get("model", {})
     duration_cfg = cfg.get("duration", {})
+    objective_cfg = cfg.get("objective", {})
     model_type = str(
         model_cfg.get("type", "continuous_trajectory_field")
     ).lower()
@@ -792,6 +819,9 @@ def build_continuous_trajectory_field(cfg, text_dim: int):
                     sentence_cfg.get("gate_initial_bias", -2.2)
                 ),
                 sentence_key_value_mode=sentence_cfg.get("key_value_mode"),
+                sentence_candidate_value_mode=sentence_cfg.get(
+                    "candidate_value_mode"
+                ),
                 sentence_temporal_prior_mode=str(
                     sentence_cfg.get("temporal_prior_mode", "none")
                 ),
@@ -800,6 +830,34 @@ def build_continuous_trajectory_field(cfg, text_dim: int):
                 ),
                 sentence_temporal_prior_scale=float(
                     sentence_cfg.get("temporal_prior_scale", 1.0)
+                ),
+                sentence_association_mode=str(
+                    sentence_cfg.get("association_mode", "none")
+                ),
+                sentence_association_dim=int(
+                    sentence_cfg.get("association_dim", 128)
+                ),
+                sentence_association_temperature=float(
+                    objective_cfg.get(
+                        "association_temperature",
+                        sentence_cfg.get("association_temperature", 0.10),
+                    )
+                ),
+                sentence_association_threshold_initial=float(
+                    sentence_cfg.get("association_threshold_initial", 0.0)
+                ),
+                sentence_relevance_gate_mode=str(
+                    sentence_cfg.get("relevance_gate_mode", "none")
+                ),
+                sentence_relevance_slope=(
+                    float(sentence_cfg["relevance_slope"])
+                    if sentence_cfg.get("relevance_slope") is not None
+                    else None
+                ),
+                sentence_relevance_intercept=(
+                    float(sentence_cfg["relevance_intercept"])
+                    if sentence_cfg.get("relevance_intercept") is not None
+                    else None
                 ),
             )
             return SentenceMemoryContinuousTrajectoryField(**common)
