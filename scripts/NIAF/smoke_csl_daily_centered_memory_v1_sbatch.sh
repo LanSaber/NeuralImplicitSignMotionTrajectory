@@ -22,7 +22,7 @@ SOURCE_BANK="${SENTENCE_MEMORY_DIR:-/media/cvpr/haomian/data/SOKE_FLOW/csl_daily
 STAGER="$PROJECT_DIR/scripts/NIAF/stage_sentence_memory_train_val_only_node.sh"
 TRAIN_WRAPPER="$PROJECT_DIR/scripts/NIAF/train_continuous_trajectory_field_sbatch.sh"
 PARTITION_DIR="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_motion_contrast_v1.prerequisites/validation_text_partition"
-CALIBRATION_DIR="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_v1_retry1"
+CALIBRATION_DIR="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_v1_retry2"
 GLOBAL_HOLDOUT_SPEND="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_factorized_ordered_v1_control/confirmation_holdout_spent.json"
 EXPECTED_V2_SHA256="06ca0a2613005b6e3949bab0e5d7ded999b212723debd3e7685a58c077e44c54"
 V2_CHECKPOINT="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v2_mt5_text_only_full/checkpoints/best.pt"
@@ -84,7 +84,7 @@ cleanup() {
   exit "$exit_code"
 }
 trap cleanup EXIT
-STAGE_A_CFG="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1_smoke_retry1.yaml"
+STAGE_A_CFG="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1_smoke_retry2.yaml"
 "$STAGER" stage "$LOCAL_BANK" "$SOURCE_BANK" "$PROJECT_DIR" "$PYTHON_BIN" "$STAGE_A_CFG" "train val"
 [[ -f "$LOCAL_BANK/neighbors_train.npz" && -f "$LOCAL_BANK/neighbors_val.npz" && ! -e "$LOCAL_BANK/neighbors_test.npz" ]] || {
   echo "ERROR: smoke local staging violated train/val-only visibility" >&2; exit 1;
@@ -252,5 +252,5 @@ if cfg.get("sentence_memory", {}).get("association_mode") != "none":
 PY
 }
 
-run_arm csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1_smoke_retry1
-run_arm csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1_smoke_retry1
+run_arm csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1_smoke_retry2
+run_arm csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1_smoke_retry2

@@ -28,7 +28,7 @@ GLOBAL_SPEND = (
     "csl_daily_signtrajfield_v3_sentence_memory_phase_a_factorized_ordered_v1_control/"
     "confirmation_holdout_spent.json"
 )
-CALIBRATION_RETRY = "csl_daily_sentence_memory_relevance_calibration_v1_retry1"
+CALIBRATION_RETRY = "csl_daily_sentence_memory_relevance_calibration_v1_retry2"
 STAGE_A_MODES = [
     "off",
     "on",
@@ -160,6 +160,12 @@ def test_recovery_calibration_path_is_consistent_and_source_bound():
         / "NIAF/continuous_trajectory_field/scripts/decide_centered_memory_stage.py"
     ).read_text(encoding="utf-8")
     assert helper.count(CALIBRATION_RETRY) == 2
+    runbook = (
+        ROOT / "docs/NIAF/continuous_trajectory_field/phase_a_centered_relevance_v1.md"
+    ).read_text(encoding="utf-8")
+    assert "SignTrajField_centered_run_source_r2" in runbook
+    assert "codex/csl-daily-centered-memory-v1-run-r2" in runbook
+    assert "source_5a884505_job143304_decision143319" in runbook
 
 
 def test_full_driver_enforces_order_fresh_v2_and_single_holdout_lock():
@@ -210,6 +216,152 @@ def test_centered_helper_ports_full_recovery_and_is_import_isolated():
     assert "legacy.decide_stage(" not in source
     assert "legacy.record_precheckpoint_retry(" not in source
     assert "legacy.spend_confirmation(" not in source
+    assert (
+        "_centered_resume_progress_evidence(checkpoint, metrics, replay_cfg)" in source
+    )
+    assert "_replay_selection(metrics, replay_cfg)" in source
+
+
+def test_centered_decision_replay_uses_exact_runtime_v2_parity(tmp_path):
+    ordered = _ordered_helper()
+    parity = {
+        "prediction_max_abs": 0.0,
+        "duration_max_abs": 0.0,
+        "tolerance": 1e-7,
+        "passed": True,
+    }
+    approved = {
+        "sentence_memory_safety": {"enabled": True},
+        "output": {"out_dir": ordered.EXPERIMENTS[ordered.STAGE1]},
+    }
+    resolved = {
+        **approved,
+        "sentence_memory_safety": {
+            "enabled": True,
+            "v2_to_v3_text_only_parity": parity,
+        },
+        "device": "cuda",
+        "validation_text_partition": {
+            "partition_digest": ordered.legacy.EXPECTED_PARTITION_DIGEST,
+            "partition_artifact_identity": (
+                ordered.legacy.EXPECTED_PARTITION_ARTIFACT_IDENTITY
+            ),
+            "expected_development_manifest_sha256": (
+                ordered.legacy.EXPECTED_DEVELOPMENT_MANIFEST_SHA256
+            ),
+            "development_row_count": ordered.legacy.EXPECTED_DEVELOPMENT_ROWS,
+            "development_text_count": ordered.legacy.EXPECTED_DEVELOPMENT_TEXTS,
+            "confirmation_evaluated_during_training": False,
+            "exact_seen_evaluated_during_training": False,
+            "retrieval_query_mode": ("exact_name_indexed_full_val_table_subset_v1"),
+        },
+    }
+    ordered._validate_resolved_config(
+        stage=ordered.STAGE1, resolved=resolved, approved=approved
+    )
+    replay_cfg = ordered._selection_replay_config(approved, resolved)
+    assert "v2_to_v3_text_only_parity" not in approved["sentence_memory_safety"]
+    assert replay_cfg == {
+        **approved,
+        "sentence_memory_safety": {
+            "enabled": True,
+            "v2_to_v3_text_only_parity": parity,
+        },
+    }
+    assert (
+        ordered._validated_checkpoint_v2_parity(
+            {"v2_to_v3_text_only_parity": parity}, resolved
+        )
+        == parity
+    )
+    with pytest.raises(ordered.OrderedDecisionError, match="differs"):
+        ordered._validated_checkpoint_v2_parity(
+            {
+                "v2_to_v3_text_only_parity": {
+                    **parity,
+                    "prediction_max_abs": 1e-8,
+                }
+            },
+            resolved,
+        )
+
+    for broken_parity in (
+        None,
+        {**parity, "passed": False},
+        {**parity, "tolerance": 1e-6},
+        {**parity, "prediction_max_abs": -1e-9},
+        {**parity, "prediction_max_abs": 2e-7},
+        {**parity, "duration_max_abs": float("nan")},
+        {**parity, "duration_max_abs": float("inf")},
+        {**parity, "prediction_max_abs": "0.0"},
+        {**parity, "prediction_max_abs": True},
+        {**parity, "unexpected": 0},
+    ):
+        broken = {
+            **resolved,
+            "sentence_memory_safety": {
+                "enabled": True,
+                "v2_to_v3_text_only_parity": broken_parity,
+            },
+        }
+        with pytest.raises(ordered.OrderedDecisionError, match="v2 parity"):
+            ordered._validated_runtime_v2_parity(broken)
+    for invalid_max_abs in (-1e-9, float("nan"), float("inf"), True, "0.0"):
+        with pytest.raises(ordered.OrderedDecisionError):
+            ordered._validated_nonnegative_max_abs(
+                invalid_max_abs, name="test.max_abs", maximum=1e-7
+            )
+
+    run = tmp_path / ordered.EXPERIMENTS[ordered.STAGE1]
+    run.mkdir()
+    rows = []
+    namespaces = {
+        "off": "text_only",
+        "on": "sentence_memory",
+        "motion_shuffled_n0": "motion_shuffled_n0_sentence_memory",
+        "motion_shuffled_n1": "motion_shuffled_n1_sentence_memory",
+        "motion_shuffled_n2": "motion_shuffled_n2_sentence_memory",
+        "cross_query_motion": "cross_query_motion_sentence_memory",
+        "full_replacement": "full_replacement_sentence_memory",
+        "joint_tuple_permuted": "joint_tuple_permuted_sentence_memory",
+        "uniform_final_mass": "uniform_final_mass_sentence_memory",
+        "analytic_prior": "analytic_prior_sentence_memory",
+    }
+    for epoch in range(1, 4):
+        row = {
+            "epoch": epoch,
+            "validation_pending": 0.0,
+            "selection_feasible": 0.0,
+        }
+        row.update(
+            {
+                f"val_{namespaces[mode]}/finite_probe": 0.0
+                for mode in ordered.EVAL_MODES[ordered.STAGE1]
+            }
+        )
+        rows.append(row)
+
+    class ReplayReached(RuntimeError):
+        pass
+
+    def capture_replay(_rows, cfg):
+        assert cfg == replay_cfg
+        assert "device" not in cfg
+        assert "validation_text_partition" not in cfg
+        raise ReplayReached
+
+    with (
+        patch.object(ordered, "validate_config", return_value=approved),
+        patch.object(ordered.legacy, "_json", return_value=resolved),
+        patch.object(ordered.legacy, "_read_metrics", return_value=rows),
+        patch.object(ordered, "_replay_selection", side_effect=capture_replay),
+        pytest.raises(ReplayReached),
+    ):
+        ordered._validate_run(
+            stage=ordered.STAGE1,
+            run_dir=run,
+            config_path=tmp_path / f"{ordered.EXPERIMENTS[ordered.STAGE1]}.yaml",
+        )
 
 
 def test_decision_requires_standalone_replay_then_diagnostic_authorization():
@@ -271,10 +423,10 @@ def test_full_and_smoke_slurm_resources_are_explicit():
     assert "MAX_TRAIN_BATCHES=2" in smoke
     assert 'global_step", -1)) != 1' in smoke
     assert smoke.count("run_arm csl_daily_signtrajfield_v3") == 2
-    assert smoke.count("_smoke_retry1") == 3
-    assert "invalid smoke attempt 143300" in (
+    assert smoke.count("_smoke_retry2") == 3
+    assert "decision replay incident 143319" in (
         CONFIG_DIR
-        / f"{STAGE_A}_smoke_retry1.yaml"
+        / f"{STAGE_A}_smoke_retry2.yaml"
     ).read_text(encoding="utf-8")
     cpu = _source("test_csl_daily_centered_memory_v1_sbatch.sh")
     assert "pytest==8.4.2" in cpu and "ruff==0.12.0" in cpu
@@ -607,6 +759,14 @@ def test_diagnostic_contract_and_finalizer_reject_incomplete_evidence(tmp_path):
         broken["development_rows"] = 346
         with pytest.raises(ordered.OrderedDecisionError, match="completeness"):
             ordered._validate_diagnostic_summary_contract(broken, stage=ordered.STAGE1)
+        negative_joint = json.loads(json.dumps(summary))
+        negative_joint["exact_invariants"]["joint_tuple_vs_correct"][
+            "prediction_max_abs"
+        ] = -1e-9
+        with pytest.raises(ordered.OrderedDecisionError, match="nonnegative bound"):
+            ordered._validate_diagnostic_summary_contract(
+                negative_joint, stage=ordered.STAGE1
+            )
 
     layer_row = {
         "mode": "on",
@@ -695,6 +855,16 @@ def test_authorization_source_failure_happens_before_global_spend(tmp_path):
     }
     for path in files.values():
         path.write_bytes(b"x")
+    parity = {
+        "prediction_max_abs": 0.0,
+        "duration_max_abs": 0.0,
+        "tolerance": 1e-7,
+        "passed": True,
+    }
+    files["resolved"].write_text(
+        json.dumps({"sentence_memory_safety": {"v2_to_v3_text_only_parity": parity}}),
+        encoding="utf-8",
+    )
     calibration = {"artifact_identity": "r" * 64}
     exact_zero = {name: 0.0 for name in ordered._EXACT_ZERO_AUDITS}
     checkpoint = {
@@ -707,6 +877,7 @@ def test_authorization_source_failure_happens_before_global_spend(tmp_path):
             "path": str(files["config"]),
             "sha256": ordered.sha256_file(files["config"]),
         },
+        "parity": parity,
         "relevance_calibration": calibration,
         "selected_checkpoint_integrity_audit": {
             "path": str(files["audit"]),

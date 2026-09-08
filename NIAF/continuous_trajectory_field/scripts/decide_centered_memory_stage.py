@@ -69,7 +69,7 @@ EXPERIMENTS = {
     ),
 }
 LEASE_EXPERIMENTS = {
-    CALIBRATION_STAGE: "csl_daily_sentence_memory_relevance_calibration_v1_retry1",
+    CALIBRATION_STAGE: "csl_daily_sentence_memory_relevance_calibration_v1_retry2",
     **EXPERIMENTS,
 }
 STAGE1_EVAL_MODES = (
@@ -128,7 +128,7 @@ def _calibration_directory(cfg: Mapping[str, Any]) -> Path:
         directory = SOURCE_ROOT / directory
     expected = SOURCE_ROOT / (
         "experiments/NIAF/continuous_trajectory_field/"
-        "csl_daily_sentence_memory_relevance_calibration_v1_retry1"
+        "csl_daily_sentence_memory_relevance_calibration_v1_retry2"
     )
     if directory.resolve() != expected.resolve():
         raise OrderedDecisionError(
@@ -355,6 +355,90 @@ def _resolved_config_projection(cfg: Mapping[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _validated_runtime_v2_parity(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the exact runtime parity proof required for selection replay."""
+
+    safety = cfg.get("sentence_memory_safety")
+    if not isinstance(safety, Mapping):
+        raise OrderedDecisionError("Resolved config lacks sentence-memory safety")
+    value = safety.get("v2_to_v3_text_only_parity")
+    if not isinstance(value, Mapping) or set(value) != {
+        "prediction_max_abs",
+        "duration_max_abs",
+        "tolerance",
+        "passed",
+    }:
+        raise OrderedDecisionError("Resolved config lacks an exact v2 parity proof")
+    if value.get("passed") is not True:
+        raise OrderedDecisionError("Resolved v2 parity proof did not pass")
+
+    numeric: dict[str, float] = {}
+    for name in ("prediction_max_abs", "duration_max_abs", "tolerance"):
+        raw = value.get(name)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise OrderedDecisionError(f"Resolved v2 parity {name} is not numeric")
+        number = float(raw)
+        if not math.isfinite(number):
+            raise OrderedDecisionError(f"Resolved v2 parity {name} is non-finite")
+        numeric[name] = number
+    if numeric["tolerance"] != 1e-7:
+        raise OrderedDecisionError("Resolved v2 parity tolerance changed")
+    if any(
+        numeric[name] < 0.0 or numeric[name] > numeric["tolerance"]
+        for name in ("prediction_max_abs", "duration_max_abs")
+    ):
+        raise OrderedDecisionError("Resolved v2 parity exceeds its strict tolerance")
+    return {
+        "prediction_max_abs": numeric["prediction_max_abs"],
+        "duration_max_abs": numeric["duration_max_abs"],
+        "tolerance": numeric["tolerance"],
+        "passed": True,
+    }
+
+
+def _validated_nonnegative_max_abs(value: Any, *, name: str, maximum: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise OrderedDecisionError(f"{name} is not numeric")
+    number = float(value)
+    if not math.isfinite(number) or not 0.0 <= number <= float(maximum):
+        raise OrderedDecisionError(
+            f"{name} is outside the nonnegative bound [0, {maximum}]"
+        )
+    return number
+
+
+def _selection_replay_config(
+    approved: Mapping[str, Any], resolved: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Add only the independently validated runtime proof to the leaf config."""
+
+    replay = copy.deepcopy(dict(approved))
+    safety = replay.get("sentence_memory_safety")
+    if not isinstance(safety, dict):
+        raise OrderedDecisionError("Approved config lacks sentence-memory safety")
+    if "v2_to_v3_text_only_parity" in safety:
+        raise OrderedDecisionError("Approved config embeds a runtime v2 parity proof")
+    safety["v2_to_v3_text_only_parity"] = _validated_runtime_v2_parity(resolved)
+    return replay
+
+
+def _validated_checkpoint_v2_parity(
+    checkpoint: Mapping[str, Any], resolved: Mapping[str, Any]
+) -> dict[str, Any]:
+    parity = _validated_runtime_v2_parity(
+        {
+            "sentence_memory_safety": {
+                "v2_to_v3_text_only_parity": checkpoint.get("v2_to_v3_text_only_parity")
+            }
+        }
+    )
+    if parity != _validated_runtime_v2_parity(resolved):
+        raise OrderedDecisionError(
+            "Checkpoint v2 parity differs from the resolved runtime proof"
+        )
+    return parity
+
+
 def _validate_resolved_config(
     *, stage: str, resolved: Mapping[str, Any], approved: Mapping[str, Any]
 ) -> None:
@@ -394,6 +478,7 @@ def _validate_resolved_config(
     }
     if forbidden.intersection(partition):
         raise OrderedDecisionError("Resolved config embeds sealed holdout membership")
+    _validated_runtime_v2_parity(resolved)
 
 
 def _checkpoint_identity_evidence(
@@ -426,13 +511,7 @@ def _checkpoint_identity_evidence(
         != expected_calibration
     ):
         raise OrderedDecisionError("Checkpoint architecture/calibration changed")
-    parity = dict(checkpoint.get("v2_to_v3_text_only_parity", {}) or {})
-    if (
-        parity.get("passed") is not True
-        or float(parity.get("prediction_max_abs", math.inf)) > 1e-7
-        or float(parity.get("duration_max_abs", math.inf)) > 1e-7
-    ):
-        raise OrderedDecisionError("Checkpoint lacks strict v2 memory-off parity")
+    parity = _validated_checkpoint_v2_parity(checkpoint, resolved_cfg)
     partition = dict(checkpoint_cfg.get("validation_text_partition", {}) or {})
     if (
         partition.get("partition_digest") != legacy.EXPECTED_PARTITION_DIGEST
@@ -511,6 +590,10 @@ def _replay_selection(
         train_continuous_trajectory_field as trainer,
     )
 
+    # Selection consumes the fresh-v2 parity proof injected only after model
+    # construction.  Refuse raw leaf configs so a replay cannot silently turn
+    # the two parity gates into NaN violations.
+    _validated_runtime_v2_parity(cfg)
     early = trainer.initial_early_stopping_state()
     best_feasible_score = math.inf
     best_feasible_row = None
@@ -781,14 +864,16 @@ def _validate_selected_integrity_audit(
                 f"Selected-checkpoint exact integrity audit failed: {name}={value}"
             )
     joint = {
-        name: float(metrics.get(f"paired_sentence_memory/{name}", math.nan))
+        name: _validated_nonnegative_max_abs(
+            metrics.get(f"paired_sentence_memory/{name}"),
+            name=f"selected_integrity_audit.{name}",
+            maximum=1e-7,
+        )
         for name in (
             "joint_tuple_prediction_max_abs",
             "joint_tuple_duration_max_abs",
         )
     }
-    if any(value > 1e-7 for value in joint.values()):
-        raise OrderedDecisionError("Selected checkpoint is not joint-tuple equivariant")
 
     provenance = dict(result.get("centered_evaluation_provenance", {}) or {})
     without_identity = {
@@ -890,13 +975,14 @@ def _validate_selected_integrity_audit(
         or {}
     )
     checkpoint_parity = dict(checkpoint.get("v2_to_v3_text_only_parity", {}) or {})
-    if any(
-        float(parity.get(name, math.inf)) > 1e-7
-        or float(parity.get(name, math.inf))
-        != float(checkpoint_parity.get(name, math.inf))
-        for name in ("prediction_max_abs", "duration_max_abs")
-    ):
-        raise OrderedDecisionError("Selected-checkpoint audit v2 parity changed")
+    for name in ("prediction_max_abs", "duration_max_abs"):
+        audit_value = _validated_nonnegative_max_abs(
+            parity.get(name),
+            name=f"selected_integrity_audit.v2_{name}",
+            maximum=1e-7,
+        )
+        if audit_value != float(checkpoint_parity.get(name, math.inf)):
+            raise OrderedDecisionError("Selected-checkpoint audit v2 parity changed")
     return {
         "path": str(path),
         "sha256": sha256_file(path),
@@ -956,7 +1042,8 @@ def _validate_run(
             for prefix in required_prefixes
         ):
             raise OrderedDecisionError("Validation epoch lacks a centered control mode")
-    replay = _replay_selection(completed, cfg)
+    replay_cfg = _selection_replay_config(cfg, resolved)
+    replay = _replay_selection(completed, replay_cfg)
     summary = legacy._json(run_dir / "selection_summary.json")
     has_feasible = replay["best_feasible_row"] is not None
     expected_summary = {
@@ -1642,14 +1729,15 @@ def record_run_resume(
             metrics_path, checkpoint_row
         ) | {"kind": "missing_complete_row"}
         metrics = legacy._read_metrics(metrics_path)
-    progress = _centered_resume_progress_evidence(checkpoint, metrics, approved)
+    replay_cfg = _selection_replay_config(approved, resolved)
+    progress = _centered_resume_progress_evidence(checkpoint, metrics, replay_cfg)
     terminal_summary = None
     terminal_selected = None
     if progress["mode"] == "terminal_complete":
         terminal_summary = legacy._terminal_selection_summary_payload(
             dict(checkpoint.get("selection_state", {}) or {})
         )
-        replay = _replay_selection(metrics, approved)
+        replay = _replay_selection(metrics, replay_cfg)
         selected_name = (
             "best.pt"
             if terminal_summary["has_feasible_checkpoint"]
@@ -2469,25 +2557,44 @@ def verify_authorization(path: Path, *, purpose: str, stage: str) -> dict[str, A
         if sha256_file(artifact) != checkpoint.get(key):
             raise OrderedDecisionError(f"Authorized run artifact changed: {filename}")
     audit = dict(checkpoint.get("selected_checkpoint_integrity_audit", {}) or {})
+    legacy._finite_tree(audit, path="authorization.selected_checkpoint_integrity_audit")
     audit_path = Path(str(audit.get("path", "")))
     exact_zero = dict(audit.get("exact_zero", {}) or {})
     joint = dict(audit.get("joint_tuple", {}) or {})
     v2_parity = dict(audit.get("v2_text_only_parity", {}) or {})
+    joint_names = {
+        "joint_tuple_prediction_max_abs",
+        "joint_tuple_duration_max_abs",
+    }
+    if set(joint) != joint_names:
+        raise OrderedDecisionError("Authorized selected-checkpoint joint audit changed")
+    for name in joint_names:
+        _validated_nonnegative_max_abs(
+            joint[name], name=f"authorization.audit.{name}", maximum=1e-7
+        )
+    if set(v2_parity) != {"prediction_max_abs", "duration_max_abs"}:
+        raise OrderedDecisionError("Authorized selected-checkpoint v2 audit changed")
+    resolved_artifact = legacy._json(
+        checkpoint_path.parents[1] / "config.resolved.json"
+    )
+    checkpoint_parity = _validated_checkpoint_v2_parity(
+        {"v2_to_v3_text_only_parity": checkpoint.get("parity")},
+        resolved_artifact,
+    )
+    for name in ("prediction_max_abs", "duration_max_abs"):
+        audit_value = _validated_nonnegative_max_abs(
+            v2_parity[name],
+            name=f"authorization.audit.v2_{name}",
+            maximum=1e-7,
+        )
+        if audit_value != checkpoint_parity[name]:
+            raise OrderedDecisionError(
+                "Authorized evaluator parity differs from checkpoint parity"
+            )
     if (
         not audit_path.is_file()
         or sha256_file(audit_path) != audit.get("sha256")
         or exact_zero != {name: 0.0 for name in _EXACT_ZERO_AUDITS}
-        or any(
-            float(joint.get(name, math.inf)) > 1e-7
-            for name in (
-                "joint_tuple_prediction_max_abs",
-                "joint_tuple_duration_max_abs",
-            )
-        )
-        or any(
-            float(v2_parity.get(name, math.inf)) > 1e-7
-            for name in ("prediction_max_abs", "duration_max_abs")
-        )
         or audit.get("test_data_accessed") is not False
         or audit.get("confirmation_manifest_opened") is not False
     ):
@@ -2619,12 +2726,14 @@ def _validate_diagnostic_summary_contract(
         raise OrderedDecisionError("Locked diagnostic invariant set is incomplete")
     legacy._finite_tree(invariants, path="diagnostic.exact_invariants")
     joint = dict(invariants.get("joint_tuple_vs_correct", {}) or {})
-    if (
-        joint.get("passed") is not True
-        or float(joint.get("prediction_max_abs", math.inf)) > 1e-7
-        or float(joint.get("duration_max_abs", math.inf)) > 1e-7
-    ):
+    if joint.get("passed") is not True:
         raise OrderedDecisionError("Joint-tuple selected-checkpoint audit failed")
+    for name in ("prediction_max_abs", "duration_max_abs"):
+        _validated_nonnegative_max_abs(
+            joint.get(name),
+            name=f"diagnostic.joint_tuple_vs_correct.{name}",
+            maximum=1e-7,
+        )
     for name in (
         "uniform_final_vs_off",
         "broadcast_complete_vs_off",

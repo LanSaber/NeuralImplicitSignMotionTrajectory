@@ -1,14 +1,47 @@
 # CSL-Daily Phase-A''' centered/relevance runbook
 
-Status: recovery source prepared after the first smoke attempt exposed an
-invalid non-finite diagnostic sentinel. The original immutable source commit
-`578cbb550a9e17ead6bb2111c717046f660f712c`, its accepted calibration job
-`143299`, and failed smoke job `143300` are retained as invalid-attempt
-evidence and must never authorize a full stage. The recovery must repeat the
-complete CPU gate, publish a new source-bound train-only calibration, and run
-both smoke arms under fresh `_smoke_retry1` experiment names before any full
-training. No full-stage, decision, diagnostic, confirmation, or test-set job
-has been authorized by either attempt.
+Status: second source recovery is required after the ordered decision exposed
+a runtime-parity replay plumbing defect. The first immutable source commit
+`578cbb550a9e17ead6bb2111c717046f660f712c`, accepted calibration job `143299`,
+and failed smoke job `143300` remain invalid-attempt evidence. The first
+recovery commit `5a8845057d3e3e0ebb1daf6b3fe91d981ce44820` passed the complete
+CPU gate (`143301`), train-only calibration (`143302`), and both retry1 smoke
+arms (`143303`). Its full Stage-A job `143304` completed five finite
+development validations and was scientifically infeasible, but canceled
+decision job `143319` showed that the decision helper replayed those rows
+without the trainer-injected v2 parity proof. It published no decision or
+authorization. Because decision source must equal training source, none of
+the 5a884505 artifacts may authorize Stage B even though the trained weights
+were internally coherent. The run, retained lease, and launch records were
+moved without deletion or overwrite to
+`experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1.invalid_attempts/source_5a884505_job143304_decision143319/`;
+its `ARCHIVE.json` pins the original paths and evidence hashes.
+
+The second recovery must repeat the complete CPU gate, publish a new
+source-bound train-only `_retry2` calibration, run both `_smoke_retry2` arms,
+and train Stage A afresh before any ordered decision. No diagnostic,
+confirmation, test-set job, or confirmation-spend operation has been
+authorized by any attempt.
+
+Forensic checksum anchor for the first recovery (recorded before the r2
+commit): the archive contains 16 files and the command
+`find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum`, executed
+at its root, returns
+`858dd01738858431b1d4c11c0f706a788509c6e215719be31024155962848abe`.
+The preserved job-log SHA256 values are:
+
+```text
+143301 out fc16d5da49e566f1b46f3e927c3f9148a7397e5f3bdbf71a3eb462b0c7697319
+143301 err 12caa88629b079c6c7de75c8ff743946220dbb4045edb245f8bcac1c6f188c9f
+143302 out 6c0190543b539fe8fd26ebd182d9dd628cd0b7fb65affbaa89d0b00afe30664a
+143302 err e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+143303 out cfa214cbe631cf5264a15da790ef87a4b638736c2ac05897b8c83cbb339a5215
+143303 err d8f47ad8c88519af0f4e1a8dd4a81120ac2fc08c842c5e692aad98e73598fb87
+143304 out 69f85d440fcd163118cae56eace2c669fcf5a51af04a61bd6c1fbec4014e7434
+143304 err ffa12ad16fac7b0e99728fe0e53564d3fa561646e04b9f959d06c8885c255e16
+143319 out e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+143319 err 672a8effc696e04c6732138b6c0dc8e09b24fb9e3a58109c364424ac3ea9b6c5
+```
 
 ## Immutable protocol
 
@@ -75,9 +108,11 @@ expose durable `experiments` and `deps/mt5-base`. Jobs reject a Codex worktree
 whose gitdir points to node-local storage.
 
 The retired immutable branch
-`codex/csl-daily-centered-memory-v1-run` remains fixed at `578cbb5...` as
-forensic provenance for jobs `143298`--`143300`. It must not be advanced or
-reused. Recovery uses the distinct clone and immutable branch named below.
+`codex/csl-daily-centered-memory-v1-run` remains fixed at `578cbb5...` for
+jobs `143298`--`143300`. The first recovery branch
+`codex/csl-daily-centered-memory-v1-run-r1` remains fixed at `5a884505...`
+for jobs `143301`--`143304` and canceled job `143319`. Neither may be advanced
+or reused. Second recovery uses the distinct clone and immutable branch below.
 
 The strict staging helper reads only explicit core filenames from `bank.json`
 and explicit requested `neighbors_train.npz`/`neighbors_val.npz`. It never
@@ -101,8 +136,8 @@ Do not launch until the implementation is committed and pushed and the shared
 run clone is clean.
 
 ```bash
-export PROJECT_DIR=/media/cvpr/haomian/SignTrajField_centered_run_source_r1
-export SOURCE_REMOTE_BRANCH=codex/csl-daily-centered-memory-v1-run-r1
+export PROJECT_DIR=/media/cvpr/haomian/SignTrajField_centered_run_source_r2
+export SOURCE_REMOTE_BRANCH=codex/csl-daily-centered-memory-v1-run-r2
 export GIT_CONFIG_COUNT=1
 export GIT_CONFIG_KEY_0=safe.directory
 export GIT_CONFIG_VALUE_0="$PROJECT_DIR"

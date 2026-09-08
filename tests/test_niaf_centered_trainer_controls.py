@@ -10,6 +10,9 @@ from NIAF.continuous_trajectory_field.scripts.evaluate_continuous_trajectory_fie
     _write_json_atomic,
     validate_centered_public_evaluation_scope,
 )
+from NIAF.continuous_trajectory_field.scripts import (
+    decide_centered_memory_stage as centered_decision,
+)
 
 from NIAF.continuous_trajectory_field.sentence_memory import (
     SentenceMemoryBatch,
@@ -305,6 +308,7 @@ def _paired_cfg(*, association=False):
                 "passed": True,
                 "prediction_max_abs": 0.0,
                 "duration_max_abs": 0.0,
+                "tolerance": 1e-7,
             },
         },
         "objective": {
@@ -395,6 +399,48 @@ def test_centered_mode_order_objective_identity_and_selection_gates():
     assert diagnostic["identity_utility_denominator_valid"] is False
     assert diagnostic["identity_utility_fraction"] == 0.0
     assert math.isfinite(diagnostic["identity_utility_denominator"])
+
+
+def test_ordered_replay_requires_trainer_injected_v2_parity():
+    runtime_cfg = _paired_cfg()
+    metrics = _passing_metrics()
+    score, violation, feasible, _details = checkpoint_selection_diagnostics(
+        metrics, runtime_cfg, return_details=True
+    )
+    row = {
+        "epoch": 1,
+        "validation_pending": 0.0,
+        "selection_score": score,
+        "selection_constraint_violation": violation,
+        "selection_feasible": float(feasible),
+        "early_stopping_improved": 1.0,
+        "early_stopping_bad_validation_count": 0.0,
+        "early_stopping_validation_count": 1.0,
+        "early_stopping_requested": 0.0,
+        **{f"val_{name}": value for name, value in metrics.items()},
+    }
+    replay = centered_decision._replay_selection([row], runtime_cfg)
+    assert replay["best_feasible_row"] == row
+    assert replay["details_by_epoch"][1]["dual_mode"]["v2_text_only_parity"] == {
+        "prediction_max_abs": 0.0,
+        "duration_max_abs": 0.0,
+    }
+
+    raw_cfg = copy.deepcopy(runtime_cfg)
+    raw_cfg["sentence_memory_safety"].pop("v2_to_v3_text_only_parity")
+    _score, raw_violation, raw_feasible, raw_details = checkpoint_selection_diagnostics(
+        metrics, raw_cfg, return_details=True
+    )
+    assert raw_feasible is False
+    assert raw_violation == violation + 2.0
+    assert all(
+        math.isnan(value)
+        for value in raw_details["dual_mode"]["v2_text_only_parity"].values()
+    )
+    with pytest.raises(
+        centered_decision.OrderedDecisionError, match="exact v2 parity proof"
+    ):
+        centered_decision._replay_selection([row], raw_cfg)
 
 
 def test_stage_b_architecture_identity_seals_exact_association_descriptors():
