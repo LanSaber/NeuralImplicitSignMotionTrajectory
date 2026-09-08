@@ -92,6 +92,9 @@ run clone is clean.
 ```bash
 export PROJECT_DIR=/media/cvpr/haomian/SignTrajField_centered_run_source
 export SOURCE_REMOTE_BRANCH=codex/csl-daily-centered-memory-v1-run
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=safe.directory
+export GIT_CONFIG_VALUE_0="$PROJECT_DIR"
 export SOURCE_GIT_HEAD="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
 
 sbatch --export=ALL,PROJECT_DIR,SOURCE_GIT_HEAD,SOURCE_REMOTE_BRANCH \

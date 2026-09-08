@@ -252,7 +252,10 @@ def test_full_and_smoke_slurm_resources_are_explicit():
     assert "/media/cvpr/haomian/python_envs/slt/bin/uv" in cpu
     assert "/home/cvpr" not in cpu
     assert '== "uv 0.10.0"' in cpu
+    assert 'UV_CACHE_DIR="/tmp/signtraj_centered_cpu_uv_' in cpu
     assert '--python "$PYTHON_BIN" --no-project' in cpu
+    assert 'tool run --from ruff==0.12.0 ruff check NIAF flow tests' in cpu
+    assert '"${TEST_PYTHON[@]}" -m ruff' not in cpu
     assert '"${TEST_PYTHON[@]}" -m pytest -q tests/test_*.py' in cpu
 
 
@@ -282,6 +285,8 @@ def test_runbook_gates_cpu_before_calibration_smoke_and_stage_a():
     calibration = "calibrate_csl_daily_sentence_memory_relevance_v1_sbatch.sh"
     smoke = "smoke_csl_daily_centered_memory_v1_sbatch.sh"
     stage_a = "train_csl_daily_centered_relevance_stage_a_v1_sbatch.sh"
+    assert "GIT_CONFIG_KEY_0=safe.directory" in runbook
+    assert 'GIT_CONFIG_VALUE_0="$PROJECT_DIR"' in runbook
     assert runbook.index(cpu) < runbook.index(calibration)
     assert runbook.index(calibration) < runbook.index(smoke)
     assert runbook.index(smoke) < runbook.index(stage_a)

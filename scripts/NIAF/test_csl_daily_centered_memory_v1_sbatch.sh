@@ -41,23 +41,24 @@ REMOTE_HEAD="$(git ls-remote --heads origin "refs/heads/$SOURCE_REMOTE_BRANCH" |
 export PATH="$PYTHON_ENV/bin:$PATH" PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
 export PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=""
 export WANDB=0 WANDB_MODE=disabled WANDB_DISABLED=true
+export UV_CACHE_DIR="/tmp/signtraj_centered_cpu_uv_${SLURM_JOB_ID}.${SLURM_RESTART_COUNT:-0}"
 unset WANDB_API_KEY
 
 TEST_PYTHON=("$PYTHON_BIN")
-if ! "$PYTHON_BIN" -c 'import pytest, ruff' >/dev/null 2>&1; then
-  [[ -x "$UV_BIN" ]] || {
-    echo "ERROR: SOKE lacks test tools and no executable UV_BIN was provided" >&2
-    exit 1
-  }
-  [[ "$($UV_BIN --version)" == "uv 0.10.0" ]] || {
-    echo "ERROR: CPU-gate uv version changed" >&2
-    exit 1
-  }
+[[ -x "$UV_BIN" ]] || {
+  echo "ERROR: no executable shared UV_BIN was provided" >&2
+  exit 1
+}
+[[ "$($UV_BIN --version)" == "uv 0.10.0" ]] || {
+  echo "ERROR: CPU-gate uv version changed" >&2
+  exit 1
+}
+if ! "$PYTHON_BIN" -c 'import pytest' >/dev/null 2>&1; then
   # The overlay is disposable and leaves the shared production environment
-  # untouched. Both test tools are version-pinned in the launch evidence.
+  # untouched. Pytest is version-pinned in the launch evidence.
   TEST_PYTHON=(
     "$UV_BIN" run --python "$PYTHON_BIN" --no-project
-    --with pytest==8.4.2 --with ruff==0.12.0 python
+    --with pytest==8.4.2 python
   )
 fi
 
@@ -70,7 +71,10 @@ if torch.cuda.is_available():
 print(f"pytest={pytest.__version__} torch={torch.__version__}")
 PY
 "${TEST_PYTHON[@]}" -m compileall -q NIAF flow tests
-"${TEST_PYTHON[@]}" -m ruff check NIAF flow tests
+# Invoke Ruff as its own pinned uv tool. `python -m ruff` from an ephemeral
+# multi-package overlay can retain a console-script path after uv removes the
+# temporary build directory, which caused invalid gate attempt 143292.
+"$UV_BIN" tool run --from ruff==0.12.0 ruff check NIAF flow tests
 # The explicit shell expansion is intentional: it proves tests/test_*.py, not
 # an accidentally narrower historical test_niaf_* subset, was requested.
 "${TEST_PYTHON[@]}" -m pytest -q tests/test_*.py
