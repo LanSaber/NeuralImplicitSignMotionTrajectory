@@ -20,6 +20,7 @@ PYTHON_BIN="${PYTHON_BIN:-$PYTHON_ENV/bin/python}"
 # Compute-node home directories are node-local.  Use the shared ARM64 uv
 # binary so scheduler-selected nodes all execute the same disposable overlay.
 UV_BIN="${UV_BIN:-/media/cvpr/haomian/python_envs/slt/bin/uv}"
+CENTERED_LINT_BASE="96fc62aa12e1c6b690a564dd7f97bbd9670006d0"
 
 [[ -n "${SLURM_JOB_ID:-}" && "${SLURM_NNODES:-0}" == "1" ]] || {
   echo "ERROR: CPU gate requires one Slurm node" >&2; exit 1;
@@ -74,7 +75,26 @@ PY
 # Invoke Ruff as its own pinned uv tool. `python -m ruff` from an ephemeral
 # multi-package overlay can retain a console-script path after uv removes the
 # temporary build directory, which caused invalid gate attempt 143292.
-"$UV_BIN" tool run --from ruff==0.12.0 ruff check NIAF flow tests
+# Lint the complete experiment diff against its immutable pre-implementation
+# base. Repository-wide lint is not a clean baseline (invalid attempt 143293
+# found 23 pre-existing F401/F403/F405 findings in untouched legacy modules),
+# while compileall and the complete test suite below remain repository-wide.
+git cat-file -e "${CENTERED_LINT_BASE}^{commit}"
+git merge-base --is-ancestor "$CENTERED_LINT_BASE" "$SOURCE_GIT_HEAD"
+mapfile -t CENTERED_RUFF_FILES < <(
+  git diff --name-only --diff-filter=ACM "$CENTERED_LINT_BASE" "$SOURCE_GIT_HEAD" -- '*.py'
+)
+[[ "${#CENTERED_RUFF_FILES[@]}" -gt 0 ]] || {
+  echo "ERROR: centered implementation lint scope is unexpectedly empty" >&2
+  exit 1
+}
+for file in "${CENTERED_RUFF_FILES[@]}"; do
+  [[ -f "$file" && ! -L "$file" ]] || {
+    echo "ERROR: centered Ruff input is missing or a symlink: $file" >&2
+    exit 1
+  }
+done
+"$UV_BIN" tool run --from ruff==0.12.0 ruff check "${CENTERED_RUFF_FILES[@]}"
 # The explicit shell expansion is intentional: it proves tests/test_*.py, not
 # an accidentally narrower historical test_niaf_* subset, was requested.
 "${TEST_PYTHON[@]}" -m pytest -q tests/test_*.py

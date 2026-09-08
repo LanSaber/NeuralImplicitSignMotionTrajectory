@@ -254,7 +254,11 @@ def test_full_and_smoke_slurm_resources_are_explicit():
     assert '== "uv 0.10.0"' in cpu
     assert 'UV_CACHE_DIR="/tmp/signtraj_centered_cpu_uv_' in cpu
     assert '--python "$PYTHON_BIN" --no-project' in cpu
-    assert 'tool run --from ruff==0.12.0 ruff check NIAF flow tests' in cpu
+    assert 'CENTERED_LINT_BASE="96fc62aa12e1c6b690a564dd7f97bbd9670006d0"' in cpu
+    assert 'git merge-base --is-ancestor "$CENTERED_LINT_BASE" "$SOURCE_GIT_HEAD"' in cpu
+    assert 'git diff --name-only --diff-filter=ACM "$CENTERED_LINT_BASE"' in cpu
+    assert 'tool run --from ruff==0.12.0 ruff check "${CENTERED_RUFF_FILES[@]}"' in cpu
+    assert "invalid attempt 143293" in cpu
     assert '"${TEST_PYTHON[@]}" -m ruff' not in cpu
     assert '"${TEST_PYTHON[@]}" -m pytest -q tests/test_*.py' in cpu
 
