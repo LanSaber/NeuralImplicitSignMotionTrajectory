@@ -69,7 +69,7 @@ EXPERIMENTS = {
     ),
 }
 LEASE_EXPERIMENTS = {
-    CALIBRATION_STAGE: "csl_daily_sentence_memory_relevance_calibration_v1_retry2",
+    CALIBRATION_STAGE: "csl_daily_sentence_memory_relevance_calibration_v1_retry3",
     **EXPERIMENTS,
 }
 STAGE1_EVAL_MODES = (
@@ -128,7 +128,7 @@ def _calibration_directory(cfg: Mapping[str, Any]) -> Path:
         directory = SOURCE_ROOT / directory
     expected = SOURCE_ROOT / (
         "experiments/NIAF/continuous_trajectory_field/"
-        "csl_daily_sentence_memory_relevance_calibration_v1_retry2"
+        "csl_daily_sentence_memory_relevance_calibration_v1_retry3"
     )
     if directory.resolve() != expected.resolve():
         raise OrderedDecisionError(
@@ -1170,11 +1170,12 @@ def _load_dev_export(*args: Any, **kwargs: Any) -> dict[str, Any]:
         )
         stage = STAGE1 if config_path.stem == EXPERIMENTS[STAGE1] else STAGE2
         cfg = validate_config(stage, config_path)
-        if (
-            summary.get("sentence_memory_relevance_calibration_identity")
-            != cfg["sentence_memory"]["resolved_relevance_calibration_identity"]
-        ):
-            raise OrderedDecisionError("Centered export calibration identity changed")
+        _validate_centered_export_calibration_identity(
+            summary,
+            expected=cfg["sentence_memory"][
+                "resolved_relevance_calibration_identity"
+            ],
+        )
     if (
         legacy._resolve_existing(summary.get("checkpoint"), directory)
         != checkpoint_path
@@ -1234,6 +1235,24 @@ def _load_dev_export(*args: Any, **kwargs: Any) -> dict[str, Any]:
         "rows": rows,
         "durations": durations,
     }
+
+
+def _validate_centered_export_calibration_identity(
+    summary: Mapping[str, Any], *, expected: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Require both centered export identity fields to match exactly."""
+
+    expected = dict(expected)
+    top_level = summary.get("sentence_memory_relevance_calibration_identity")
+    checkpoint_identities = summary.get("sentence_memory_checkpoint_identities")
+    nested = (
+        checkpoint_identities.get("relevance_calibration")
+        if isinstance(checkpoint_identities, Mapping)
+        else None
+    )
+    if top_level != expected or nested != expected or top_level != nested:
+        raise OrderedDecisionError("Centered export calibration identity changed")
+    return expected
 
 
 def _augment_calibration_identity(

@@ -1,7 +1,7 @@
 # CSL-Daily Phase-A''' centered/relevance runbook
 
-Status: second source recovery is required after the ordered decision exposed
-a runtime-parity replay plumbing defect. The first immutable source commit
+Status: third source recovery is required after the second ordered decision
+exposed a centered-export provenance schema mismatch. The first immutable source commit
 `578cbb550a9e17ead6bb2111c717046f660f712c`, accepted calibration job `143299`,
 and failed smoke job `143300` remain invalid-attempt evidence. The first
 recovery commit `5a8845057d3e3e0ebb1daf6b3fe91d981ce44820` passed the complete
@@ -17,8 +17,25 @@ moved without deletion or overwrite to
 `experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1.invalid_attempts/source_5a884505_job143304_decision143319/`;
 its `ARCHIVE.json` pins the original paths and evidence hashes.
 
-The second recovery must repeat the complete CPU gate, publish a new
-source-bound train-only `_retry2` calibration, run both `_smoke_retry2` arms,
+The second recovery commit
+`cacd362ed90c080e0965d0e457a64c6b9d94f5ca` passed the complete CPU gate
+(`143332`), source-bound train-only retry2 calibration (`143339`), and both
+retry2 smoke arms (`143344`). Its fresh Stage-A job `143353` reproduced five
+finite development validations and was scientifically infeasible. The fixed
+selection replay then passed exactly in ordered decision job `143367`, and its
+complete selected-checkpoint audit passed every parity and exact-invariant
+gate. However, the exporter placed the correct relevance-calibration identity
+only under `sentence_memory_checkpoint_identities.relevance_calibration`,
+while the decision reader required the same proof at top level. The decision
+therefore failed closed with `Centered export calibration identity changed`
+and published only nonterminal integrity-invalid evidence `82933329...`; it
+created no canonical decision or authorization. The complete r2 run,
+development-only exports, and both retained failed-job leases were moved
+without deletion or overwrite to
+`experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1.invalid_attempts/source_cacd362_job143353_decision143367/`.
+
+The third recovery must repeat the complete CPU gate, publish a new
+source-bound train-only `_retry3` calibration, run both `_smoke_retry3` arms,
 and train Stage A afresh before any ordered decision. No diagnostic,
 confirmation, test-set job, or confirmation-spend operation has been
 authorized by any attempt.
@@ -41,6 +58,28 @@ The preserved job-log SHA256 values are:
 143304 err ffa12ad16fac7b0e99728fe0e53564d3fa561646e04b9f959d06c8885c255e16
 143319 out e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 143319 err 672a8effc696e04c6732138b6c0dc8e09b24fb9e3a58109c364424ac3ea9b6c5
+```
+
+Forensic checksum anchor for the second recovery (recorded before the r3
+commit): its archive contains 2,113 files totaling 1,407,774,082 bytes. The
+same full-tree checksum command, executed at that archive root, returns
+`256c414c588f797e7207e6aacdf3aa394322ef445b37927c9a03d7525b02ee44`.
+Its `ARCHIVE.json` pins the selected/last checkpoints, training and decision
+attempts and leases, complete selected-checkpoint audit, all three dev export
+summaries, retry2 calibration/smoke evidence, and the integrity-invalid
+decision. The preserved r2 job-log SHA256 values are:
+
+```text
+143332 out f19db4aab7cc1368e87273010df84c047e2ab3585a27ffaa40e5dc32b7b6257b
+143332 err b062a1de51e755800ae81453b9349e89dbd9e6fb226b193bfcd7f209d112290c
+143339 out 762c1920d70230d73d7190a4be33e5c72ac1f3805fe8db2cd3859cdbf5589a57
+143339 err e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+143344 out ed652f1bd007f71bfa29b2103779fd8a81fa30cb567c041db7106cd31f9ad4cf
+143344 err e61b6a1efbf4144df309ee77fd4bc4ed51e0a02fa2cf37bc8ecd29ddcb14df35
+143353 out ddc457fde38e5c5ed3de22b5cd4ce27f49b0b3e683a0a3a14e0076127ca8cf0b
+143353 err 328e5c312da3374b9fa48c726a535a560e3dac2def6953b6729e47838bd6ee80
+143367 out 5f59f3c374adc83ab6108469755a3e5f424d3e6dad8fee97346a16a625373ef3
+143367 err d83ad2811a58b8350a9a8d6f7fb684a38c4e834a168604977b344fd373f1e321
 ```
 
 ## Immutable protocol
@@ -111,8 +150,11 @@ The retired immutable branch
 `codex/csl-daily-centered-memory-v1-run` remains fixed at `578cbb5...` for
 jobs `143298`--`143300`. The first recovery branch
 `codex/csl-daily-centered-memory-v1-run-r1` remains fixed at `5a884505...`
-for jobs `143301`--`143304` and canceled job `143319`. Neither may be advanced
-or reused. Second recovery uses the distinct clone and immutable branch below.
+for jobs `143301`--`143304` and canceled job `143319`. The second recovery
+branch `codex/csl-daily-centered-memory-v1-run-r2` remains fixed at
+`cacd362e...` for jobs `143332`, `143339`, `143344`, `143353`, and `143367`.
+None of these branches may be advanced or reused. Third recovery uses the
+distinct clone and immutable branch below.
 
 The strict staging helper reads only explicit core filenames from `bank.json`
 and explicit requested `neighbors_train.npz`/`neighbors_val.npz`. It never
@@ -136,8 +178,8 @@ Do not launch until the implementation is committed and pushed and the shared
 run clone is clean.
 
 ```bash
-export PROJECT_DIR=/media/cvpr/haomian/SignTrajField_centered_run_source_r2
-export SOURCE_REMOTE_BRANCH=codex/csl-daily-centered-memory-v1-run-r2
+export PROJECT_DIR=/media/cvpr/haomian/SignTrajField_centered_run_source_r3
+export SOURCE_REMOTE_BRANCH=codex/csl-daily-centered-memory-v1-run-r3
 export GIT_CONFIG_COUNT=1
 export GIT_CONFIG_KEY_0=safe.directory
 export GIT_CONFIG_VALUE_0="$PROJECT_DIR"

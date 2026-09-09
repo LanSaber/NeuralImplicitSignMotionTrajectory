@@ -18,7 +18,7 @@ SOURCE_GIT_HEAD="${SOURCE_GIT_HEAD:?Set SOURCE_GIT_HEAD to the clean pushed comm
 PYTHON_ENV="${PYTHON_ENV:-/media/cvpr/haomian/python_envs/SOKE}"
 PYTHON_BIN="${PYTHON_BIN:-$PYTHON_ENV/bin/python}"
 SOURCE_BANK="${SENTENCE_MEMORY_DIR:-/media/cvpr/haomian/data/SOKE_FLOW/csl_daily_upper_smplx/meta/niaf_sentence_memory/mt5_vae_mu_train_v1}"
-CANONICAL_CALIBRATION_OUT="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_v1_retry2"
+CANONICAL_CALIBRATION_OUT="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_v1_retry3"
 if [[ -n "${CALIBRATION_OUT:-}" && "$CALIBRATION_OUT" != "$CANONICAL_CALIBRATION_OUT" ]]; then
   echo "ERROR: calibration forbids a noncanonical output path" >&2
   exit 1

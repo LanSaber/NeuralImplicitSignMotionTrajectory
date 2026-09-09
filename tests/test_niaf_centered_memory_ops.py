@@ -28,7 +28,7 @@ GLOBAL_SPEND = (
     "csl_daily_signtrajfield_v3_sentence_memory_phase_a_factorized_ordered_v1_control/"
     "confirmation_holdout_spent.json"
 )
-CALIBRATION_RETRY = "csl_daily_sentence_memory_relevance_calibration_v1_retry2"
+CALIBRATION_RETRY = "csl_daily_sentence_memory_relevance_calibration_v1_retry3"
 STAGE_A_MODES = [
     "off",
     "on",
@@ -163,8 +163,9 @@ def test_recovery_calibration_path_is_consistent_and_source_bound():
     runbook = (
         ROOT / "docs/NIAF/continuous_trajectory_field/phase_a_centered_relevance_v1.md"
     ).read_text(encoding="utf-8")
-    assert "SignTrajField_centered_run_source_r2" in runbook
-    assert "codex/csl-daily-centered-memory-v1-run-r2" in runbook
+    assert "SignTrajField_centered_run_source_r3" in runbook
+    assert "codex/csl-daily-centered-memory-v1-run-r3" in runbook
+    assert "source_cacd362_job143353_decision143367" in runbook
     assert "source_5a884505_job143304_decision143319" in runbook
 
 
@@ -423,10 +424,10 @@ def test_full_and_smoke_slurm_resources_are_explicit():
     assert "MAX_TRAIN_BATCHES=2" in smoke
     assert 'global_step", -1)) != 1' in smoke
     assert smoke.count("run_arm csl_daily_signtrajfield_v3") == 2
-    assert smoke.count("_smoke_retry2") == 3
-    assert "decision replay incident 143319" in (
+    assert smoke.count("_smoke_retry3") == 3
+    assert "export identity incident 143367" in (
         CONFIG_DIR
-        / f"{STAGE_A}_smoke_retry2.yaml"
+        / f"{STAGE_A}_smoke_retry3.yaml"
     ).read_text(encoding="utf-8")
     cpu = _source("test_csl_daily_centered_memory_v1_sbatch.sh")
     assert "pytest==8.4.2" in cpu and "ruff==0.12.0" in cpu
@@ -541,6 +542,188 @@ def _load_ordered_isolated():
 
 def _ordered_helper():
     return _load_ordered_isolated()[0]
+
+
+def test_centered_export_calibration_identity_is_dual_bound(tmp_path):
+    from NIAF.continuous_trajectory_field.scripts.export_continuous_trajectory import (
+        centered_checkpoint_export_identity_fields,
+    )
+
+    ordered = _ordered_helper()
+    calibration = {
+        "schema_name": "signtrajfield_sentence_memory_relevance_calibration",
+        "schema_version": 1,
+        "artifact_identity": "a" * 64,
+        "digest": "b" * 64,
+    }
+    checkpoint = {
+        "sentence_memory_relevance_calibration_identity": calibration,
+        **{
+            f"sentence_memory_{name}_identity": {"digest": name}
+            for name in (
+                "architecture",
+                "behavior",
+                "objective",
+                "resume",
+                "evaluation_control",
+                "selection_aggregation",
+                "validation_corruption_map",
+            )
+        },
+    }
+    cfg = {
+        "sentence_memory": {
+            "resolved_relevance_calibration_identity": calibration,
+        }
+    }
+
+    checkpoint_path = tmp_path / "best.pt"
+    checkpoint_path.write_bytes(b"checkpoint")
+    config_path = tmp_path / f"{ordered.EXPERIMENTS[ordered.STAGE1]}.yaml"
+    config_path.write_text("experiment: centered\n", encoding="utf-8")
+    manifest_path = tmp_path / "manifest_development.jsonl"
+    manifest_path.write_text("sealed development fixture\n", encoding="utf-8")
+    manifest_sha256 = ordered.sha256_file(manifest_path)
+    rows = [
+        {
+            "name": f"sample-{index:03d}",
+            "text": f"development text {index:03d}",
+            "predicted_duration_seconds": 1.0,
+        }
+        for index in range(ordered.legacy.EXPECTED_DEVELOPMENT_ROWS)
+    ]
+    directory = tmp_path / "centered_off"
+    directory.mkdir()
+
+    # Exercise the same constructor used by the real centered exporter, then
+    # pass the complete serialized summary through the ordered decision loader.
+    summary = {
+        "split": "val",
+        "length_mode": "predicted",
+        "word_prior_mode": "off",
+        "sentence_memory_mode": "off",
+        "sentence_memory_evaluation_corruption": ordered.EVALUATION_CORRUPTION,
+        "sentence_memory_query_binding": {"bound": True},
+        "checkpoint": str(checkpoint_path),
+        "config": str(config_path),
+        "manifest": {
+            "canonical_source_manifest": None,
+            "canonical_sample_count": None,
+            "is_complete_canonical_manifest": None,
+            "is_canonical_order": None,
+            "canonical_manifest_inspection": (
+                "forbidden_isolated_explicit_manifest_v1"
+            ),
+            "query_manifest_authority": (
+                "config_pinned_development_manifest_v1"
+            ),
+            "dataset_manifest_sha256": manifest_sha256,
+            "sealed_partition_artifact_identity": (
+                ordered.legacy.EXPECTED_PARTITION_ARTIFACT_IDENTITY
+            ),
+            "dataset_manifest": str(manifest_path),
+            "output_manifest": str(manifest_path),
+        },
+        "rows": rows,
+        **centered_checkpoint_export_identity_fields(checkpoint, cfg),
+    }
+    assert summary["sentence_memory_relevance_calibration_identity"] == calibration
+    assert summary["sentence_memory_checkpoint_identities"][
+        "relevance_calibration"
+    ] == calibration
+    partition = {
+        "development_manifest": manifest_path,
+        "development_manifest_sha256": manifest_sha256,
+        "rows": rows,
+    }
+
+    def load(candidate):
+        (directory / "export_summary.json").write_text(
+            json.dumps(candidate), encoding="utf-8"
+        )
+        return ordered._load_dev_export(
+            directory,
+            expected_mode="off",
+            checkpoint_path=checkpoint_path,
+            config_path=config_path,
+            partition=partition,
+        )
+
+    with (
+        patch.object(ordered, "validate_config", return_value=cfg),
+        patch.object(
+            ordered.legacy,
+            "validate_factorized_export_query_binding",
+            return_value={"bound": True},
+        ),
+    ):
+        assert load(summary)["summary"] == summary
+
+        broken_summaries = []
+        for missing in (
+            "sentence_memory_relevance_calibration_identity",
+            "sentence_memory_checkpoint_identities",
+        ):
+            broken = json.loads(json.dumps(summary))
+            broken.pop(missing)
+            broken_summaries.append(broken)
+        broken = json.loads(json.dumps(summary))
+        broken["sentence_memory_relevance_calibration_identity"]["digest"] = (
+            "c" * 64
+        )
+        broken_summaries.append(broken)
+        broken = json.loads(json.dumps(summary))
+        broken["sentence_memory_checkpoint_identities"]["relevance_calibration"][
+            "digest"
+        ] = "c" * 64
+        broken_summaries.append(broken)
+        for broken in broken_summaries:
+            with pytest.raises(
+                ordered.OrderedDecisionError, match="calibration identity changed"
+            ):
+                load(broken)
+
+    mismatched_checkpoint = json.loads(json.dumps(checkpoint))
+    mismatched_checkpoint["sentence_memory_relevance_calibration_identity"][
+        "digest"
+    ] = "c" * 64
+    with pytest.raises(RuntimeError, match="differs from the resolved config"):
+        centered_checkpoint_export_identity_fields(mismatched_checkpoint, cfg)
+
+
+def test_v2_development_export_exempts_centered_calibration_identity(tmp_path):
+    ordered = _ordered_helper()
+    directory = tmp_path / "v2_off"
+    directory.mkdir()
+    summary = {
+        "split": "val",
+        "length_mode": "predicted",
+        "word_prior_mode": "off",
+        "sentence_memory_mode": "not_applicable",
+    }
+    (directory / "export_summary.json").write_text(
+        json.dumps(summary), encoding="utf-8"
+    )
+
+    class ReachedCheckpointBinding(RuntimeError):
+        pass
+
+    with (
+        patch.object(
+            ordered.legacy,
+            "_resolve_existing",
+            side_effect=ReachedCheckpointBinding,
+        ),
+        pytest.raises(ReachedCheckpointBinding),
+    ):
+        ordered._load_dev_export(
+            directory,
+            expected_mode="not_applicable",
+            checkpoint_path=tmp_path / "v2.pt",
+            config_path=tmp_path / "v2.yaml",
+            partition={},
+            require_factorized_control=False,
+        )
 
 
 def test_importing_centered_helper_never_mutates_legacy_module():

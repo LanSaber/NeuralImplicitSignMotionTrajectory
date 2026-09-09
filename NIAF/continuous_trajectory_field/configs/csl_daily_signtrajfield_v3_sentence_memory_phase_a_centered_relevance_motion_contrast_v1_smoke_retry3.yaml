@@ -1,0 +1,16 @@
+_base_: csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1.yaml
+
+# Engineering-only source recovery after export identity incident 143367.
+# The prior retry2 smoke remains immutable and cannot authorize this source.
+experiment_name: csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1_smoke_retry3
+
+train:
+  epochs: 1
+  early_stopping_patience: 0
+  early_stopping_min_epochs: 1
+
+selection:
+  require_feasible: false
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1_smoke_retry3

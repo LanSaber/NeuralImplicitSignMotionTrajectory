@@ -14,7 +14,7 @@ sentence_memory:
   temporal_prior_sigma: 0.25
   temporal_prior_scale: 1.0
   relevance_calibration:
-    artifact_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_v1_retry2
+    artifact_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_v1_retry3
     schema_name: signtrajfield_sentence_memory_relevance_calibration
     schema_version: 1
     minimum_heldout_auroc: 0.75

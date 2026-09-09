@@ -94,6 +94,42 @@ CENTERED_EXPORT_MODES = (
 )
 
 
+def centered_checkpoint_export_identity_fields(checkpoint, cfg):
+    """Return the dual-bound checkpoint identities for a centered export."""
+
+    resolved_calibration = cfg.get("sentence_memory", {}).get(
+        "resolved_relevance_calibration_identity"
+    )
+    checkpoint_calibration = checkpoint.get(
+        "sentence_memory_relevance_calibration_identity"
+    )
+    if (
+        not isinstance(resolved_calibration, dict)
+        or checkpoint_calibration != resolved_calibration
+    ):
+        raise RuntimeError(
+            "Centered export checkpoint relevance calibration differs from "
+            "the resolved config"
+        )
+    checkpoint_identities = {
+        name: checkpoint.get(f"sentence_memory_{name}_identity")
+        for name in (
+            "architecture",
+            "behavior",
+            "objective",
+            "resume",
+            "evaluation_control",
+            "selection_aggregation",
+            "validation_corruption_map",
+        )
+    }
+    checkpoint_identities["relevance_calibration"] = checkpoint_calibration
+    return {
+        "sentence_memory_relevance_calibration_identity": resolved_calibration,
+        "sentence_memory_checkpoint_identities": checkpoint_identities,
+    }
+
+
 def _validated_sha256(value, *, label):
     value = str(value or "").lower()
     if len(value) != 64 or any(
@@ -1869,22 +1905,7 @@ def main():
         "rows": rows,
     }
     if centered_sentence_memory_enabled(cfg):
-        summary["sentence_memory_checkpoint_identities"] = {
-            name: checkpoint.get(f"sentence_memory_{name}_identity")
-            for name in (
-                "architecture",
-                "behavior",
-                "objective",
-                "resume",
-                "evaluation_control",
-                "selection_aggregation",
-                "validation_corruption_map",
-            )
-        } | {
-            "relevance_calibration": checkpoint.get(
-                "sentence_memory_relevance_calibration_identity"
-            )
-        }
+        summary.update(centered_checkpoint_export_identity_fields(checkpoint, cfg))
     (out_dir / "export_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )
