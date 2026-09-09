@@ -5,7 +5,7 @@ runs. Read it before answering an unqualified question such as "What is the
 current training progress?" The scheduler and logs remain the source of truth
 for live state; this registry determines **which run** the question refers to.
 
-Last observed: **2026-09-08 05:02 Asia/Dubai (UTC+04:00)**
+Last observed: **2026-09-09 15:28 Asia/Dubai (UTC+04:00)**
 
 ## Default run resolution
 
@@ -19,7 +19,7 @@ has the highest Slurm job ID or is already in the `RUNNING` state.
 Dataset-qualified requests override that default: "the How2Sign training"
 refers to `how2sign-signtrajfield-v2-full-20260807`, and "the CSL-Daily
 training" refers to
-`csl-daily-signtrajfield-rag-v3-phase-a-factorized-memory-v1-20260908`.
+`csl-daily-signtrajfield-rag-v3-phase-a-centered-absolute-binding-v1-20260909`.
 
 ## Active prerequisite artifact jobs (not training)
 
@@ -84,7 +84,50 @@ logs/sbatch/csl_rag_neighbors_142745.out
 logs/sbatch/csl_rag_neighbors_142745.err
 ```
 
-## Latest completed CSL-Daily: Phase-A'' factorized-memory experiment
+## Latest completed CSL-Daily: Phase-A''' centered-evidence and absolute-binding experiment
+
+| Field | Value |
+|---|---|
+| Alias | `csl-daily-signtrajfield-rag-v3-phase-a-centered-absolute-binding-v1-20260909` |
+| State | **Ordered protocol complete; stopped by the Stage-B development gate and not deployable.** Stage A and Stage B were integrity-valid but scientifically infeasible. Neither stage produced `best.pt`; no locked diagnostic, confirmation, checkpoint promotion, test evaluation, Phase B, or further adaptive stage was authorized |
+| Ordered arms | Stage A used per-layer/head/slot/part centered candidate-motion covariance values plus a frozen absolute relevance gate. Stage B added absolute candidate text-motion association with balanced BCE and symmetric multi-positive InfoNCE, but started independently from v2 and never loaded Stage-A weights or optimizer state. Both stages removed the Gaussian temporal prior |
+| Dataset and controls | Full 18,399-row training set, `K=8`, top-M 64, seed 1234, candidate dropout 0.10, 90% motion-only and 10% full corruption. Selection used 256 equal-weight normalized-text development clusters/347 signer rows. Partition digest `80f9f5e9fe8414d66730ff0f19bd95fa9f8156922b7cd6f14f27b182cae7d74e`; fixed control-map digest `5142f61a2e21d407cdfd9516440b7048c732ab4b7d872f9c666db3d56f437c31` |
+| Source | Clean standalone clone `/media/cvpr/haomian/SignTrajField_centered_run_source_r3`, immutable branch `origin/codex/csl-daily-centered-memory-v1-run-r3`, commit `191b5c28515bff446926185ac965bbe6e8701e93`. Local and live origin heads were equal before, during, and after all eligible jobs; the immutable branch was not advanced by this registry update |
+| Relevance calibration | CPU-only Slurm `143376` completed and published accepted train-only retry3 artifact identity `668694ff012a5b71bedeab42a8139b7a95014b9b790ec8d44514cdd50cac933d`. Held-out AUROC `0.9817280587`; positive-minus-negative probability gap `0.7923572567`; `a=68.17342257577045`, `b=0.8278962850773125`. Calibration/map/READY SHA256 `aa98927325147956d68caa0a66979d8d64a746b8812899d15e90cf4f09755775` / `948a7c2f7a8ec8fdbcfa8a9c130e665adfdf7615b8908cc31324b77c15e61411` / `e9da4d8240092c54121a733fd466aa6f0822802fad639b1eed10d50e20e5c394` |
+| Engineering gates | Export-identity focused Slurm `143374`: **22 passed**. Complete CPU Slurm `143375`: compileall and Ruff passed; all 30 `tests/test_*.py` files passed, **387 passed**, 13 warnings. Sequential one-GPU smoke `143377` completed both fresh-v2 arms for exactly one optimizer step, with 10/11 modes, finite state and Stage-B association gradients, frozen base, exact parity/invariants, train/validation-only staging, and W&B disabled |
+| Initialization | Each full stage strictly imported frozen v2 SHA256 `06ca0a2613005b6e3949bab0e5d7ded999b212723debd3e7685a58c077e44c54`, reset optimizer/epoch state, and preserved exact memory-off prediction and duration parity. Stage A exposed 59 trainable sentence-memory tensors; Stage B exposed 62; the inherited 171 base/planner tensors remained bitwise unchanged |
+| Stage-A training | Slurm `143380`, four nodes/GPUs, 16 CPUs and 100 GiB per node, finished five development validations/global step 360 and early-stopped at patience two. Scheduler `FAILED/143` is the intentional fail-closed `require_feasible` exit, not a CUDA, NCCL, OOM, numerical, or staging failure. Launch identity `0b1b9a8c089f88d9128027016cd5bb1ea7b39d3a67d5b5ab76c7dda2a078d97e`; config SHA256 `c5497e6a912261a00c48dd1fa3174305bf66c83212e25e9fbc93cad629273763`; authenticated failed-training lease claim `e588e1801b42148074b90970b42e60ea2edbb5a9fefee97c39208f498595cbb8` remains retained |
+| Stage-A selected checkpoint | `best_infeasible.pt`, epoch 3/global step 216, SHA256 `39a66ba0422ad5be1ccf2745ea7464d3c43894f3cc7c53c0a83e0dffcd979cb6`; metrics SHA256 `2aeaf86de44cac053f9c5bf2ac37364820b675cb266ba80809339d9733c5d210`; selection-summary SHA256 `3c518eb472ff857f04dd2e151731c235bbb85cd81004138774a9eee36612f679`. It is audit-only and non-promotable |
+| Stage-A decision | Slurm `143395` completed the full selected-checkpoint replay and three 347-row predicted-duration integrity exports. Canonical path `experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1/evaluation/ordered_development_decision`; status `valid_infeasible`; decision identity `12c4fd20233f218422b36d977829cca5957c7c35c4a4e6be4aceec178642e837`; decision/READY SHA256 `73bcec6eab500588875edaf0f74661d1b2aa8548b79e5d3928403f78f29f3104` / `cd0fe2a9c4e7db59b9fbabb9c331ae7c226f0157de5e78014c6995a6543af020` |
+| Stage-A science | Correct/text-only/mean-derangement/cross-query/full composite `12.6233378644 / 12.7318543089 / 12.6255987817 / 12.6262668752 / 12.6917002527`. Correct improved text-only by 0.8523% and full replacement by 0.5386%, but mean derangements by only **0.0179%** and cross-query motion by **0.0232%**, below 0.25%; `Rpair=0.1215702175`; identity utility `0.0208347904` |
+| Stage-B authorization | Stage A emitted only `authorize_stage2.json`, authorization identity `ecca886ee2252a0db74f8ca8c404100cb1ea2fa8690f5e1e36bb68cc5e654d15`, file SHA256 `81978bc51af76741f9330010036e4c55e93bc219c6d8a0bfeb7f4397901c4b3a`. Stage-B fresh-v2 ordered-input identity `7a196496561c32df8ba1a71257775c31b20c75cad2944f200f7baee22facab57` preserved that predecessor chain |
+| Stage-B training | Slurm `143400`, same four-node envelope, completed all six validation events/global step 432, then returned the intentional no-feasible `FAILED/143`. Launch identity `59a0015755ed927f506b0e6785b779092f56578317365cac7212c99b76d8d029`; config SHA256 `7741da46d37a4b77f481663f25fa580281f6d29de6c2616baebcc30dac59b85e`; retained authenticated lease claim `3868b9018b8ddfb7f08ecf85dd0ac3e4cebba138ef4f29b0eb165a73aec66a7d` |
+| Stage-B selected checkpoint | `best_infeasible.pt`, epoch 5/global step 360, SHA256 `b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202`; metrics SHA256 `9171e1e65ceb57c6b291cf24825eb934bcfd4983f7d822fe01e56af33e4c9b10`; selection-summary SHA256 `41b5bcb5eeece4132f1c576399232010ac00e6c0fec168327d2c9d03095cd561`. It is audit-only and non-promotable |
+| Stage-B decision | Slurm `143427` completed all integrity work at `experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1/evaluation/ordered_development_decision` and wrote canonical `valid_infeasible`, `integrity_valid=true`, `development_feasible=false`, and `authorized_purpose=null`. Decision identity `7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69`; decision/READY SHA256 `8993f4d7ae61d2ecd2bc41d523c45ab55073c63a061ce24629a564627724f8c5` / `fdc8e0823ccd2b3f769b5fdf31cb21098cf719a542cd9556546ee91fa174cfde` |
+| Stage-B science | Correct/text-only/mean-derangement/cross-query/full composite `12.6293070649 / 12.7318543089 / 12.6497460611 / 12.6726873684 / 12.6987959243`. `Rpair=0.4059177979`; all nonces favored correct; matching top-1 `0.4660644531`. The mean-derangement gain was only **0.1616%**, identity utility `0.1993129743`, and true-minus-best-negative association margin `-0.0091593001`, so all three required gates failed |
+| Integrity identities | Stage-A/Stage-B architecture digests `a41da52ab3005f55f4c428926813cb6ff4244cb5c84f7764281d0e8e539c4c62` / `bc69fd35ac58e10bc894460c35175f13356b79416df40e8c57156b1929614236`; objective digests `8267d7875a277e9b9ffcc7fc4e4d04e0db3f11565e6a251f987a80db33680821` / `9180692d6585b0e4e508b0456e1d3562144db21742bab6b84c6570779300d484`; shared evaluation-control `359315546b1fe4a2542d66ee784d30d5ed222e01dcd832eb00402cd57f915743`; selection aggregation `cd5754faf3a45267452c0245589f1a57b9ab30cdb8773e40154be797cddca50f` |
+| Exact invariants and isolation | Every selected-checkpoint audit reported exact zero for uniform-final, broadcast-complete, all-null, joint-tuple, and v2 prediction/duration deltas, with all-null gate/candidate mass zero and null mass one. Eligible jobs staged only train and validation neighbor tables, with test absent before provider construction; all decision flags say `test_data_accessed=false` and `confirmation_manifest_opened=false`; W&B was disabled. Calibration and ordered-decision leases were released into immutable history; the two no-feasible training leases remain intentionally retained |
+| Recovery history | The initial source/smoke incident at `578cbb5`, parity-replay recovery archive `source_5a884505_job143304_decision143319`, and export-schema recovery archive `source_cacd362_job143353_decision143367` remain preserved and documented in the runbook. None authorized Stage B or confirmation; the final r3 protocol restarted calibration, smoke, and Stage A fresh |
+| Final scientific decision | Centering successfully removed the uniform candidate-average carrier and absolute association substantially increased causal sensitivity (`Rpair` from 0.1216 to 0.4059) and matching accuracy. It still failed to turn enough of the generic memory benefit into correct identity-specific motion utility. Per the predeclared rule, **stop after Stage B**; do not weaken gates, promote either `best_infeasible.pt`, open confirmation/test, run the locked diagnostic, begin Phase B, or launch another adaptive stage |
+| Outputs | Stage A: `experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_relevance_motion_contrast_v1`; Stage B: `experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1`; calibration: `experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_v1_retry3` |
+| Confirmation/test/diagnostic status | No `authorize_diagnostic.json` or `authorize_confirmation.json` exists. The global confirmation-spend marker remains absent; no confirmation export/analysis, diagnostic, test evaluation, promotion, or Phase-B job was run |
+| Runbook | `docs/NIAF/continuous_trajectory_field/phase_a_centered_relevance_v1.md` |
+| Default alias | Unchanged |
+
+Terminal logs:
+
+```text
+logs/sbatch/csl_r3_fix_143374.out
+logs/sbatch/csl_centered_cpu_143375.out
+logs/sbatch/csl-rel-cal-v1_143376.out
+logs/sbatch/csl_centered_smoke_143377.out
+logs/sbatch/csl_centered_a_143380.out
+logs/sbatch/csl_centered_decide_143395.out
+logs/sbatch/csl_centered_b_143400.out
+logs/sbatch/csl_centered_decide_143427.out
+```
+
+## Previous completed CSL-Daily: Phase-A'' factorized-memory experiment
 
 | Field | Value |
 |---|---|
