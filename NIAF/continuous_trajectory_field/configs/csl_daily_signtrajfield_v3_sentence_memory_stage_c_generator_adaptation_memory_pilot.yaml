@@ -1,0 +1,94 @@
+_base_: csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1.yaml
+
+# Exploratory, development-only Stage C.  This arm adapts only the approved
+# generator prefixes while consuming the frozen Stage-B sentence memory under
+# the same 25% training dropout used by Phase B.  It cannot authorize a
+# confirmation/test evaluation or promotion.
+experiment_name: csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_pilot
+
+sentence_memory:
+  # Rebuilt from the same train-only inputs under the immutable Stage-C source.
+  # Its runtime identity is resolved only after that source is committed, so it
+  # cannot be copied from the older Stage-B source seal.
+  relevance_calibration:
+    artifact_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_v1
+    artifact_identity: null
+
+conditioning:
+  word_prior_train_mode: "off"
+  sentence_memory_train_mode: "dropout"
+  sentence_memory_dropout_probability: 0.25
+
+sentence_memory_safety:
+  enabled: true
+  paired_corruption:
+    enabled: false
+  phase_b:
+    enabled: false
+  stage_c:
+    schema_name: signtrajfield_centered_stage_c_generator_adaptation
+    schema_version: 1
+    enabled: true
+    development_only: true
+    non_authorizing: true
+    promotion_eligible: false
+    arm: memory
+    huber_beta: 0.10
+    text_only_max_relative_degradation: 0.005
+    source_checkpoint:
+      path: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1/checkpoints/best_infeasible.pt
+      sha256: b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202
+      selection_status: best_infeasible
+      epoch: 5
+      global_step: 360
+    source_terminal_decision:
+      path: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1/evaluation/ordered_development_decision/decision.json
+      sha256: 8993f4d7ae61d2ecd2bc41d523c45ab55073c63a061ce24629a564627724f8c5
+      decision_identity: 7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69
+      status: valid_infeasible
+      authorized_purpose: null
+    frozen_v2_teacher:
+      path: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v2_mt5_text_only_full/checkpoints/best.pt
+      sha256: 06ca0a2613005b6e3949bab0e5d7ded999b212723debd3e7685a58c077e44c54
+    source_stage_b:
+      config_path: NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1.yaml
+      config_sha256: 7741da46d37a4b77f481663f25fa580281f6d29de6c2616baebcc30dac59b85e
+      architecture_identity: bc69fd35ac58e10bc894460c35175f13356b79416df40e8c57156b1929614236
+    active_stage_c:
+      calibration_artifact_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_v1
+      calibration_schema_name: signtrajfield_sentence_memory_relevance_calibration
+      calibration_schema_version: 1
+
+train:
+  # --stage_c_warm_start is the sole initialization authority.  Memory
+  # parameters remain bitwise frozen; optimizer/epoch/selection state restart.
+  base_checkpoint: null
+  freeze_base: true
+  freeze_sentence_memory: true
+  unfreeze_base_prefixes:
+    - hypernetwork.global_context.
+    - hypernetwork.coarse_head.
+    - hypernetwork.residual_head.
+    - hypernetwork.gate_head.
+    - hypernetwork.local_context.
+    - hypernetwork.local_head.
+    - hypernetwork.local_gate_head.
+  sentence_memory_lr: 0.0001
+  joint_global_lr: 0.00001
+  joint_local_lr: 0.00001
+  epochs: 1
+  batch_size: 64
+  accumulation_steps: 2
+  early_stopping_patience: 0
+  early_stopping_min_epochs: 1
+  val_every: 1
+  save_every: 1
+
+selection:
+  # A one-epoch exploratory arm must retain its development result even when
+  # the inherited Stage-B promotion constraints are (expectedly) infeasible.
+  require_feasible: false
+
+output:
+  # The launcher must replace this with its unique, no-replace job-attempt path.
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_pilot

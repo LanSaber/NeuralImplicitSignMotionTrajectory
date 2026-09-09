@@ -10,7 +10,9 @@ from pathlib import Path
 from NIAF.continuous_trajectory_field.relevance_calibration import (
     ALTERNATIVE_NONCE,
     DEFAULT_SEED,
+    LEGACY_SOURCE_FILE_PROFILE,
     RelevanceCalibrationError,
+    SOURCE_FILE_PROFILES,
     SPLIT_NONCE,
     build_calibration_map,
     calibrate_from_map,
@@ -37,6 +39,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source_remote_ref", required=True)
     parser.add_argument("--source_remote_head", required=True)
     parser.add_argument("--launcher", type=Path, required=True)
+    parser.add_argument(
+        "--source_file_profile",
+        choices=tuple(sorted(SOURCE_FILE_PROFILES)),
+        default=LEGACY_SOURCE_FILE_PROFILE,
+    )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--duration_weight", type=float, default=0.05)
     parser.add_argument("--minimum_auroc", type=float, default=0.75)
@@ -121,6 +128,14 @@ def main() -> None:
             raise RelevanceCalibrationError(
                 f"Calibration source file is absent/outside source root: {path}"
             )
+    source_files = {
+        str(path.relative_to(source_root))
+        for path in (helper, script, decision_helper, stager, launcher)
+    }
+    if source_files != SOURCE_FILE_PROFILES[args.source_file_profile]:
+        raise RelevanceCalibrationError(
+            "Calibration source files differ from the selected exact profile"
+        )
     inputs = load_train_inputs(
         args.bank_dir,
         args.train_neighbors,
@@ -145,6 +160,7 @@ def main() -> None:
         "remote_head": source_remote_head,
         "remote_ref": str(args.source_remote_ref),
         "repository_root": str(source_root),
+        "source_file_profile": args.source_file_profile,
         "source_files": {
             str(path.relative_to(source_root)): {
                 "bytes": path.stat().st_size,

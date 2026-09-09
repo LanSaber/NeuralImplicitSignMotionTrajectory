@@ -5,7 +5,7 @@ runs. Read it before answering an unqualified question such as "What is the
 current training progress?" The scheduler and logs remain the source of truth
 for live state; this registry determines **which run** the question refers to.
 
-Last observed: **2026-09-09 15:28 Asia/Dubai (UTC+04:00)**
+Last observed: **2026-09-10 00:21 Asia/Dubai (UTC+04:00)**
 
 ## Default run resolution
 
@@ -19,7 +19,7 @@ has the highest Slurm job ID or is already in the `RUNNING` state.
 Dataset-qualified requests override that default: "the How2Sign training"
 refers to `how2sign-signtrajfield-v2-full-20260807`, and "the CSL-Daily
 training" refers to
-`csl-daily-signtrajfield-rag-v3-phase-a-centered-absolute-binding-v1-20260909`.
+`csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-pilot-v1-20260910`.
 
 ## Active prerequisite artifact jobs (not training)
 
@@ -83,6 +83,24 @@ Logs:
 logs/sbatch/csl_rag_neighbors_142745.out
 logs/sbatch/csl_rag_neighbors_142745.err
 ```
+
+## Preregistered CSL-Daily: Stage-C generator-adaptation pilot
+
+| Field | Value |
+|---|---|
+| Alias | `csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-pilot-v1-20260910` |
+| State | **Preregistered; no job submitted and no result observed at this registry timestamp.** This is a development-only, non-authorizing exploration and does not amend the terminal Stage-B `valid_infeasible` decision |
+| Exact source | Stage-B epoch-5/global-step-360 `best_infeasible.pt`, SHA256 `b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202`; terminal decision SHA256 `8993f4d7ae61d2ecd2bc41d523c45ab55073c63a061ce24629a564627724f8c5`, identity `7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69`, `authorized_purpose=null` |
+| Matched arms | Sequential `memory` (`dropout`, probability `0.25`) and `matched_off` (`off`, probability `1.0`) arms in one allocation; each independently reloads the same source and resets optimizer, epoch, selection, and RNG state |
+| Trainability | All 62 sentence-memory tensors frozen; exactly 20 generator tensors/1,109,395 parameters trainable under seven pinned hypernetwork prefixes; all other 213 model tensors frozen |
+| Batch and duration | Exactly two ranks on two GPUs; batch 64/rank and accumulation two, effective global batch 256; one uncapped epoch and global step 72 per arm after an exact one-update smoke |
+| Allocation | Exactly two Spark nodes sharing one explicit `pair01`--`pair15` feature, one GPU/rank per node. Both 200-Gb/s ConnectX-7 f1 RoCE rails must pass topology, peer, counter, NCCL `NET/IB`, and no-socket-fallback checks before training; single-versus-dual rail is benchmark-selected |
+| Ordered gates | Complete CPU/compile/Ruff/tests -> fresh source-bound train-only calibration -> paired forced-IB network and one-update smoke -> one-epoch paired pilot. Only `smoke_ready` permits the pilot |
+| Decision boundary | Smoke or pilot failure is `stop`/`none`. Passing pilot is `pilot_complete_development_signal` with `none_requires_fresh_preregistration_without_pilot_outcome_access`. No status authorizes a longer run, promotion, confirmation, or test |
+| Isolation | Only train/validation data may be staged; Stage-C code must not reference or open confirmation/test inputs, the global confirmation-spend marker must stay absent, and W&B is disabled |
+| Immutable source | To be recorded after the implementation/docs commit is pushed and copied into a clean standalone shared run clone; launch is forbidden before that binding exists |
+| Runbook | `docs/NIAF/continuous_trajectory_field/stage_c_generator_adaptation_v1.md` |
+| Default alias | Global PHOENIX default unchanged; this alias is only the dataset-qualified CSL-Daily resolution |
 
 ## Latest completed CSL-Daily: Phase-A''' centered-evidence and absolute-binding experiment
 

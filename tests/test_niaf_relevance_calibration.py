@@ -183,16 +183,15 @@ def test_sealed_source_binding_rejects_commit_or_source_file_drift(tmp_path):
         "repository_root": str(source_root),
         "source_files": files,
     }
-    assert (
-        validate_relevance_calibration_source(
-            {"source": source},
-            source_root=source_root,
-            expected_git_head="a" * 40,
-            expected_remote_ref="origin/frozen",
-            expected_remote_head="a" * 40,
-        )["git_head"]
-        == "a" * 40
+    validated = validate_relevance_calibration_source(
+        {"source": source},
+        source_root=source_root,
+        expected_git_head="a" * 40,
+        expected_remote_ref="origin/frozen",
+        expected_remote_head="a" * 40,
     )
+    assert validated["git_head"] == "a" * 40
+    assert validated["source_file_profile"] == MODULE.LEGACY_SOURCE_FILE_PROFILE
     with pytest.raises(RelevanceCalibrationError, match="commit"):
         validate_relevance_calibration_source(
             {"source": source},
@@ -206,6 +205,81 @@ def test_sealed_source_binding_rejects_commit_or_source_file_drift(tmp_path):
             {"source": source},
             source_root=source_root,
             expected_git_head="a" * 40,
+        )
+
+
+def test_stage_c_source_profile_is_exact_and_rejects_mixed_or_unknown_sets(tmp_path):
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    files = {}
+    for relative in MODULE.STAGE_C_REQUIRED_SOURCE_FILES:
+        path = source_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"stage-c:{relative}\n", encoding="utf-8")
+        files[relative] = {
+            "bytes": path.stat().st_size,
+            "sha256": MODULE.sha256_file(path),
+        }
+    source = {
+        "git_head": "c" * 40,
+        "remote_head": "c" * 40,
+        "remote_ref": "origin/stage-c",
+        "repository_root": str(source_root),
+        "source_file_profile": MODULE.STAGE_C_SOURCE_FILE_PROFILE,
+        "source_files": files,
+    }
+    validated = validate_relevance_calibration_source(
+        {"source": source},
+        source_root=source_root,
+        expected_git_head="c" * 40,
+        expected_remote_ref="origin/stage-c",
+        expected_remote_head="c" * 40,
+        expected_source_file_profile=MODULE.STAGE_C_SOURCE_FILE_PROFILE,
+    )
+    assert validated["source_file_profile"] == MODULE.STAGE_C_SOURCE_FILE_PROFILE
+
+    wrong_expected = copy.deepcopy(source)
+    with pytest.raises(RelevanceCalibrationError, match="profile changed"):
+        validate_relevance_calibration_source(
+            {"source": wrong_expected},
+            source_root=source_root,
+            expected_git_head="c" * 40,
+            expected_source_file_profile=MODULE.LEGACY_SOURCE_FILE_PROFILE,
+        )
+
+    unknown = copy.deepcopy(source)
+    unknown["source_file_profile"] = "unapproved_v9"
+    with pytest.raises(RelevanceCalibrationError, match="Unknown"):
+        validate_relevance_calibration_source(
+            {"source": unknown},
+            source_root=source_root,
+            expected_git_head="c" * 40,
+        )
+
+    missing = copy.deepcopy(source)
+    missing["source_files"].pop(next(iter(missing["source_files"])))
+    with pytest.raises(RelevanceCalibrationError, match="exact profile"):
+        validate_relevance_calibration_source(
+            {"source": missing},
+            source_root=source_root,
+            expected_git_head="c" * 40,
+        )
+
+    mixed = copy.deepcopy(source)
+    legacy_launcher = (
+        "scripts/NIAF/calibrate_csl_daily_sentence_memory_relevance_v1_sbatch.sh"
+    )
+    path = source_root / legacy_launcher
+    path.write_text("legacy launcher\n", encoding="utf-8")
+    mixed["source_files"][legacy_launcher] = {
+        "bytes": path.stat().st_size,
+        "sha256": MODULE.sha256_file(path),
+    }
+    with pytest.raises(RelevanceCalibrationError, match="exact profile"):
+        validate_relevance_calibration_source(
+            {"source": mixed},
+            source_root=source_root,
+            expected_git_head="c" * 40,
         )
 
 

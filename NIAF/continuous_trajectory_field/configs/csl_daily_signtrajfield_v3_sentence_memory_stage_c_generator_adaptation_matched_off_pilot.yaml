@@ -1,0 +1,18 @@
+_base_: csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_pilot.yaml
+
+# Matched control: identical source checkpoint, generator parameters, optimizer
+# settings, effective batch, data, seed, and validation; only training-time
+# sentence-memory availability changes to exact off.
+experiment_name: csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_matched_off_pilot
+
+conditioning:
+  sentence_memory_train_mode: "off"
+  sentence_memory_dropout_probability: 1.0
+
+sentence_memory_safety:
+  stage_c:
+    arm: matched_off
+
+output:
+  # The launcher must replace this with its unique, no-replace job-attempt path.
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_matched_off_pilot

@@ -41,6 +41,21 @@ REQUIRED_SOURCE_FILES = frozenset(
         "scripts/NIAF/stage_sentence_memory_train_val_only_node.sh",
     }
 )
+LEGACY_SOURCE_FILE_PROFILE = "sentence_memory_relevance_v1"
+STAGE_C_SOURCE_FILE_PROFILE = "stage_c_generator_adaptation_v1"
+STAGE_C_REQUIRED_SOURCE_FILES = frozenset(
+    {
+        "NIAF/continuous_trajectory_field/relevance_calibration.py",
+        "NIAF/continuous_trajectory_field/scripts/calibrate_sentence_memory_relevance.py",
+        "NIAF/continuous_trajectory_field/scripts/decide_centered_memory_stage.py",
+        "scripts/NIAF/calibrate_csl_daily_stage_c_generator_adaptation_sbatch.sh",
+        "scripts/NIAF/stage_sentence_memory_train_val_only_node.sh",
+    }
+)
+SOURCE_FILE_PROFILES = {
+    LEGACY_SOURCE_FILE_PROFILE: REQUIRED_SOURCE_FILES,
+    STAGE_C_SOURCE_FILE_PROFILE: STAGE_C_REQUIRED_SOURCE_FILES,
+}
 
 
 class RelevanceCalibrationError(RuntimeError):
@@ -1106,6 +1121,7 @@ def validate_relevance_calibration_source(
     expected_git_head: str,
     expected_remote_ref: str | None = None,
     expected_remote_head: str | None = None,
+    expected_source_file_profile: str | None = None,
 ) -> dict[str, Any]:
     """Bind a sealed calibration to the immutable checkout consuming it.
 
@@ -1133,10 +1149,21 @@ def validate_relevance_calibration_source(
         or str(expected_remote_head).lower() != git_head
     ):
         raise RelevanceCalibrationError("Calibration lacks exact pushed-source proof")
+    raw_profile = source.get("source_file_profile")
+    source_file_profile = (
+        LEGACY_SOURCE_FILE_PROFILE if raw_profile is None else str(raw_profile)
+    )
+    if source_file_profile not in SOURCE_FILE_PROFILES:
+        raise RelevanceCalibrationError("Unknown calibration source-file profile")
+    if (
+        expected_source_file_profile is not None
+        and source_file_profile != str(expected_source_file_profile)
+    ):
+        raise RelevanceCalibrationError("Calibration source-file profile changed")
     files = dict(source.get("source_files", {}) or {})
-    if set(files) != REQUIRED_SOURCE_FILES:
+    if set(files) != SOURCE_FILE_PROFILES[source_file_profile]:
         raise RelevanceCalibrationError(
-            "Calibration source-file map is incomplete or contains unknown paths"
+            "Calibration source-file map differs from its exact profile"
         )
     validated: dict[str, Any] = {}
     for relative, recorded in sorted(files.items()):
@@ -1163,5 +1190,6 @@ def validate_relevance_calibration_source(
         "remote_ref": source.get("remote_ref"),
         "remote_head": str(source.get("remote_head", "")).lower(),
         "repository_root": str(root),
+        "source_file_profile": source_file_profile,
         "source_files": validated,
     }

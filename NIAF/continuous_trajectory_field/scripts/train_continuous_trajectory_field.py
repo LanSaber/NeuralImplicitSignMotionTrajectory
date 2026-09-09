@@ -114,6 +114,134 @@ DEVELOPMENT_VALIDATION_MANIFEST = "manifest_development.jsonl"
 DEVELOPMENT_VALIDATION_RUNTIME_SCHEMA = (
     "signtrajfield_development_validation_runtime"
 )
+STAGE_C_SCHEMA_NAME = "signtrajfield_centered_stage_c_generator_adaptation"
+STAGE_C_SCHEMA_VERSION = 1
+STAGE_C_ARM_TRAIN_MODES = {
+    "memory": "dropout",
+    "matched_off": "off",
+}
+STAGE_C_ARM_DROPOUT_PROBABILITIES = {
+    "memory": 0.25,
+    "matched_off": 1.0,
+}
+STAGE_C_EVALUATION_MODES = (
+    "off",
+    "on",
+    "motion_shuffled_n0",
+    "motion_shuffled_n1",
+    "motion_shuffled_n2",
+    "cross_query_motion",
+    "full_replacement",
+    "joint_tuple_permuted",
+    "uniform_final_mass",
+    "analytic_prior",
+    "association_disabled",
+)
+STAGE_C_GENERATOR_PREFIXES = (
+    "hypernetwork.global_context.",
+    "hypernetwork.coarse_head.",
+    "hypernetwork.residual_head.",
+    "hypernetwork.gate_head.",
+    "hypernetwork.local_context.",
+    "hypernetwork.local_head.",
+    "hypernetwork.local_gate_head.",
+)
+STAGE_C_GENERATOR_PARAMETER_NAMES = (
+    "hypernetwork.coarse_head.bias",
+    "hypernetwork.coarse_head.weight",
+    "hypernetwork.gate_head.bias",
+    "hypernetwork.gate_head.weight",
+    "hypernetwork.global_context.0.bias",
+    "hypernetwork.global_context.0.weight",
+    "hypernetwork.global_context.1.bias",
+    "hypernetwork.global_context.1.weight",
+    "hypernetwork.global_context.4.bias",
+    "hypernetwork.global_context.4.weight",
+    "hypernetwork.local_context.0.bias",
+    "hypernetwork.local_context.0.weight",
+    "hypernetwork.local_context.1.bias",
+    "hypernetwork.local_context.1.weight",
+    "hypernetwork.local_gate_head.bias",
+    "hypernetwork.local_gate_head.weight",
+    "hypernetwork.local_head.bias",
+    "hypernetwork.local_head.weight",
+    "hypernetwork.residual_head.bias",
+    "hypernetwork.residual_head.weight",
+)
+STAGE_C_GENERATOR_PARAMETER_COUNT = 1_109_395
+STAGE_C_OPTIMIZER_PARAMETER_GROUPS = (
+    (
+        "global",
+        (
+            "hypernetwork.global_context.0.weight",
+            "hypernetwork.global_context.0.bias",
+            "hypernetwork.global_context.1.weight",
+            "hypernetwork.global_context.1.bias",
+            "hypernetwork.global_context.4.weight",
+            "hypernetwork.global_context.4.bias",
+            "hypernetwork.coarse_head.weight",
+            "hypernetwork.coarse_head.bias",
+            "hypernetwork.residual_head.weight",
+            "hypernetwork.residual_head.bias",
+            "hypernetwork.gate_head.weight",
+            "hypernetwork.gate_head.bias",
+        ),
+    ),
+    (
+        "local",
+        (
+            "hypernetwork.local_context.0.weight",
+            "hypernetwork.local_context.0.bias",
+            "hypernetwork.local_context.1.weight",
+            "hypernetwork.local_context.1.bias",
+            "hypernetwork.local_head.weight",
+            "hypernetwork.local_head.bias",
+            "hypernetwork.local_gate_head.weight",
+            "hypernetwork.local_gate_head.bias",
+        ),
+    ),
+)
+STAGE_C_PINNED_SOURCE = {
+    "source_checkpoint": {
+        "path": (
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_"
+            "absolute_binding_motion_contrast_v1/checkpoints/best_infeasible.pt"
+        ),
+        "sha256": "b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202",
+        "selection_status": "best_infeasible",
+        "epoch": 5,
+        "global_step": 360,
+    },
+    "source_terminal_decision": {
+        "path": (
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_"
+            "absolute_binding_motion_contrast_v1/evaluation/"
+            "ordered_development_decision/decision.json"
+        ),
+        "sha256": "8993f4d7ae61d2ecd2bc41d523c45ab55073c63a061ce24629a564627724f8c5",
+        "decision_identity": "7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69",
+        "status": "valid_infeasible",
+        "authorized_purpose": None,
+    },
+    "frozen_v2_teacher": {
+        "path": (
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_signtrajfield_v2_mt5_text_only_full/checkpoints/best.pt"
+        ),
+        "sha256": "06ca0a2613005b6e3949bab0e5d7ded999b212723debd3e7685a58c077e44c54",
+    },
+    "source_stage_b": {
+        "config_path": (
+            "NIAF/continuous_trajectory_field/configs/"
+            "csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_"
+            "absolute_binding_motion_contrast_v1.yaml"
+        ),
+        "config_sha256": "7741da46d37a4b77f481663f25fa580281f6d29de6c2616baebcc30dac59b85e",
+        "architecture_identity": "bc69fd35ac58e10bc894460c35175f13356b79416df40e8c57156b1929614236",
+    },
+}
 
 
 def configured_model_type(cfg):
@@ -434,6 +562,48 @@ def _digest_named_identity(payload):
         **payload,
         "digest": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
     }
+
+
+def stage_c_trainability_contract():
+    """Return the immutable schema-v1 generator payload contract."""
+
+    return _digest_named_identity(
+        {
+            "schema_name": "signtrajfield_stage_c_trainability_contract",
+            "schema_version": 1,
+            "trainable_parameter_names": list(
+                STAGE_C_GENERATOR_PARAMETER_NAMES
+            ),
+            "trainable_tensor_count": len(STAGE_C_GENERATOR_PARAMETER_NAMES),
+            "trainable_parameter_count": STAGE_C_GENERATOR_PARAMETER_COUNT,
+            "sentence_memory_frozen": True,
+        }
+    )
+
+
+def stage_c_optimizer_parameter_mapping_contract():
+    """Bind serialized optimizer parameter IDs to Stage-C tensor names."""
+
+    return _digest_named_identity(
+        {
+            "schema_name": "signtrajfield_stage_c_optimizer_parameter_mapping",
+            "schema_version": 1,
+            "groups": [
+                {
+                    "group_index": index,
+                    "group_name": group_name,
+                    "parameter_names": list(parameter_names),
+                }
+                for index, (group_name, parameter_names) in enumerate(
+                    STAGE_C_OPTIMIZER_PARAMETER_GROUPS
+                )
+            ],
+            "mapping_rule": (
+                "optimizer.param_groups[group_index].params[i] maps to "
+                "groups[group_index].parameter_names[i]"
+            ),
+        }
+    )
 
 
 def sentence_memory_evaluation_control_identity(cfg):
@@ -1585,7 +1755,134 @@ def sentence_memory_objective_identity(cfg):
 
     paired_cfg = paired_sentence_memory_corruption_config(cfg)
     association = configured_sentence_memory_association(cfg)
-    if (
+    if stage_c_enabled(cfg):
+        stage_c = configured_stage_c(cfg)
+        objective_cfg = cfg.get("objective", {})
+        safety_cfg = cfg.get("sentence_memory_safety", {})
+        train_cfg = cfg.get("train", {})
+        provenance = stage_c.get("resolved_source_provenance") or {}
+        teacher_reference = provenance.get("teacher_validation_reference")
+        payload = {
+            "schema_version": 4,
+            "mode": "centered_stage_c_generator_adaptation_v1",
+            "arm": stage_c.get("arm"),
+            "sentence_memory_train_mode": configured_sentence_memory_train_mode(
+                cfg
+            ),
+            "sentence_memory_dropout_probability": float(
+                cfg.get("conditioning", {}).get(
+                    "sentence_memory_dropout_probability", math.nan
+                )
+            ),
+            "paired_corruption": {"enabled": False},
+            "weights": {
+                "lambda_sentence_safe": float(
+                    objective_cfg.get("lambda_sentence_safe", 1.0)
+                ),
+                "lambda_sentence_shuffle": float(
+                    objective_cfg.get("lambda_sentence_shuffle", 1.0)
+                ),
+                "lambda_sentence_sparsity": float(
+                    objective_cfg.get("lambda_sentence_sparsity", 1e-4)
+                ),
+                "lambda_sentence_off_distill": float(
+                    objective_cfg.get("lambda_sentence_off_distill", 1.0)
+                ),
+            },
+            "safety": {
+                "nonregression_margin": float(
+                    safety_cfg.get("nonregression_margin", 0.0)
+                ),
+                "shuffle_probability": float(
+                    safety_cfg.get("shuffle_probability", 0.25)
+                ),
+                "shuffle_huber_beta": float(
+                    safety_cfg.get("shuffle_huber_beta", 0.10)
+                ),
+            },
+            "off_distillation": {
+                "teacher_checkpoint_sha256": stage_c.get(
+                    "frozen_v2_teacher", {}
+                ).get("sha256"),
+                "huber_beta": float(stage_c.get("huber_beta", 0.10)),
+                "student_path": "differentiable_memory_off_same_ddp_forward_v1",
+                "teacher_path": "frozen_v2_no_grad_v1",
+                "validation_guard": (
+                    "live_memory_off_vs_exact_parity_stage_b_source_on_same_"
+                    "sealed_cluster_equal_development_v1"
+                ),
+                "teacher_validation_reference": copy.deepcopy(
+                    teacher_reference
+                ),
+                "text_only_max_relative_degradation": float(
+                    stage_c.get("text_only_max_relative_degradation", 0.005)
+                ),
+            },
+            "trainability": {
+                "freeze_base": bool(train_cfg.get("freeze_base", False)),
+                "freeze_sentence_memory": bool(
+                    train_cfg.get("freeze_sentence_memory", False)
+                ),
+                "generator_prefixes": list(
+                    train_cfg.get("unfreeze_base_prefixes", ())
+                ),
+                "tensor_contract": stage_c_trainability_contract(),
+                "optimizer_parameter_mapping": (
+                    stage_c_optimizer_parameter_mapping_contract()
+                ),
+            },
+            "optimizer": {
+                "joint_global_lr": float(
+                    train_cfg.get("joint_global_lr", math.nan)
+                ),
+                "joint_local_lr": float(
+                    train_cfg.get("joint_local_lr", math.nan)
+                ),
+                "weight_decay": float(
+                    train_cfg.get("weight_decay", math.nan)
+                ),
+                "grad_clip": float(train_cfg.get("grad_clip", math.nan)),
+                "local_warmup_epochs": int(
+                    train_cfg.get("local_warmup_epochs", -1)
+                ),
+            },
+            "bounded_memory_batches": {
+                "seed": int(cfg.get("seed", -1)),
+                "train_max_samples": int(
+                    train_cfg.get("max_samples_per_memory_batch", -1)
+                ),
+                "train_max_frames": int(
+                    train_cfg.get("max_frames_per_memory_batch", -1)
+                ),
+                "validation_max_samples": int(
+                    cfg.get("eval", {}).get(
+                        "max_samples_per_memory_batch", -1
+                    )
+                ),
+                "validation_max_frames": int(
+                    cfg.get("eval", {}).get(
+                        "max_frames_per_memory_batch", -1
+                    )
+                ),
+                "length_bucketed_batches": bool(
+                    train_cfg.get("length_bucketed_batches", False)
+                ),
+                "drop_last": bool(train_cfg.get("drop_last", True)),
+            },
+            "validation_checkpoint_schedule": {
+                "val_every": int(train_cfg.get("val_every", -1)),
+                "save_every": int(train_cfg.get("save_every", -1)),
+            },
+            "distribution_contract": copy.deepcopy(
+                stage_c.get("resolved_distribution_contract")
+            ),
+            "authorization": {
+                "development_only": True,
+                "non_authorizing": True,
+                "promotion_eligible": False,
+            },
+        }
+    elif (
         paired_cfg["enabled"]
         and centered_sentence_memory_enabled(cfg)
         and association["enabled"]
@@ -1692,8 +1989,8 @@ def validate_sentence_memory_objective_identity(checkpoint, cfg, source="checkpo
     if actual is None and int(expected.get("schema_version", 0)) >= 2:
         raise RuntimeError(
             f"{source} has no persisted sentence-memory objective identity; "
-            "paired Phase-A resume requires the named schema produced by the "
-            "same trainer implementation"
+            "protected sentence-memory resume requires the named schema "
+            "produced by the same trainer implementation"
         )
     if actual is None and isinstance(checkpoint.get("config"), dict):
         # Pre-identity legacy checkpoints can be reconstructed without weakening
@@ -1757,6 +2054,7 @@ def sentence_memory_resume_identity(cfg):
         # deliberately absent from a later --resume invocation.
         train_cfg.pop("base_checkpoint", None)
         train_cfg.pop("warm_start_checkpoint", None)
+        train_cfg.pop("stage_c_warm_start_checkpoint", None)
         train_cfg.pop("reset_local_branch_on_warm_start", None)
 
     memory_cfg = payload.get("sentence_memory")
@@ -1782,6 +2080,13 @@ def sentence_memory_resume_identity(cfg):
             # The accepted report is validated through its own canonical digest.
             phase_b_cfg.pop("gate_report", None)
             phase_b_cfg.pop("resolved_scientific_gate", None)
+        stage_c_cfg = safety_cfg.get("stage_c")
+        if isinstance(stage_c_cfg, dict):
+            # Runtime provenance is validated independently and contains file
+            # placement plus the teacher's measured validation score.
+            stage_c_cfg.pop("resolved_source_provenance", None)
+            stage_c_cfg.pop("teacher_validation_selection_score", None)
+            stage_c_cfg.pop("resolved_distribution_contract", None)
 
     if str(
         cfg.get("sentence_memory", {}).get(
@@ -1843,6 +2148,462 @@ def configured_phase_b_gate_report(cfg):
         .get("gate_report")
     )
     return Path(value) if value else None
+
+
+def configured_stage_c(cfg):
+    """Return the explicit Stage-C contract without enabling it implicitly."""
+
+    configured = cfg.get("sentence_memory_safety", {}).get("stage_c", {})
+    if configured is None:
+        configured = {}
+    if not isinstance(configured, dict):
+        raise ValueError("sentence_memory_safety.stage_c must be a mapping")
+    return configured
+
+
+def stage_c_enabled(cfg):
+    return bool(
+        is_sentence_memory_model(cfg)
+        and configured_stage_c(cfg).get("enabled", False)
+    )
+
+
+def _stage_c_declared_contract(stage_c):
+    """Select the immutable, user-declared portion of a Stage-C contract."""
+
+    names = (
+        "schema_name",
+        "schema_version",
+        "development_only",
+        "non_authorizing",
+        "promotion_eligible",
+        "arm",
+        "source_checkpoint",
+        "source_terminal_decision",
+        "frozen_v2_teacher",
+        "source_stage_b",
+        "active_stage_c",
+        "huber_beta",
+        "text_only_max_relative_degradation",
+    )
+    return {name: copy.deepcopy(stage_c.get(name)) for name in names}
+
+
+def _require_exact_mapping(value, *, label, fields):
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a mapping")
+    missing = sorted(set(fields) - set(value))
+    unsupported = sorted(set(value) - set(fields))
+    if missing or unsupported:
+        raise ValueError(
+            f"{label} must have exactly fields {sorted(fields)}; "
+            f"missing={missing}, unsupported={unsupported}"
+        )
+    return value
+
+
+def _require_exact_number(mapping, name, expected, *, label):
+    value = mapping.get(name)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"Stage-C schema v1 requires {label}.{name}={expected}"
+        )
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed != float(expected):
+        raise ValueError(
+            f"Stage-C schema v1 requires {label}.{name}={expected}"
+        )
+    return parsed
+
+
+def configured_sentence_off_distillation(cfg):
+    """Resolve the one training phase allowed to use the frozen-v2 teacher."""
+
+    safety = cfg.get("sentence_memory_safety", {})
+    phase_b = safety.get("phase_b", {})
+    phase_b_active = bool(
+        isinstance(phase_b, dict) and phase_b.get("enabled", False)
+    )
+    stage_c = configured_stage_c(cfg)
+    stage_c_active = bool(stage_c.get("enabled", False))
+    if phase_b_active and stage_c_active:
+        raise ValueError("Phase B and Stage C may not be enabled together")
+    if phase_b_active:
+        return "phase_b", phase_b
+    if stage_c_active:
+        return "stage_c", stage_c
+    return None, None
+
+
+def validate_stage_c_training_contract(
+    cfg, *, stage_c_warm_start=None, resume=None
+):
+    """Validate the development-only generator-adaptation contract.
+
+    This contract is deliberately separate from canonical Phase B. It cannot
+    authorize confirmation/test access or promotion, and its two arms differ
+    only in whether sentence memory is sampled during training.
+    """
+
+    stage_c = configured_stage_c(cfg)
+    enabled = bool(stage_c.get("enabled", False))
+    if not enabled:
+        if stage_c_warm_start is not None:
+            raise ValueError(
+                "--stage_c_warm_start requires sentence_memory_safety."
+                "stage_c.enabled=true"
+            )
+        return None
+    supported = {
+        "enabled",
+        "schema_name",
+        "schema_version",
+        "development_only",
+        "non_authorizing",
+        "promotion_eligible",
+        "arm",
+        "source_checkpoint",
+        "source_terminal_decision",
+        "frozen_v2_teacher",
+        "source_stage_b",
+        "active_stage_c",
+        "huber_beta",
+        "text_only_max_relative_degradation",
+        # Runtime-only fields are persisted in resolved configs/checkpoints and
+        # omitted from the exact resume identity below.
+        "teacher_validation_selection_score",
+        "resolved_source_provenance",
+        "resolved_distribution_contract",
+    }
+    unsupported = sorted(set(stage_c) - supported)
+    if unsupported:
+        raise ValueError(
+            "sentence_memory_safety.stage_c has unsupported fields: "
+            f"{unsupported}"
+        )
+    required = supported - {
+        "teacher_validation_selection_score",
+        "resolved_source_provenance",
+        "resolved_distribution_contract",
+    }
+    missing = sorted(required - set(stage_c))
+    if missing:
+        raise ValueError(
+            "sentence_memory_safety.stage_c is missing required fields: "
+            f"{missing}"
+        )
+    if stage_c.get("schema_name") != STAGE_C_SCHEMA_NAME or int(
+        stage_c.get("schema_version", -1)
+    ) != STAGE_C_SCHEMA_VERSION:
+        raise ValueError(
+            "Stage C requires schema "
+            f"{STAGE_C_SCHEMA_NAME!r}/v{STAGE_C_SCHEMA_VERSION}"
+        )
+    for name, expected in (
+        ("development_only", True),
+        ("non_authorizing", True),
+        ("promotion_eligible", False),
+    ):
+        if stage_c.get(name) is not expected:
+            raise ValueError(f"Stage C requires {name}={expected!r}")
+    arm = str(stage_c.get("arm", ""))
+    if arm not in STAGE_C_ARM_TRAIN_MODES:
+        raise ValueError(
+            f"Stage C arm must be one of {sorted(STAGE_C_ARM_TRAIN_MODES)}"
+        )
+    if stage_c_warm_start is None and resume is None:
+        raise ValueError(
+            "Stage C must start with --stage_c_warm_start or continue with "
+            "--resume"
+        )
+    if stage_c_warm_start is not None and resume is not None:
+        raise ValueError("Stage-C warm start and exact resume are mutually exclusive")
+
+    source_checkpoint = _require_exact_mapping(
+        stage_c.get("source_checkpoint"),
+        label="sentence_memory_safety.stage_c.source_checkpoint",
+        fields={"path", "sha256", "selection_status", "epoch", "global_step"},
+    )
+    if not str(source_checkpoint.get("path", "")):
+        raise ValueError("Stage-C source checkpoint path must be non-empty")
+    _require_sha256(
+        source_checkpoint.get("sha256"), label="Stage-C source checkpoint sha256"
+    )
+    if source_checkpoint.get("selection_status") != "best_infeasible":
+        raise ValueError(
+            "Stage C must declare source_checkpoint.selection_status="
+            "'best_infeasible'"
+        )
+    if int(source_checkpoint.get("epoch", -1)) != 5 or int(
+        source_checkpoint.get("global_step", -1)
+    ) != 360:
+        raise ValueError("Stage C requires the selected epoch-5/step-360 source")
+
+    source_decision = _require_exact_mapping(
+        stage_c.get("source_terminal_decision"),
+        label="sentence_memory_safety.stage_c.source_terminal_decision",
+        fields={
+            "path",
+            "sha256",
+            "decision_identity",
+            "status",
+            "authorized_purpose",
+        },
+    )
+    if not str(source_decision.get("path", "")):
+        raise ValueError("Stage-C terminal-decision path must be non-empty")
+    _require_sha256(
+        source_decision.get("sha256"), label="Stage-C terminal-decision sha256"
+    )
+    _require_sha256(
+        source_decision.get("decision_identity"),
+        label="Stage-C terminal decision identity",
+    )
+    if source_decision.get("status") != "valid_infeasible":
+        raise ValueError("Stage C requires terminal status 'valid_infeasible'")
+    if source_decision.get("authorized_purpose") is not None:
+        raise ValueError("Stage C requires authorized_purpose=null")
+
+    teacher = _require_exact_mapping(
+        stage_c.get("frozen_v2_teacher"),
+        label="sentence_memory_safety.stage_c.frozen_v2_teacher",
+        fields={"path", "sha256"},
+    )
+    if not str(teacher.get("path", "")):
+        raise ValueError("Stage-C frozen-v2 teacher path must be non-empty")
+    _require_sha256(teacher.get("sha256"), label="Stage-C frozen-v2 teacher sha256")
+    source_stage_b = _require_exact_mapping(
+        stage_c.get("source_stage_b"),
+        label="sentence_memory_safety.stage_c.source_stage_b",
+        fields={"config_path", "config_sha256", "architecture_identity"},
+    )
+    if not str(source_stage_b.get("config_path", "")):
+        raise ValueError("Stage-C source Stage-B config path must be non-empty")
+    _require_sha256(
+        source_stage_b.get("config_sha256"), label="Stage-C Stage-B config sha256"
+    )
+    _require_sha256(
+        source_stage_b.get("architecture_identity"),
+        label="Stage-C Stage-B architecture identity",
+    )
+    for section_name, pinned in STAGE_C_PINNED_SOURCE.items():
+        configured = stage_c.get(section_name)
+        if configured != pinned:
+            changed = sorted(
+                name
+                for name in set(configured or {}) | set(pinned)
+                if (configured or {}).get(name) != pinned.get(name)
+            )
+            raise ValueError(
+                "Stage-C schema v1 requires the exact approved "
+                f"{section_name} source binding; changed fields={changed}"
+            )
+    active_stage_c = _require_exact_mapping(
+        stage_c.get("active_stage_c"),
+        label="sentence_memory_safety.stage_c.active_stage_c",
+        fields={
+            "calibration_artifact_dir",
+            "calibration_schema_name",
+            "calibration_schema_version",
+        },
+    )
+    if active_stage_c.get("calibration_schema_name") != (
+        "signtrajfield_sentence_memory_relevance_calibration"
+    ) or int(active_stage_c.get("calibration_schema_version", -1)) != 1:
+        raise ValueError("Stage C requires relevance-calibration schema v1")
+    active_calibration_dir = Path(
+        active_stage_c.get("calibration_artifact_dir", "")
+    ).resolve()
+    configured_calibration_dir = Path(
+        cfg.get("sentence_memory", {})
+        .get("relevance_calibration", {})
+        .get("artifact_dir", "")
+    ).resolve()
+    if not str(active_stage_c.get("calibration_artifact_dir", "")) or (
+        active_calibration_dir != configured_calibration_dir
+    ):
+        raise ValueError(
+            "Stage-C active calibration directory must exactly match "
+            "sentence_memory.relevance_calibration.artifact_dir"
+        )
+
+    if not is_sentence_memory_model(cfg) or not sentence_memory_enabled(cfg):
+        raise ValueError("Stage C requires an enabled v3 sentence-memory model")
+    if not centered_sentence_memory_enabled(cfg):
+        raise ValueError("Stage C requires centered candidate covariance")
+    if not configured_sentence_memory_association(cfg)["enabled"]:
+        raise ValueError("Stage C requires the centered Stage-B association model")
+    safety = cfg.get("sentence_memory_safety", {})
+    if safety.get("enabled") is not True:
+        raise ValueError("Stage C requires sentence_memory_safety.enabled=true")
+    phase_b = safety.get("phase_b")
+    if not isinstance(phase_b, dict) or phase_b.get("enabled") is not False:
+        raise ValueError("Stage C requires explicit phase_b.enabled=false")
+    paired = safety.get("paired_corruption")
+    if not isinstance(paired, dict) or paired.get("enabled") is not False:
+        raise ValueError("Stage C requires explicit paired_corruption.enabled=false")
+
+    train_cfg = cfg.get("train", {})
+    if train_cfg.get("freeze_base") is not True:
+        raise ValueError("Stage C requires train.freeze_base=true")
+    if train_cfg.get("freeze_sentence_memory") is not True:
+        raise ValueError("Stage C requires train.freeze_sentence_memory=true")
+    prefixes = tuple(str(value) for value in train_cfg.get("unfreeze_base_prefixes", ()))
+    if prefixes != STAGE_C_GENERATOR_PREFIXES:
+        raise ValueError(
+            "Stage C requires exactly the seven approved generator prefixes "
+            f"in protocol order: {list(STAGE_C_GENERATOR_PREFIXES)}"
+        )
+    if train_cfg.get("base_checkpoint") is not None:
+        raise ValueError("Stage C forbids train.base_checkpoint; use its distinct warm start")
+    if bool(train_cfg.get("reset_local_branch_on_warm_start", False)):
+        raise ValueError("Stage C forbids resetting the warm-started local branch")
+    exact_training = {
+        "epochs": 1,
+        "batch_size": 64,
+        "accumulation_steps": 2,
+        "early_stopping_patience": 0,
+        "early_stopping_min_epochs": 1,
+        "local_warmup_epochs": 0,
+        "val_every": 1,
+        "save_every": 1,
+    }
+    for name, expected in exact_training.items():
+        _require_exact_number(train_cfg, name, expected, label="train")
+    for name, expected in (
+        ("joint_global_lr", 1e-5),
+        ("joint_local_lr", 1e-5),
+        ("weight_decay", 1e-4),
+        ("grad_clip", 1.0),
+        ("max_samples_per_memory_batch", 8),
+        ("max_frames_per_memory_batch", 2048),
+    ):
+        _require_exact_number(train_cfg, name, expected, label="train")
+    if train_cfg.get("length_bucketed_batches") is not True:
+        raise ValueError(
+            "Stage-C schema v1 requires train.length_bucketed_batches=true"
+        )
+    if train_cfg.get("drop_last") is not False:
+        raise ValueError("Stage-C schema v1 requires train.drop_last=false")
+    _require_exact_number(cfg, "seed", 1234, label="config")
+    expected_mode = STAGE_C_ARM_TRAIN_MODES[arm]
+    actual_mode = configured_sentence_memory_train_mode(cfg)
+    if actual_mode != expected_mode:
+        raise ValueError(
+            f"Stage-C arm {arm!r} requires sentence-memory train mode "
+            f"{expected_mode!r}, got {actual_mode!r}"
+        )
+    expected_dropout_probability = STAGE_C_ARM_DROPOUT_PROBABILITIES[arm]
+    _require_exact_number(
+        cfg.get("conditioning", {}),
+        "sentence_memory_dropout_probability",
+        expected_dropout_probability,
+        label="conditioning",
+    )
+    if configured_word_prior_train_mode(cfg) != "off":
+        raise ValueError("Stage C requires word_prior_train_mode='off'")
+    if float(cfg.get("model", {}).get("dropout", 0.0)) != 0.0:
+        raise ValueError("Stage C requires model.dropout=0")
+
+    for name, expected in (
+        ("huber_beta", 0.10),
+        ("text_only_max_relative_degradation", 0.005),
+    ):
+        _require_exact_number(stage_c, name, expected, label="stage_c")
+    for name, expected in (
+        ("nonregression_margin", 0.0),
+        ("shuffle_probability", 0.25),
+        ("shuffle_huber_beta", 0.10),
+    ):
+        _require_exact_number(
+            safety,
+            name,
+            expected,
+            label="sentence_memory_safety",
+        )
+    objective = cfg.get("objective", {})
+    for name, expected in (
+        ("lambda_sentence_safe", 1.0),
+        ("lambda_sentence_shuffle", 1.0),
+        ("lambda_sentence_sparsity", 1e-4),
+        ("lambda_sentence_off_distill", 1.0),
+    ):
+        _require_exact_number(objective, name, expected, label="objective")
+    eval_cfg = cfg.get("eval", {})
+    for name, expected in (
+        ("max_samples_per_memory_batch", 1),
+        ("max_frames_per_memory_batch", 512),
+    ):
+        _require_exact_number(eval_cfg, name, expected, label="eval")
+    partition = cfg.get("validation_text_partition")
+    if not isinstance(partition, dict) or partition.get("enabled") is not True:
+        raise ValueError("Stage C requires the sealed development validation partition")
+    data_cfg = cfg.get("data", {})
+    if str(data_cfg.get("train_split", "train")) != "train" or str(
+        data_cfg.get("val_split", "val")
+    ) != "val":
+        raise ValueError("Stage C permits only train and val data splits")
+    if data_cfg.get("limit_train") not in (None, 0):
+        raise ValueError("Stage C forbids data.limit_train")
+    if data_cfg.get("limit_val") not in (None, 0):
+        raise ValueError("Stage C forbids data.limit_val")
+    if cfg.get("selection", {}).get("require_feasible") is not False:
+        raise ValueError(
+            "Stage C requires selection.require_feasible=false because it is "
+            "development-only and non-authorizing"
+        )
+    configured_sentence_memory_eval_modes(cfg)
+    return stage_c
+
+
+def validate_stage_c_distributed_runtime(cfg, dist_info, device):
+    """Bind schema-v1 Stage C to exactly two one-GPU NCCL ranks."""
+
+    if not stage_c_enabled(cfg):
+        return None
+    visible_devices = int(torch.cuda.device_count())
+    checks = {
+        "ddp_enabled": bool(dist_info.get("enabled", False)),
+        "world_size": int(dist_info.get("world_size", -1)),
+        "backend": str(dist_info.get("backend")),
+        "local_rank": int(dist_info.get("local_rank", -1)),
+        "device_type": str(torch.device(device).type),
+        "device_index": torch.device(device).index,
+        "visible_cuda_devices_per_rank": visible_devices,
+    }
+    if not checks["ddp_enabled"] or checks["world_size"] != 2:
+        raise RuntimeError("Stage-C schema v1 requires DDP world_size=2")
+    if checks["backend"] != "nccl":
+        raise RuntimeError("Stage-C schema v1 requires the NCCL backend")
+    if checks["device_type"] != "cuda" or visible_devices != 1:
+        raise RuntimeError(
+            "Stage-C schema v1 requires exactly one visible CUDA GPU per rank"
+        )
+    if checks["local_rank"] != 0 or checks["device_index"] != 0:
+        raise RuntimeError(
+            "Stage-C paired-node contract requires one rank per node on cuda:0"
+        )
+    train_cfg = cfg["train"]
+    resolved = _digest_named_identity(
+        {
+            "schema_name": "signtrajfield_stage_c_distribution_contract",
+            "schema_version": 1,
+            "world_size": 2,
+            "ranks_per_node": 1,
+            "visible_cuda_devices_per_rank": 1,
+            "backend": "nccl",
+            "micro_batch_per_rank": int(train_cfg["batch_size"]),
+            "accumulation_steps": int(train_cfg["accumulation_steps"]),
+            "effective_global_batch": (
+                2
+                * int(train_cfg["batch_size"])
+                * int(train_cfg["accumulation_steps"])
+            ),
+            "epochs": int(train_cfg["epochs"]),
+        }
+    )
+    configured_stage_c(cfg)["resolved_distribution_contract"] = resolved
+    return resolved
 
 
 def validate_phase_b_scientific_gate_settings(settings, source="gate report"):
@@ -2074,6 +2835,689 @@ def validate_phase_b_warm_start_checkpoint(cfg, checkpoint, source="checkpoint")
         )
 
 
+def _sha256_file_stream(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_pinned_stage_c_file(specification, *, label, path_key="path"):
+    path = Path(specification[path_key]).resolve()
+    if not path.is_file():
+        raise RuntimeError(f"{label} does not exist: {path}")
+    actual = _sha256_file_stream(path)
+    expected = _require_sha256(
+        specification["sha256" if path_key == "path" else "config_sha256"],
+        label=f"{label} SHA256",
+    )
+    if actual != expected:
+        raise RuntimeError(
+            f"{label} SHA256 mismatch: actual={actual}, expected={expected}"
+        )
+    return path, actual
+
+
+def _validated_named_identity(value, *, label):
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{label} is missing or malformed")
+    payload = {key: copy.deepcopy(item) for key, item in value.items() if key != "digest"}
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if value.get("digest") != digest:
+        raise RuntimeError(f"{label} has an invalid digest")
+    return payload, digest
+
+
+def validate_stage_c_selection_comparability(
+    cfg, checkpoint, *, source="checkpoint"
+):
+    """Bind the Stage-B off reference to the active scoring definition."""
+
+    source_cfg = checkpoint.get("config")
+    if not isinstance(source_cfg, dict):
+        raise RuntimeError(f"{source} has no saved Stage-B config")
+    active_selection = copy.deepcopy(cfg.get("selection"))
+    source_selection = copy.deepcopy(source_cfg.get("selection"))
+    if not isinstance(active_selection, dict) or not isinstance(
+        source_selection, dict
+    ):
+        raise RuntimeError(
+            "Stage C requires explicit source and active selection definitions"
+        )
+    if active_selection.get("require_feasible") is not False:
+        raise RuntimeError("Stage C requires active selection.require_feasible=false")
+    if source_selection.get("require_feasible") is not True:
+        raise RuntimeError(
+            f"{source} does not record the canonical feasible Stage-B selection"
+        )
+    active_selection.pop("require_feasible")
+    source_selection.pop("require_feasible")
+    if active_selection != source_selection:
+        changed = sorted(
+            name
+            for name in set(active_selection) | set(source_selection)
+            if active_selection.get(name) != source_selection.get(name)
+        )
+        raise RuntimeError(
+            "Stage-C selection score definition differs from Stage B beyond "
+            f"the authorized require_feasible switch; changed fields={changed}"
+        )
+
+    active_modes = configured_sentence_memory_eval_modes(cfg)
+    source_modes = configured_sentence_memory_eval_modes(source_cfg)
+    if active_modes != STAGE_C_EVALUATION_MODES or source_modes != active_modes:
+        raise RuntimeError(
+            "Stage C requires the exact canonical 11-mode Stage-B evaluation order"
+        )
+    active_control = sentence_memory_evaluation_control_identity(cfg)
+    source_control = sentence_memory_evaluation_control_identity(source_cfg)
+    if (
+        active_control != source_control
+        or active_control.get("mode") != FIXED_EVIDENCE_CONTROLS_MODE
+    ):
+        raise RuntimeError(
+            "Stage-C evaluation-control identity differs from canonical Stage B"
+        )
+    validate_sentence_memory_evaluation_control_identity(
+        checkpoint, cfg, source=source
+    )
+    active_aggregation = sentence_memory_selection_aggregation_identity(cfg)
+    source_aggregation = sentence_memory_selection_aggregation_identity(
+        source_cfg
+    )
+    if (
+        active_aggregation != source_aggregation
+        or active_aggregation.get("mode") != CLUSTER_EQUAL_SELECTION_AGGREGATION
+    ):
+        raise RuntimeError(
+            "Stage-C selection aggregation differs from canonical Stage B"
+        )
+    validate_sentence_memory_selection_aggregation_identity(
+        checkpoint, cfg, source=source
+    )
+    return _digest_named_identity(
+        {
+            "schema_name": "signtrajfield_stage_c_selection_comparability",
+            "schema_version": 1,
+            "selection_definition_except_require_feasible": active_selection,
+            "active_require_feasible": False,
+            "source_require_feasible": True,
+            "evaluation_modes": list(active_modes),
+            "evaluation_control_identity": active_control["digest"],
+            "selection_aggregation_identity": active_aggregation["digest"],
+        }
+    )
+
+
+def validate_stage_c_calibration_transition(cfg, checkpoint, *, source="checkpoint"):
+    """Validate the explicit old-source to fresh-active calibration transition.
+
+    General checkpoint validators remain exact. Stage C alone may replace the
+    calibration *provenance*, after independently proving that the coefficients
+    and calibration-map content are unchanged and every other architecture and
+    behavior field is identical.
+    """
+
+    expected_source_architecture = configured_stage_c(cfg)["source_stage_b"][
+        "architecture_identity"
+    ]
+    source_architecture_payload, source_architecture_digest = (
+        _validated_named_identity(
+            checkpoint.get("sentence_memory_architecture_identity"),
+            label=f"{source} source architecture identity",
+        )
+    )
+    if source_architecture_digest != expected_source_architecture:
+        raise RuntimeError(
+            "Stage-C source architecture is not the pinned Stage-B identity: "
+            f"actual={source_architecture_digest}, "
+            f"expected={expected_source_architecture}"
+        )
+    active_architecture = sentence_memory_architecture_identity(cfg)
+    active_architecture_payload, active_architecture_digest = (
+        _validated_named_identity(
+            active_architecture, label="active Stage-C architecture identity"
+        )
+    )
+
+    source_calibration = (
+        source_architecture_payload.get("relevance_gate", {}).get(
+            "calibration_identity"
+        )
+    )
+    active_calibration = (
+        active_architecture_payload.get("relevance_gate", {}).get(
+            "calibration_identity"
+        )
+    )
+    source_calibration_payload, source_calibration_digest = (
+        _validated_named_identity(
+            source_calibration, label=f"{source} source calibration identity"
+        )
+    )
+    active_calibration_payload, active_calibration_digest = (
+        _validated_named_identity(
+            active_calibration, label="active Stage-C calibration identity"
+        )
+    )
+    checkpoint_calibration = checkpoint.get(
+        "sentence_memory_relevance_calibration_identity"
+    )
+    if checkpoint_calibration != source_calibration:
+        raise RuntimeError(
+            "Stage-C source checkpoint calibration metadata differs from its "
+            "source architecture identity"
+        )
+    # Only repository/file-bound provenance is permitted to change. Everything
+    # that can affect or qualify the calibration result remains exact: map
+    # bytes/content, held-out statistics, minimum gates, coefficient formula,
+    # and all schema-defined deterministic semantics.
+    provenance_only_fields = {"artifact_identity", "calibration_sha256"}
+    source_calibration_semantics = {
+        name: value
+        for name, value in source_calibration_payload.items()
+        if name not in provenance_only_fields
+    }
+    active_calibration_semantics = {
+        name: value
+        for name, value in active_calibration_payload.items()
+        if name not in provenance_only_fields
+    }
+    if source_calibration_semantics != active_calibration_semantics:
+        changed = sorted(
+            name
+            for name in set(source_calibration_semantics)
+            | set(active_calibration_semantics)
+            if source_calibration_semantics.get(name)
+            != active_calibration_semantics.get(name)
+        )
+        raise RuntimeError(
+            "Stage-C fresh calibration is not semantically equivalent to the "
+            f"source calibration; changed fields={changed}"
+        )
+    if active_calibration_digest == source_calibration_digest:
+        raise RuntimeError(
+            "Stage C requires a freshly attested calibration identity, not the "
+            "source repository-bound identity"
+        )
+
+    source_structural = copy.deepcopy(source_architecture_payload)
+    active_structural = copy.deepcopy(active_architecture_payload)
+    source_structural["relevance_gate"].pop("calibration_identity", None)
+    active_structural["relevance_gate"].pop("calibration_identity", None)
+    if source_structural != active_structural:
+        raise RuntimeError(
+            "Stage-C active architecture differs from Stage B beyond the "
+            "explicit calibration-provenance transition"
+        )
+
+    source_behavior_payload, _source_behavior_digest = _validated_named_identity(
+        checkpoint.get("sentence_memory_behavior_identity"),
+        label=f"{source} source behavior identity",
+    )
+    active_behavior_payload, active_behavior_digest = _validated_named_identity(
+        sentence_memory_behavior_identity(cfg),
+        label="active Stage-C behavior identity",
+    )
+    source_behavior_payload.pop("sentence_memory_architecture_digest", None)
+    active_behavior_payload.pop("sentence_memory_architecture_digest", None)
+    if source_behavior_payload != active_behavior_payload:
+        raise RuntimeError(
+            "Stage-C active sentence-memory behavior differs from Stage B "
+            "beyond calibration provenance"
+        )
+    return {
+        "schema_name": "signtrajfield_stage_c_calibration_transition",
+        "schema_version": 1,
+        "source_calibration_identity": source_calibration_digest,
+        "active_calibration_identity": active_calibration_digest,
+        "source_architecture_identity": source_architecture_digest,
+        "active_architecture_identity": active_architecture_digest,
+        "active_behavior_identity": active_behavior_digest,
+        "semantic_equivalence": {
+            "coefficients_exact": True,
+            "map_sha256_exact": True,
+            "map_content_digest_exact": True,
+            "heldout_metrics_exact": True,
+            "minimum_gates_exact": True,
+            "all_non_provenance_calibration_fields_exact": True,
+            "structural_architecture_except_calibration_provenance_exact": True,
+            "behavior_except_architecture_digest_exact": True,
+        },
+    }
+
+
+def validate_stage_c_warm_start_checkpoint(
+    cfg, checkpoint, checkpoint_path, *, provider, source="checkpoint"
+):
+    """Bind Stage C to the exact non-authorizing Stage-B terminal state."""
+
+    if not stage_c_enabled(cfg):
+        return None
+    if provider is None:
+        raise RuntimeError("Stage C requires an active sentence-memory provider")
+    stage_c = configured_stage_c(cfg)
+    declared = _stage_c_declared_contract(stage_c)
+    source_checkpoint = stage_c["source_checkpoint"]
+    expected_checkpoint_path = Path(source_checkpoint["path"]).resolve()
+    actual_checkpoint_path = Path(checkpoint_path).resolve()
+    if actual_checkpoint_path != expected_checkpoint_path:
+        raise RuntimeError(
+            "--stage_c_warm_start does not match the pinned source checkpoint: "
+            f"actual={actual_checkpoint_path}, expected={expected_checkpoint_path}"
+        )
+    if actual_checkpoint_path.name != "best_infeasible.pt":
+        raise RuntimeError("Stage C must warm-start from a best_infeasible.pt artifact")
+    actual_checkpoint_sha256 = _sha256_file_stream(actual_checkpoint_path)
+    if actual_checkpoint_sha256 != source_checkpoint["sha256"]:
+        raise RuntimeError(
+            "Stage-C source checkpoint SHA256 mismatch: "
+            f"actual={actual_checkpoint_sha256}, "
+            f"expected={source_checkpoint['sha256']}"
+        )
+    expected_epoch = int(source_checkpoint["epoch"])
+    expected_step = int(source_checkpoint["global_step"])
+    if int(checkpoint.get("epoch", -1)) != expected_epoch or int(
+        checkpoint.get("global_step", -1)
+    ) != expected_step:
+        raise RuntimeError(
+            "Stage-C source checkpoint is not the pinned epoch/global step: "
+            f"actual={checkpoint.get('epoch')}/{checkpoint.get('global_step')}, "
+            f"expected={expected_epoch}/{expected_step}"
+        )
+    source_cfg = checkpoint.get("config")
+    if not isinstance(source_cfg, dict):
+        raise RuntimeError(f"{source} has no saved Stage-B config")
+    if not centered_sentence_memory_enabled(source_cfg) or not (
+        configured_sentence_memory_association(source_cfg)["enabled"]
+    ):
+        raise RuntimeError(
+            f"{source} is not a centered absolute-association Stage-B checkpoint"
+        )
+    source_phase_b = source_cfg.get("sentence_memory_safety", {}).get(
+        "phase_b", {}
+    )
+    if not isinstance(source_phase_b, dict) or source_phase_b.get("enabled") is not False:
+        raise RuntimeError(f"{source} lacks the explicit canonical phase_b=false marker")
+    source_paired = source_cfg.get("sentence_memory_safety", {}).get(
+        "paired_corruption", {}
+    )
+    if not isinstance(source_paired, dict) or source_paired.get("enabled") is not True:
+        raise RuntimeError(f"{source} is not the paired centered Stage-B source")
+    selection_state = checkpoint.get("selection_state")
+    if not isinstance(selection_state, dict):
+        raise RuntimeError(f"{source} has no selection state")
+    if selection_state.get("best_feasible_score") is not None:
+        raise RuntimeError(f"{source} records a feasible checkpoint")
+    if selection_state.get("best_infeasible_score") is None or (
+        selection_state.get("best_infeasible_key") is None
+    ):
+        raise RuntimeError(f"{source} has no best-infeasible selection provenance")
+    metrics = checkpoint.get("metrics") or {}
+    if bool(metrics.get("selection_feasible", True)):
+        raise RuntimeError(f"{source} is not marked selection-infeasible")
+    initialization_parity = checkpoint.get("v2_to_v3_text_only_parity")
+    if not isinstance(initialization_parity, dict) or not bool(
+        initialization_parity.get("passed", False)
+    ):
+        raise RuntimeError(
+            f"{source} has no passing source initialization-parity proof"
+        )
+    selection_comparability = validate_stage_c_selection_comparability(
+        cfg, checkpoint, source=source
+    )
+    validate_sentence_memory_validation_corruption_map_identity(
+        checkpoint, cfg, source=source
+    )
+    source_partition = source_cfg.get("validation_text_partition") or {}
+    active_partition = cfg.get("validation_text_partition") or {}
+    partition_fields = (
+        "partition_digest",
+        "expected_partition_digest",
+        "expected_development_manifest_sha256",
+        "expected_development_rows",
+        "development_text_count",
+    )
+    partition_binding = {
+        name: copy.deepcopy(active_partition.get(name)) for name in partition_fields
+    }
+    if any(value is None for value in partition_binding.values()) or any(
+        source_partition.get(name) != active_partition.get(name)
+        for name in partition_fields
+    ):
+        raise RuntimeError(
+            "Stage-C source and active sealed development partitions differ"
+        )
+    source_text_metrics = {
+        name.removeprefix("val_text_only/"): value
+        for name, value in metrics.items()
+        if name.startswith("val_text_only/")
+    }
+    if not source_text_metrics:
+        raise RuntimeError(
+            f"{source} has no sealed-development val_text_only metrics"
+        )
+    teacher_validation_score = float(
+        selection_diagnostics(source_text_metrics, source_cfg)[0]
+    )
+    if not math.isfinite(teacher_validation_score):
+        raise RuntimeError(
+            f"{source} has a non-finite sealed-development text-only score"
+        )
+    stage_c["teacher_validation_selection_score"] = teacher_validation_score
+
+    expected_architecture = stage_c["source_stage_b"]["architecture_identity"]
+    calibration_transition = validate_stage_c_calibration_transition(
+        cfg, checkpoint, source=source
+    )
+    if calibration_transition["source_architecture_identity"] != expected_architecture:
+        raise RuntimeError("Stage-C source architecture identity is not the pinned value")
+
+    source_stage_b = stage_c["source_stage_b"]
+    config_path, config_sha256 = _validate_pinned_stage_c_file(
+        source_stage_b,
+        label="Stage-C source Stage-B config",
+        path_key="config_path",
+    )
+    decision_spec = stage_c["source_terminal_decision"]
+    decision_path, decision_sha256 = _validate_pinned_stage_c_file(
+        decision_spec, label="Stage-C source terminal decision"
+    )
+    try:
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"Could not read Stage-C source terminal decision {decision_path}: {error}"
+        ) from error
+    if not isinstance(decision, dict):
+        raise RuntimeError("Stage-C source terminal decision must be a JSON object")
+    if decision.get("schema_name") != "signtrajfield_centered_memory_ordered_decision" or int(
+        decision.get("schema_version", -1)
+    ) != 1:
+        raise RuntimeError("Stage-C source terminal decision has an unsupported schema")
+    for name, expected in (
+        ("decision_identity", decision_spec["decision_identity"]),
+        ("status", decision_spec["status"]),
+        ("authorized_purpose", decision_spec["authorized_purpose"]),
+    ):
+        if decision.get(name) != expected:
+            raise RuntimeError(
+                f"Stage-C terminal decision {name} mismatch: "
+                f"actual={decision.get(name)!r}, expected={expected!r}"
+            )
+    if decision.get("stage") != "stage2":
+        raise RuntimeError("Stage-C source decision is not the Stage-B/stage2 decision")
+    if decision.get("integrity_valid") is not True or decision.get(
+        "development_feasible"
+    ) is not False:
+        raise RuntimeError(
+            "Stage C requires an integrity-valid, development-infeasible source decision"
+        )
+    if decision.get("confirmation_manifest_opened") is not False or decision.get(
+        "test_data_accessed"
+    ) is not False:
+        raise RuntimeError(
+            "Stage-C source decision must attest no confirmation or test access"
+        )
+    decision_checkpoint = decision.get("checkpoint")
+    if not isinstance(decision_checkpoint, dict):
+        raise RuntimeError("Stage-C terminal decision has no checkpoint provenance")
+    try:
+        decision_checkpoint_path = Path(decision_checkpoint["path"]).resolve()
+    except (KeyError, TypeError) as error:
+        raise RuntimeError(
+            "Stage-C terminal decision has no valid checkpoint path"
+        ) from error
+    if decision_checkpoint_path != actual_checkpoint_path:
+        raise RuntimeError(
+            "Stage-C terminal decision names a different source checkpoint"
+        )
+    for name, expected in (
+        ("sha256", actual_checkpoint_sha256),
+        ("epoch", expected_epoch),
+        ("global_step", expected_step),
+        ("has_feasible_checkpoint", False),
+    ):
+        if decision_checkpoint.get(name) != expected:
+            raise RuntimeError(
+                f"Stage-C terminal decision checkpoint {name} mismatch"
+            )
+    decision_config = decision_checkpoint.get("config") or {}
+    if decision_config.get("sha256") != config_sha256:
+        raise RuntimeError(
+            "Stage-C terminal decision does not bind the pinned Stage-B config"
+        )
+    decision_architecture = (
+        decision_checkpoint.get("identities", {}).get("architecture", {}).get("digest")
+    )
+    if decision_architecture != expected_architecture:
+        raise RuntimeError(
+            "Stage-C terminal decision does not bind the pinned architecture"
+        )
+
+    teacher_path, teacher_sha256 = _validate_pinned_stage_c_file(
+        stage_c["frozen_v2_teacher"], label="Stage-C frozen-v2 teacher"
+    )
+    decision_teacher_sha256 = (
+        decision.get("development_integrity", {}).get("v2_checkpoint_sha256")
+    )
+    if decision_teacher_sha256 != teacher_sha256:
+        raise RuntimeError(
+            "Stage-C terminal decision uses a different frozen-v2 checkpoint"
+        )
+
+    checkpoint_memory = checkpoint.get("sentence_memory_identity")
+    active_memory = getattr(provider, "identity", None)
+    if not isinstance(checkpoint_memory, dict) or not isinstance(active_memory, dict):
+        raise RuntimeError("Stage C requires source and active memory identities")
+    if checkpoint_memory.get("bank_id") != active_memory.get("bank_id"):
+        raise RuntimeError("Stage-C source and active memory bank IDs differ")
+    checkpoint_neighbors = checkpoint_memory.get("neighbor_tables")
+    active_neighbors = active_memory.get("neighbor_tables")
+    if not isinstance(checkpoint_neighbors, dict) or checkpoint_neighbors != active_neighbors:
+        raise RuntimeError(
+            "Stage-C source and active sentence-neighbor table identities differ"
+        )
+    if not isinstance(active_neighbors.get("train"), dict):
+        raise RuntimeError("Stage C has no identity-bound training neighbor table")
+    distribution_contract = stage_c.get("resolved_distribution_contract")
+    _validated_named_identity(
+        distribution_contract, label="active Stage-C distribution contract"
+    )
+
+    provenance = _digest_named_identity(
+        {
+            "schema_name": "signtrajfield_stage_c_warm_start_provenance",
+            "schema_version": 1,
+            "declared_contract": declared,
+            "source_checkpoint": {
+                "path": str(actual_checkpoint_path),
+                "sha256": actual_checkpoint_sha256,
+                "selection_status": "best_infeasible",
+                "epoch": expected_epoch,
+                "global_step": expected_step,
+            },
+            "source_terminal_decision": {
+                "path": str(decision_path),
+                "sha256": decision_sha256,
+                "decision_identity": decision["decision_identity"],
+                "status": decision["status"],
+                "authorized_purpose": decision.get("authorized_purpose"),
+            },
+            "source_stage_b": {
+                "config_path": str(config_path),
+                "config_sha256": config_sha256,
+                "architecture_identity": expected_architecture,
+            },
+            "frozen_v2_teacher": {
+                "path": str(teacher_path),
+                "sha256": teacher_sha256,
+            },
+            "calibration_transition": calibration_transition,
+            "memory_semantic_equivalence": {
+                "bank_id": active_memory["bank_id"],
+                "bank_id_exact": True,
+                "neighbor_tables_exact": True,
+                "train_neighbor_table_identity": copy.deepcopy(
+                    active_neighbors["train"]
+                ),
+            },
+            # This is explicitly source-time evidence. It is not copied into
+            # Stage-C's live v2_to_v3_text_only_parity checkpoint field because
+            # generator updates invalidate that equality after the first step.
+            "source_initialization_v2_text_only_parity": copy.deepcopy(
+                initialization_parity
+            ),
+            "teacher_validation_reference": {
+                "source": "stage_b_memory_off_exact_v2_parity",
+                "selection_score": teacher_validation_score,
+                "selection_comparability_identity": (
+                    selection_comparability["digest"]
+                ),
+                "selection_comparability": copy.deepcopy(
+                    selection_comparability
+                ),
+                "selection_aggregation_identity": (
+                    checkpoint[
+                        "sentence_memory_selection_aggregation_identity"
+                    ]["digest"]
+                ),
+                "validation_corruption_map_identity": (
+                    checkpoint[
+                        "sentence_memory_validation_corruption_map_identity"
+                    ]["digest"]
+                ),
+                "sealed_development_partition": partition_binding,
+            },
+            "state_reset": {
+                "model_weights_only": True,
+                "epoch": 1,
+                "global_step": 0,
+                "optimizer": "fresh",
+                "selection": "fresh",
+            },
+            "distribution_contract": copy.deepcopy(
+                distribution_contract
+            ),
+            "trainability_contract": stage_c_trainability_contract(),
+            "optimizer_parameter_mapping": (
+                stage_c_optimizer_parameter_mapping_contract()
+            ),
+            "scope": {
+                "development_only": True,
+                "non_authorizing": True,
+                "promotion_eligible": False,
+                "confirmation_manifest_opened": False,
+                "test_data_accessed": False,
+            },
+        }
+    )
+    stage_c["resolved_source_provenance"] = provenance
+    return provenance
+
+
+def validate_stage_c_resume_checkpoint(cfg, checkpoint, source="checkpoint"):
+    """Require exact Stage-C provenance before resuming an adaptation run."""
+
+    if not stage_c_enabled(cfg):
+        return None
+    checkpoint_cfg = checkpoint.get("config") or {}
+    checkpoint_stage_c = configured_stage_c(checkpoint_cfg)
+    if not bool(checkpoint_stage_c.get("enabled", False)):
+        raise RuntimeError(f"{source} is not a Stage-C checkpoint")
+    if _stage_c_declared_contract(checkpoint_stage_c) != _stage_c_declared_contract(
+        configured_stage_c(cfg)
+    ):
+        raise RuntimeError(f"{source} has a different Stage-C declared contract")
+    provenance = checkpoint.get("stage_c_provenance")
+    if not isinstance(provenance, dict):
+        raise RuntimeError(f"{source} has no Stage-C warm-start provenance")
+    payload = {key: value for key, value in provenance.items() if key != "digest"}
+    actual_digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if provenance.get("digest") != actual_digest:
+        raise RuntimeError(f"{source} has an invalid Stage-C provenance digest")
+    if provenance.get("declared_contract") != _stage_c_declared_contract(
+        configured_stage_c(cfg)
+    ):
+        raise RuntimeError(f"{source} Stage-C provenance does not match active config")
+    saved_distribution = checkpoint.get("stage_c_distribution_contract")
+    active_distribution = configured_stage_c(cfg).get(
+        "resolved_distribution_contract"
+    )
+    if not isinstance(saved_distribution, dict) or (
+        saved_distribution != active_distribution
+    ):
+        raise RuntimeError(
+            f"{source} Stage-C distribution contract differs from this launch"
+        )
+    _validated_named_identity(
+        saved_distribution, label=f"{source} Stage-C distribution contract"
+    )
+    if provenance.get("distribution_contract") != active_distribution:
+        raise RuntimeError(
+            f"{source} warm-start provenance has a different distribution contract"
+        )
+    expected_trainability = stage_c_trainability_contract()
+    saved_trainability = checkpoint.get("stage_c_trainability_contract")
+    if saved_trainability != expected_trainability:
+        raise RuntimeError(
+            f"{source} Stage-C trainability contract differs from schema v1"
+        )
+    _validated_named_identity(
+        saved_trainability, label=f"{source} Stage-C trainability contract"
+    )
+    if provenance.get("trainability_contract") != expected_trainability:
+        raise RuntimeError(
+            f"{source} warm-start provenance has a different trainability contract"
+        )
+    expected_optimizer_mapping = (
+        stage_c_optimizer_parameter_mapping_contract()
+    )
+    saved_optimizer_mapping = checkpoint.get(
+        "stage_c_optimizer_parameter_mapping"
+    )
+    if saved_optimizer_mapping != expected_optimizer_mapping:
+        raise RuntimeError(
+            f"{source} Stage-C optimizer parameter mapping differs from schema v1"
+        )
+    _validated_named_identity(
+        saved_optimizer_mapping,
+        label=f"{source} Stage-C optimizer parameter mapping",
+    )
+    if provenance.get("optimizer_parameter_mapping") != (
+        expected_optimizer_mapping
+    ):
+        raise RuntimeError(
+            f"{source} warm-start provenance has a different optimizer mapping"
+        )
+    if provenance.get("state_reset") != {
+        "model_weights_only": True,
+        "epoch": 1,
+        "global_step": 0,
+        "optimizer": "fresh",
+        "selection": "fresh",
+    }:
+        raise RuntimeError(f"{source} lacks exact Stage-C state-reset provenance")
+    scope = provenance.get("scope") or {}
+    if scope != {
+        "development_only": True,
+        "non_authorizing": True,
+        "promotion_eligible": False,
+        "confirmation_manifest_opened": False,
+        "test_data_accessed": False,
+    }:
+        raise RuntimeError(f"{source} has invalid Stage-C authorization scope")
+    configured_stage_c(cfg)["resolved_source_provenance"] = copy.deepcopy(
+        provenance
+    )
+    return provenance
+
+
 def _phase_b_gate_source_paths(report):
     source_files = report.get("provenance", {}).get("source_files", {})
     required = {
@@ -2286,7 +3730,7 @@ class DevelopmentValidationRuntime:
 
 
 def requires_isolated_development_validation(cfg):
-    """Return whether the factorized paired objective needs its sealed dev view."""
+    """Return whether a protected factorized run needs its sealed dev view."""
 
     memory_mode = str(
         cfg.get("sentence_memory", {}).get(
@@ -2296,9 +3740,21 @@ def requires_isolated_development_validation(cfg):
     partition_cfg = cfg.get("validation_text_partition")
     return bool(
         memory_mode == "factorized_metadata_motion_v1"
-        and paired_sentence_memory_corruption_config(cfg)["enabled"]
+        and (
+            paired_sentence_memory_corruption_config(cfg)["enabled"]
+            or stage_c_enabled(cfg)
+        )
         and isinstance(partition_cfg, dict)
         and partition_cfg.get("enabled", False)
+    )
+
+
+def requires_development_only_selection(cfg):
+    """Keep protected training phases off confirmation rows by construction."""
+
+    return bool(
+        paired_sentence_memory_corruption_config(cfg)["enabled"]
+        or stage_c_enabled(cfg)
     )
 
 
@@ -2800,9 +4256,9 @@ def build_development_validation_loader(
     sentence_memory_provider,
     dist_info,
 ):
-    """Restrict paired-objective checkpoint selection to fixed novel dev texts."""
+    """Restrict protected checkpoint selection to fixed novel dev texts."""
 
-    if not paired_sentence_memory_corruption_config(cfg)["enabled"]:
+    if not requires_development_only_selection(cfg):
         return loader, getattr(loader, "sampler", None), None
     partition_cfg = cfg.get("validation_text_partition")
     if not isinstance(partition_cfg, dict) or not bool(
@@ -3033,6 +4489,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--stage_c_warm_start",
+        type=Path,
+        default=None,
+        help=(
+            "Load the exact pinned centered Stage-B best_infeasible model into "
+            "a development-only, non-authorizing Stage-C adaptation run while "
+            "resetting epoch, optimizer, and checkpoint selection state."
+        ),
+    )
+    parser.add_argument(
         "--phase_b_gate_report",
         type=Path,
         default=None,
@@ -3087,6 +4553,10 @@ def apply_overrides(cfg, args):
         )
     if args.warm_start is not None:
         cfg.setdefault("train", {})["warm_start_checkpoint"] = str(args.warm_start)
+    if args.stage_c_warm_start is not None:
+        cfg.setdefault("train", {})["stage_c_warm_start_checkpoint"] = str(
+            args.stage_c_warm_start
+        )
     if args.phase_b_gate_report is not None:
         cfg.setdefault("sentence_memory_safety", {}).setdefault(
             "phase_b", {}
@@ -3702,12 +5172,13 @@ def phase_b_off_distillation(
     ``prepare_field_batch`` produces the student text-only rows alongside the
     primary rows in one call through the DDP wrapper.  This helper only runs the
     frozen teacher and forms the loss, avoiding a second trainable forward
-    before backward.
+    before backward. The historical function name is retained for callers;
+    both Phase B and the isolated Stage-C contract use this exact mechanism.
     """
 
     if sentence_off_teacher is None:
         raise RuntimeError(
-            "Phase-B off distillation is enabled without a frozen teacher"
+            "Sentence-off distillation is enabled without a frozen teacher"
         )
     teacher_kwargs = {
         "text_tokens": prepared["text_tokens"],
@@ -3728,7 +5199,7 @@ def phase_b_off_distillation(
     student_prediction = prepared.get("phase_b_student_off_prediction")
     if student_prediction is None:
         raise RuntimeError(
-            "Phase-B batch has no differentiable text-only student prediction"
+            "Distillation batch has no differentiable text-only student prediction"
         )
     valid_frames = batch["mask"].bool()
     if bool(valid_frames.any()):
@@ -4675,12 +6146,13 @@ def prepare_field_batch(
             and paired_sentence_memory_corruption_config(cfg)["enabled"]
             and sentence_memory_corrupt_batch is not None
         )
+        _off_distillation_phase, off_distillation_cfg = (
+            configured_sentence_off_distillation(cfg)
+        )
         phase_b_combined_forward = bool(
             training
             and is_sentence_memory_model(cfg)
-            and cfg.get("sentence_memory_safety", {})
-            .get("phase_b", {})
-            .get("enabled", False)
+            and off_distillation_cfg is not None
         )
         if paired_forward:
             outputs, sentence_memory_corrupt_outputs = (
@@ -4913,8 +6385,10 @@ def compute_batch_losses(
     association_diagnostics = None
     sentence_safety_cfg = cfg.get("sentence_memory_safety", {})
     paired_cfg = paired_sentence_memory_corruption_config(cfg)
-    phase_b_cfg = sentence_safety_cfg.get("phase_b", {})
-    phase_b_enabled = bool(training and phase_b_cfg.get("enabled", False))
+    _off_distillation_phase, phase_b_cfg = configured_sentence_off_distillation(
+        cfg
+    )
+    phase_b_enabled = bool(training and phase_b_cfg is not None)
     phase_b_teacher_prediction = None
     if phase_b_enabled:
         (
@@ -5548,6 +7022,75 @@ def configure_sentence_memory_trainable_parameters(model, cfg):
     )
     if not is_sentence_memory_model(cfg):
         return {"freeze_base": False, "trainable": None}
+    if stage_c_enabled(cfg):
+        if not freeze_base or train_cfg.get("freeze_sentence_memory") is not True:
+            raise RuntimeError(
+                "Stage C requires explicit base and sentence-memory freezing"
+            )
+        if unfreeze_prefixes != STAGE_C_GENERATOR_PREFIXES:
+            raise RuntimeError(
+                "Stage C trainability differs from the approved generator allowlist"
+            )
+        named_parameters = list(unwrap_model(model).named_parameters())
+        trainable = []
+        matched_prefixes = set()
+        for name, parameter in named_parameters:
+            matched = tuple(
+                prefix for prefix in STAGE_C_GENERATOR_PREFIXES if name.startswith(prefix)
+            )
+            enabled = bool(matched) and not is_sentence_memory_parameter(name)
+            parameter.requires_grad_(enabled)
+            if enabled:
+                trainable.append(name)
+                matched_prefixes.update(matched)
+        missing_prefixes = sorted(set(STAGE_C_GENERATOR_PREFIXES) - matched_prefixes)
+        if not trainable or missing_prefixes:
+            raise RuntimeError(
+                "Stage C generator allowlist did not match the complete model; "
+                f"missing_prefixes={missing_prefixes}"
+            )
+        memory_trainable = [
+            name
+            for name, parameter in named_parameters
+            if is_sentence_memory_parameter(name) and parameter.requires_grad
+        ]
+        if memory_trainable:
+            raise RuntimeError(
+                "Stage C must freeze every sentence-memory tensor; unexpectedly "
+                f"trainable={memory_trainable}"
+            )
+        actual_trainable_names = tuple(sorted(trainable))
+        if actual_trainable_names != STAGE_C_GENERATOR_PARAMETER_NAMES:
+            missing = sorted(
+                set(STAGE_C_GENERATOR_PARAMETER_NAMES) - set(actual_trainable_names)
+            )
+            unexpected = sorted(
+                set(actual_trainable_names) - set(STAGE_C_GENERATOR_PARAMETER_NAMES)
+            )
+            raise RuntimeError(
+                "Stage C must train exactly the 20 pinned generator tensors; "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        trainable_parameter_count = sum(
+            int(parameter.numel())
+            for name, parameter in named_parameters
+            if name in STAGE_C_GENERATOR_PARAMETER_NAMES
+        )
+        if trainable_parameter_count != STAGE_C_GENERATOR_PARAMETER_COUNT:
+            raise RuntimeError(
+                "Stage-C generator parameter count differs from the pinned "
+                f"1,109,395-parameter payload: actual={trainable_parameter_count}"
+            )
+        tensor_contract = stage_c_trainability_contract()
+        return {
+            "freeze_base": True,
+            "freeze_sentence_memory": True,
+            "unfreeze_base_prefixes": unfreeze_prefixes,
+            "trainable": list(actual_trainable_names),
+            "trainable_parameter_count": trainable_parameter_count,
+            "trainability_contract": tensor_contract,
+            "stage_c_arm": configured_stage_c(cfg)["arm"],
+        }
     trainable = []
     for name, parameter in unwrap_model(model).named_parameters():
         enabled = (
@@ -5571,12 +7114,33 @@ def configure_sentence_memory_trainable_parameters(model, cfg):
 
 
 def build_sentence_off_teacher(cfg, text_dim, device):
-    """Build the frozen v2 teacher used by optional Phase-B off distillation."""
+    """Build the frozen v2 teacher used by protected off distillation."""
 
-    phase_b = cfg.get("sentence_memory_safety", {}).get("phase_b", {})
-    if not bool(phase_b.get("enabled", False)):
+    phase_name, phase_b = configured_sentence_off_distillation(cfg)
+    if phase_b is None:
         return None
-    checkpoint_path = phase_b.get("teacher_checkpoint")
+    if phase_name == "stage_c":
+        teacher_spec = phase_b.get("frozen_v2_teacher") or {}
+        checkpoint_path = teacher_spec.get("path")
+        if not checkpoint_path:
+            raise ValueError(
+                "sentence_memory_safety.stage_c.frozen_v2_teacher.path is required"
+            )
+        teacher_path = Path(checkpoint_path).resolve()
+        if not teacher_path.is_file():
+            raise RuntimeError(f"Stage-C frozen-v2 teacher does not exist: {teacher_path}")
+        actual_sha256 = _sha256_file_stream(teacher_path)
+        expected_sha256 = _require_sha256(
+            teacher_spec.get("sha256"), label="Stage-C frozen-v2 teacher sha256"
+        )
+        if actual_sha256 != expected_sha256:
+            raise RuntimeError(
+                "Stage-C frozen-v2 teacher SHA256 mismatch: "
+                f"actual={actual_sha256}, expected={expected_sha256}"
+            )
+        checkpoint_path = teacher_path
+    else:
+        checkpoint_path = phase_b.get("teacher_checkpoint")
     if not checkpoint_path:
         raise ValueError(
             "sentence_memory_safety.phase_b.teacher_checkpoint is required "
@@ -5597,26 +7161,37 @@ def build_sentence_off_teacher(cfg, text_dim, device):
     for parameter in teacher.parameters():
         parameter.requires_grad_(False)
 
-    # Bind the Phase-B validation guard to the actual source-v2 validation
-    # result.  This avoids re-running a fourth validation forward every epoch
-    # while still making the 0.5% no-regression threshold checkpoint-specific.
-    validation_prefix = "val_text_only/"
-    teacher_validation = {
-        name.removeprefix(validation_prefix): value
-        for name, value in (checkpoint.get("metrics") or {}).items()
-        if name.startswith(validation_prefix)
-    }
-    if not teacher_validation:
-        raise RuntimeError(
-            "Phase-B teacher checkpoint has no val_text_only/* metrics; "
-            "it cannot establish the required text-only validation guard"
-        )
-    teacher_score = float(selection_diagnostics(teacher_validation, cfg)[0])
-    if not math.isfinite(teacher_score):
-        raise RuntimeError(
-            "Phase-B teacher has a non-finite text-only validation score"
-        )
-    phase_b["teacher_validation_selection_score"] = teacher_score
+    if phase_name == "stage_c":
+        # The v2 checkpoint's stored validation is the legacy 1,077-row,
+        # row-weighted split and is not comparable to Stage C's sealed
+        # 347-row/256-text cluster-equal development view. Warm-start
+        # validation has already bound the exact-parity Stage-B memory-off
+        # score on that identical development partition instead.
+        teacher_score = phase_b.get("teacher_validation_selection_score")
+        if teacher_score is None or not math.isfinite(float(teacher_score)):
+            raise RuntimeError(
+                "Stage C has no like-for-like sealed-development frozen-v2 "
+                "validation reference"
+            )
+    else:
+        # Preserve canonical Phase-B behavior exactly.
+        validation_prefix = "val_text_only/"
+        teacher_validation = {
+            name.removeprefix(validation_prefix): value
+            for name, value in (checkpoint.get("metrics") or {}).items()
+            if name.startswith(validation_prefix)
+        }
+        if not teacher_validation:
+            raise RuntimeError(
+                "Phase-B teacher checkpoint has no val_text_only/* metrics; "
+                "it cannot establish the required text-only validation guard"
+            )
+        teacher_score = float(selection_diagnostics(teacher_validation, cfg)[0])
+        if not math.isfinite(teacher_score):
+            raise RuntimeError(
+                "Phase-B teacher has a non-finite text-only validation score"
+            )
+        phase_b["teacher_validation_selection_score"] = teacher_score
     return teacher
 
 
@@ -5672,6 +7247,41 @@ def build_optimizer(model, cfg):
     if not groups:
         raise RuntimeError("No trainable parameters remain for the optimizer")
     return torch.optim.AdamW(groups, weight_decay=weight_decay)
+
+
+def validate_stage_c_optimizer_parameter_mapping(model, optimizer, cfg):
+    """Prove the persisted optimizer-ID/name mapping for Stage C."""
+
+    if not stage_c_enabled(cfg):
+        return None
+    names_by_parameter_id = {
+        id(parameter): name
+        for name, parameter in unwrap_model(model).named_parameters()
+    }
+    actual_groups = []
+    for group_index, group in enumerate(optimizer.param_groups):
+        parameter_names = []
+        for parameter in group.get("params", ()):
+            name = names_by_parameter_id.get(id(parameter))
+            if name is None:
+                raise RuntimeError(
+                    "Stage-C optimizer contains a parameter absent from the model"
+                )
+            parameter_names.append(name)
+        actual_groups.append(
+            {
+                "group_index": group_index,
+                "group_name": group.get("group_name"),
+                "parameter_names": parameter_names,
+            }
+        )
+    expected = stage_c_optimizer_parameter_mapping_contract()
+    if actual_groups != expected["groups"]:
+        raise RuntimeError(
+            "Stage-C optimizer parameter ordering/grouping differs from the "
+            f"pinned mapping: actual={actual_groups}"
+        )
+    return expected
 
 
 def configure_optimizer_epoch(optimizer, cfg, epoch):
@@ -7420,22 +9030,74 @@ def _centered_sentence_memory_selection_diagnostics(
     parity = cfg.get("sentence_memory_safety", {}).get(
         "v2_to_v3_text_only_parity"
     )
-    parity_details = {}
-    for parity_name in ("prediction_max_abs", "duration_max_abs"):
-        parity_value = (
-            float(parity.get(parity_name, math.nan))
-            if isinstance(parity, dict) and bool(parity.get("passed", False))
-            else math.nan
+    if stage_c_enabled(cfg):
+        # Generator adaptation intentionally invalidates source-time equality.
+        # Do not present the inherited zero-valued proof as a live metric.
+        provenance = configured_stage_c(cfg).get("resolved_source_provenance") or {}
+        diagnostic["v2_text_only_parity"] = {
+            "applicable": False,
+            "reason": "source_initialization_only_generator_adapted",
+            "source_initialization": copy.deepcopy(
+                provenance.get("source_initialization_v2_text_only_parity")
+            ),
+        }
+    else:
+        parity_details = {}
+        for parity_name in ("prediction_max_abs", "duration_max_abs"):
+            parity_value = (
+                float(parity.get(parity_name, math.nan))
+                if isinstance(parity, dict) and bool(parity.get("passed", False))
+                else math.nan
+            )
+            add_maximum(
+                f"v2_{parity_name}",
+                parity_value,
+                1e-7,
+                scale=1e-7,
+                reason=f"stored v2 {parity_name} parity proof exceeds 1e-7",
+            )
+            parity_details[parity_name] = parity_value
+        diagnostic["v2_text_only_parity"] = parity_details
+
+    off_phase_name, off_phase_cfg = configured_sentence_off_distillation(cfg)
+    if off_phase_cfg is not None:
+        teacher_score = off_phase_cfg.get("teacher_validation_selection_score")
+        if teacher_score is None:
+            raise ValueError(
+                f"{off_phase_name} selection requires the validation score "
+                "bound to its frozen v2 teacher"
+            )
+        teacher_score = float(teacher_score)
+        tolerance = float(
+            off_phase_cfg.get("text_only_max_relative_degradation", 0.005)
         )
-        add_maximum(
-            f"v2_{parity_name}",
-            parity_value,
-            1e-7,
-            scale=1e-7,
-            reason=f"stored v2 {parity_name} parity proof exceeds 1e-7",
+        if tolerance < 0.0:
+            raise ValueError(
+                f"{off_phase_name}.text_only_max_relative_degradation must be "
+                "non-negative"
+            )
+        scale = max(abs(teacher_score), 1e-8)
+        allowed = teacher_score + tolerance * scale
+        teacher_violation = (
+            max(scores["off"] - allowed, 0.0) / scale
+            if math.isfinite(scores["off"]) and math.isfinite(teacher_score)
+            else float("inf")
         )
-        parity_details[parity_name] = parity_value
-    diagnostic["v2_text_only_parity"] = parity_details
+        violation += teacher_violation
+        feasible = bool(feasible and teacher_violation <= 1e-12)
+        if teacher_violation > 0.0:
+            reasons.append(
+                f"{off_phase_name} live text-only score {scores['off']:.6g} "
+                f"is more than {100.0 * tolerance:.2f}% worse than frozen-v2 "
+                f"teacher score {teacher_score:.6g}"
+            )
+        diagnostic[f"{off_phase_name}_text_only_guard"] = {
+            "live_text_only_score": scores["off"],
+            "teacher_score": teacher_score,
+            "allowed_text_only_score": allowed,
+            "max_relative_degradation": tolerance,
+            "violation": teacher_violation,
+        }
 
     hand_details = {}
     for hand in ("lhand", "rhand"):
@@ -7667,22 +9329,21 @@ def checkpoint_selection_diagnostics(metrics, cfg, return_details=False):
                     feasible = bool(feasible and hand_violation <= 1e-12)
                 memory_details["hand_path_nonregression"] = hand_rows
 
-        phase_b_cfg = (
-            cfg.get("sentence_memory_safety", {}).get("phase_b", {})
-        )
-        if bool(phase_b_cfg.get("enabled", False)):
+        off_phase_name, phase_b_cfg = configured_sentence_off_distillation(cfg)
+        if phase_b_cfg is not None:
             teacher_score = phase_b_cfg.get("teacher_validation_selection_score")
             if teacher_score is None:
                 raise ValueError(
-                    "Phase-B selection requires the validation score bound to "
-                    "its frozen v2 teacher"
+                    f"{off_phase_name} selection requires the validation score "
+                    "bound to its frozen v2 teacher"
                 )
             tolerance = float(
                 phase_b_cfg.get("text_only_max_relative_degradation", 0.005)
             )
             if tolerance < 0:
                 raise ValueError(
-                    "phase_b.text_only_max_relative_degradation must be non-negative"
+                    f"{off_phase_name}.text_only_max_relative_degradation must "
+                    "be non-negative"
                 )
             current_text_score = (
                 float(selection_diagnostics(text_metrics, cfg)[0])
@@ -7703,12 +9364,12 @@ def checkpoint_selection_diagnostics(metrics, cfg, return_details=False):
             feasible = bool(feasible and teacher_violation <= 1e-12)
             if teacher_violation > 0:
                 details["rejection_reasons"].append(
-                    "Phase-B text-only score "
+                    f"{off_phase_name} text-only score "
                     f"{current_text_score:.6g} is more than "
                     f"{100.0 * tolerance:.2f}% worse than frozen-v2 teacher "
                     f"score {teacher_score:.6g}"
                 )
-            memory_details["phase_b_text_only_guard"] = {
+            memory_details[f"{off_phase_name}_text_only_guard"] = {
                 "text_only_score": current_text_score,
                 "teacher_score": teacher_score,
                 "allowed_text_only_score": allowed_text_score,
@@ -8143,6 +9804,18 @@ def checkpoint_selection_state(
     return state
 
 
+def selected_checkpoint_artifact_name(cfg, *, feasible):
+    """Return a promotion-safe filename for a selected validation artifact."""
+
+    if stage_c_enabled(cfg):
+        return (
+            "best_exploratory.pt"
+            if bool(feasible)
+            else "best_exploratory_infeasible.pt"
+        )
+    return "best.pt" if bool(feasible) else "best_infeasible.pt"
+
+
 def restore_checkpoint_selection_scores(checkpoint, *, require=False, source="checkpoint"):
     state = checkpoint.get("selection_state")
     if not isinstance(state, dict) or int(state.get("schema_version", -1)) not in {
@@ -8508,6 +10181,48 @@ def save_checkpoint(
             "phase_b_scientific_gate": cfg.get(
                 "sentence_memory_safety", {}
             ).get("phase_b", {}).get("resolved_scientific_gate"),
+            "stage_c_provenance": (
+                copy.deepcopy(
+                    configured_stage_c(cfg).get("resolved_source_provenance")
+                )
+                if stage_c_enabled(cfg)
+                else None
+            ),
+            "stage_c_distribution_contract": (
+                copy.deepcopy(
+                    configured_stage_c(cfg).get(
+                        "resolved_distribution_contract"
+                    )
+                )
+                if stage_c_enabled(cfg)
+                else None
+            ),
+            "stage_c_trainability_contract": (
+                stage_c_trainability_contract()
+                if stage_c_enabled(cfg)
+                else None
+            ),
+            "stage_c_optimizer_parameter_mapping": (
+                validate_stage_c_optimizer_parameter_mapping(
+                    model, optimizer, cfg
+                )
+                if stage_c_enabled(cfg)
+                else None
+            ),
+            "stage_c_authorization_scope": (
+                {
+                    "schema_name": STAGE_C_SCHEMA_NAME,
+                    "schema_version": STAGE_C_SCHEMA_VERSION,
+                    "arm": configured_stage_c(cfg).get("arm"),
+                    "development_only": True,
+                    "non_authorizing": True,
+                    "promotion_eligible": False,
+                    "confirmation_manifest_opened": False,
+                    "test_data_accessed": False,
+                }
+                if stage_c_enabled(cfg)
+                else None
+            ),
         }
 
     # ``last.pt`` is the sole exact-continuation boundary for an interrupted
@@ -8683,10 +10398,16 @@ def main():
     args = parse_args()
     if sum(
         value is not None
-        for value in (args.resume, args.warm_start, args.base_checkpoint)
+        for value in (
+            args.resume,
+            args.warm_start,
+            args.stage_c_warm_start,
+            args.base_checkpoint,
+        )
     ) > 1:
         raise ValueError(
-            "--resume, --warm_start, and --base_checkpoint are mutually exclusive"
+            "--resume, --warm_start, --stage_c_warm_start, and "
+            "--base_checkpoint are mutually exclusive"
         )
     cfg = apply_overrides(load_config(args.config), args)
     if centered_sentence_memory_enabled(cfg):
@@ -8698,6 +10419,11 @@ def main():
         resume=args.resume,
         phase_b_gate_report=args.phase_b_gate_report,
     )
+    validate_stage_c_training_contract(
+        cfg,
+        stage_c_warm_start=args.stage_c_warm_start,
+        resume=args.resume,
+    )
     if is_sentence_memory_model(cfg):
         cfg.setdefault("sentence_memory", {})[
             "resolved_behavior_identity"
@@ -8705,7 +10431,9 @@ def main():
     isolated_validation_runtime = load_isolated_development_validation_runtime(
         cfg
     )
-    if args.warm_start is not None and configured_model_type(cfg) == DUAL_MODE_MODEL_TYPE:
+    if (
+        args.warm_start is not None or args.stage_c_warm_start is not None
+    ) and configured_model_type(cfg) == DUAL_MODE_MODEL_TYPE:
         raise ValueError(
             "Dual-mode v2 must be trained from scratch and does not accept "
             "--warm_start. Use --resume for an exact v2 continuation."
@@ -8715,6 +10443,7 @@ def main():
     dist_info = setup_distributed(args)
     set_seed(int(cfg.get("seed", 1234)) + int(dist_info.get("rank", 0)))
     device = resolve_distributed_device(cfg.get("device", "auto"), dist_info)
+    validate_stage_c_distributed_runtime(cfg, dist_info, device)
     text_device = torch.device(cfg.get("text", {}).get("device", "cpu"))
     if dist_info["is_main"]:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -8809,7 +10538,7 @@ def main():
             "neighbor_tables": {},
         }
     validation_text_partition = None
-    if paired_sentence_memory_corruption_config(cfg)["enabled"]:
+    if requires_development_only_selection(cfg):
         if isolated_validation_runtime is not None:
             val_loader, val_sampler, validation_text_partition = (
                 build_isolated_development_validation_loader(
@@ -8912,6 +10641,7 @@ def main():
         and bool(train_cfg.get("freeze_base", False))
         and args.resume is None
         and args.warm_start is None
+        and args.stage_c_warm_start is None
         and base_checkpoint_path is None
     ):
         raise ValueError(
@@ -8930,6 +10660,9 @@ def main():
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu")
         validate_phase_b_resume_checkpoint(
+            cfg, checkpoint, source=str(args.resume)
+        )
+        validate_stage_c_resume_checkpoint(
             cfg, checkpoint, source=str(args.resume)
         )
         validate_checkpoint_contract(checkpoint, cfg, source=str(args.resume))
@@ -8965,10 +10698,14 @@ def main():
         )
         if is_sentence_memory_model(cfg):
             parity = checkpoint.get("v2_to_v3_text_only_parity")
-            if isinstance(parity, dict):
+            if isinstance(parity, dict) and not stage_c_enabled(cfg):
                 cfg.setdefault("sentence_memory_safety", {})[
                     "v2_to_v3_text_only_parity"
                 ] = parity
+            elif stage_c_enabled(cfg):
+                cfg.setdefault("sentence_memory_safety", {}).pop(
+                    "v2_to_v3_text_only_parity", None
+                )
             gate = checkpoint.get("phase_b_scientific_gate")
             if isinstance(gate, dict):
                 cfg.setdefault("sentence_memory_safety", {}).setdefault(
@@ -8987,7 +10724,7 @@ def main():
             require=is_sentence_memory_model(cfg),
             source=str(args.resume),
         )
-        if paired_objective_enabled:
+        if paired_objective_enabled or stage_c_enabled(cfg):
             best_infeasible_key = restore_best_infeasible_selection_key(
                 checkpoint,
                 require=True,
@@ -9009,7 +10746,9 @@ def main():
             resume_pending_validation_row,
         ) = pending_validation_resume_state(
             checkpoint,
-            paired_objective_enabled=paired_objective_enabled,
+            paired_objective_enabled=(
+                paired_objective_enabled or stage_c_enabled(cfg)
+            ),
         )
         if resume_pending_validation_epoch is not None:
             start_epoch = resume_pending_validation_epoch
@@ -9017,6 +10756,50 @@ def main():
             # Restore only after model/teacher/DDP/W&B initialization has
             # finished, so those setup steps cannot consume continuation RNG.
             resume_rng_checkpoint = checkpoint
+    elif args.stage_c_warm_start:
+        checkpoint = torch.load(args.stage_c_warm_start, map_location="cpu")
+        validate_checkpoint_contract(
+            checkpoint, cfg, source=str(args.stage_c_warm_start)
+        )
+        stage_c_provenance = validate_stage_c_warm_start_checkpoint(
+            cfg,
+            checkpoint,
+            args.stage_c_warm_start,
+            provider=sentence_memory_provider,
+            source=str(args.stage_c_warm_start),
+        )
+        validate_sentence_memory_checkpoint_identity(
+            checkpoint,
+            sentence_memory_provider,
+            source=str(args.stage_c_warm_start),
+            # Stage C has an explicit, stricter cross-source calibration
+            # transition above. Passing the active cfg to the general validator
+            # would falsely claim the old checkpoint used the fresh identity.
+            cfg=None,
+            text_encoder_identity=(
+                text_encoder.checkpoint_identity()
+                if hasattr(text_encoder, "checkpoint_identity")
+                else None
+            ),
+        )
+        # The source parity proof describes only the frozen Stage-B
+        # initialization. Generator updates make it stale, so Stage-C
+        # checkpoints expose it only inside their explicit provenance record.
+        cfg.setdefault("sentence_memory_safety", {}).pop(
+            "v2_to_v3_text_only_parity", None
+        )
+        model.load_state_dict(checkpoint["model"], strict=True)
+        rank_zero_print(
+            dist_info,
+            f"Warm-started Stage-C model weights from {args.stage_c_warm_start} "
+            f"(source_epoch={checkpoint.get('epoch')}, "
+            f"source_global_step={checkpoint.get('global_step')}); optimizer, "
+            "epoch/global-step, and selection state reset; "
+            f"arm={configured_stage_c(cfg)['arm']} "
+            f"provenance={stage_c_provenance['digest']} "
+            "development_only=true non_authorizing=true "
+            "promotion_eligible=false.",
+        )
     elif args.warm_start:
         checkpoint = torch.load(args.warm_start, map_location="cpu")
         validate_checkpoint_contract(checkpoint, cfg, source=str(args.warm_start))
@@ -9122,6 +10905,7 @@ def main():
         find_unused_parameters=is_dual_mode(cfg),
     )
     optimizer = build_optimizer(model, cfg)
+    validate_stage_c_optimizer_parameter_mapping(model, optimizer, cfg)
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
 
@@ -9301,12 +11085,44 @@ def main():
             row["selection_score"] = score
             row["selection_constraint_violation"] = constraint_violation
             row["selection_feasible"] = float(selection_feasible)
+            if stage_c_enabled(cfg):
+                row.update(
+                    {
+                        "stage_c_development_only": 1.0,
+                        "stage_c_non_authorizing": 1.0,
+                        "stage_c_promotion_eligible": 0.0,
+                    }
+                )
             row["selection_rejection_reasons"] = "; ".join(
                 selection_details["rejection_reasons"]
             )
             for name, value in selection_details.get("dual_mode", {}).items():
                 if isinstance(value, (int, float)):
                     row[f"selection_{name}"] = value
+            if stage_c_enabled(cfg):
+                stage_c_guard = selection_details.get("dual_mode", {}).get(
+                    "stage_c_text_only_guard"
+                )
+                if not isinstance(stage_c_guard, dict):
+                    raise RuntimeError(
+                        "Stage-C selection did not expose its live memory-off guard"
+                    )
+                for name in (
+                    "live_text_only_score",
+                    "teacher_score",
+                    "allowed_text_only_score",
+                    "max_relative_degradation",
+                    "violation",
+                ):
+                    value = float(stage_c_guard.get(name, math.nan))
+                    if not math.isfinite(value):
+                        raise RuntimeError(
+                            f"Stage-C text-only guard field {name!r} is non-finite"
+                        )
+                    row[f"selection_stage_c_text_only_guard_{name}"] = value
+                row["selection_stage_c_text_only_guard_passed"] = float(
+                    stage_c_guard["violation"] <= 1e-12
+                )
             early_stop_requested = False
             if early_stopping_state is not None:
                 (
@@ -9384,7 +11200,9 @@ def main():
                 )
             if dist_info["is_main"] and improved_feasible:
                 save_checkpoint(
-                    out_dir / "checkpoints" / "best.pt",
+                    out_dir
+                    / "checkpoints"
+                    / selected_checkpoint_artifact_name(cfg, feasible=True),
                     unwrap_model(model),
                     optimizer,
                     epoch,
@@ -9396,7 +11214,9 @@ def main():
                 )
             elif dist_info["is_main"] and improved_infeasible:
                 save_checkpoint(
-                    out_dir / "checkpoints" / "best_infeasible.pt",
+                    out_dir
+                    / "checkpoints"
+                    / selected_checkpoint_artifact_name(cfg, feasible=False),
                     unwrap_model(model),
                     optimizer,
                     epoch,
@@ -9456,6 +11276,26 @@ def main():
             ),
             "early_stopping": copy.deepcopy(early_stopping_state),
         }
+        if stage_c_enabled(cfg):
+            selection_summary["stage_c"] = {
+                "schema_name": STAGE_C_SCHEMA_NAME,
+                "schema_version": STAGE_C_SCHEMA_VERSION,
+                "arm": configured_stage_c(cfg)["arm"],
+                "development_only": True,
+                "non_authorizing": True,
+                "promotion_eligible": False,
+                "canonical_best_checkpoint_published": False,
+                "best_feasible_artifact": (
+                    "checkpoints/best_exploratory.pt"
+                    if has_feasible_checkpoint
+                    else None
+                ),
+                "best_infeasible_artifact": (
+                    "checkpoints/best_exploratory_infeasible.pt"
+                    if math.isfinite(best_infeasible_score)
+                    else None
+                ),
+            }
         write_json_atomic(out_dir / "selection_summary.json", selection_summary)
     barrier(dist_info)
     if wandb_run is not None:
