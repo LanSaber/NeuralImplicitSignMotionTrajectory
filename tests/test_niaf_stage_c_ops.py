@@ -23,15 +23,28 @@ from NIAF.continuous_trajectory_field.scripts import (
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "NIAF/continuous_trajectory_field/configs"
 SCRIPT_DIR = ROOT / "scripts/NIAF"
-MEMORY = "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_pilot"
+RECOVERY_EVIDENCE_ROOT = Path(
+    "/media/cvpr/haomian/NeuralImplicitSignMotionTrajectory"
+)
+MEMORY = (
+    "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_"
+    "memory_pilot_run_r2"
+)
 MATCHED_OFF = (
     "csl_daily_signtrajfield_v3_sentence_memory_stage_c_"
-    "generator_adaptation_matched_off_pilot"
+    "generator_adaptation_matched_off_pilot_run_r2"
 )
 CALIBRATION = (
     "experiments/NIAF/continuous_trajectory_field/"
     "csl_daily_sentence_memory_relevance_calibration_"
-    "stage_c_generator_adaptation_v1"
+    "stage_c_generator_adaptation_retry2_v1"
+)
+SOURCE_TERMINAL_DECISION = (
+    ROOT
+    / "experiments/NIAF/continuous_trajectory_field/"
+    "csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_"
+    "absolute_binding_motion_contrast_v1/evaluation/"
+    "ordered_development_decision/decision.json"
 )
 MODES = [
     "off",
@@ -121,6 +134,128 @@ def test_stage_c_configs_are_exact_matched_non_authorizing_pair():
         assert cfg["train"]["freeze_sentence_memory"] is True
         assert cfg["selection"]["require_feasible"] is False
         assert cfg["eval"]["sentence_memory_modes"] == MODES
+    assert (
+        CONFIG_DIR
+        / "csl_daily_signtrajfield_v3_sentence_memory_stage_c_"
+        "generator_adaptation_memory_pilot.yaml"
+    ).is_file()
+    assert (
+        CONFIG_DIR
+        / "csl_daily_signtrajfield_v3_sentence_memory_stage_c_"
+        "generator_adaptation_matched_off_pilot.yaml"
+    ).is_file()
+    runner = _script("run_csl_daily_stage_c_generator_adaptation_pilot.sh")
+    assert "generator_adaptation_smoke\"" in runner
+    assert "generator_adaptation_pilot\"" in runner
+    assert "generator_adaptation_smoke_run_r2" not in runner
+    assert "generator_adaptation_pilot_run_r2\"" not in runner
+
+
+def test_stage_c_accepts_exact_legacy_source_decision_and_rejects_added_authority(
+    tmp_path,
+):
+    decision = prerequisites.validate_source_terminal_decision(
+        decision_path=SOURCE_TERMINAL_DECISION,
+        expected_sha256=prerequisites.SOURCE_TERMINAL_DECISION_SHA256,
+        expected_identity=prerequisites.SOURCE_TERMINAL_DECISION_IDENTITY,
+    )
+    assert set(decision) == prerequisites.SOURCE_TERMINAL_DECISION_FIELDS
+    assert "authorized_purpose" not in decision
+    assert decision["status"] == "valid_infeasible"
+    assert decision["integrity_valid"] is True
+    assert decision["development_feasible"] is False
+    assert decision["confirmation_manifest_opened"] is False
+    assert decision["test_data_accessed"] is False
+
+    for value, name in ((None, "null"), ("stage_c", "non_null")):
+        changed = dict(decision)
+        changed["authorized_purpose"] = value
+        path = tmp_path / f"decision_{name}.json"
+        _write_json(path, changed)
+        with pytest.raises(prerequisites.PrerequisiteError, match="fields differ"):
+            prerequisites.validate_source_terminal_decision(
+                decision_path=path,
+                expected_sha256=prerequisites.sha256_file(path),
+                expected_identity=decision["decision_identity"],
+            )
+
+
+def test_retry2_recovery_evidence_reopens_run_r1_and_rejects_false_file_claim(
+    tmp_path, monkeypatch
+):
+    policy_path = (
+        CONFIG_DIR
+        / "csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json"
+    )
+    manifest_path = (
+        CONFIG_DIR
+        / "csl_daily_stage_c_generator_adaptation_retry2_recovery_evidence_v1.json"
+    )
+    audit = prerequisites.validate_retry2_recovery_evidence(
+        policy_path=policy_path,
+        recovery_manifest=manifest_path,
+        source_root=ROOT,
+        evidence_root=RECOVERY_EVIDENCE_ROOT,
+    )
+    assert audit["run_r1_source_git_head"] == "a883baf4a0a95b4ebb2007564837c4d9b4f817cc"
+    assert audit["failed_smoke_job_id"] == "143525"
+    assert audit["prior_execution_lease_created"] is False
+    assert audit["prior_scientific_output_observed"] is False
+    assert audit["retry_authorized"] is True
+    assert audit["retry_authorization_reason"] == (
+        "attested_pre_claim_pre_science_implementation_failure"
+    )
+    assert audit["calibration_artifact_identity"] == (
+        "8999d9e81b2fccab6ed368d374e99a9f65f0dcdb4c8203f2d41d5e02f469cf49"
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    forbidden = RECOVERY_EVIDENCE_ROOT / manifest["required_absent_paths"][0]
+    original_exists = Path.exists
+    monkeypatch.setattr(
+        Path,
+        "exists",
+        lambda self: True if self == forbidden else original_exists(self),
+    )
+    with pytest.raises(
+        prerequisites.PrerequisiteError,
+        match="scientific output unexpectedly exists",
+    ):
+        prerequisites.validate_retry2_recovery_evidence(
+            policy_path=policy_path,
+            recovery_manifest=manifest_path,
+            source_root=ROOT,
+            evidence_root=RECOVERY_EVIDENCE_ROOT,
+        )
+    monkeypatch.setattr(Path, "exists", original_exists)
+
+    relative = Path(
+        "NIAF/continuous_trajectory_field/configs/"
+        "csl_daily_stage_c_generator_adaptation_retry2_recovery_evidence_v1.json"
+    )
+    changed_path = tmp_path / relative
+    changed = manifest
+    changed["required_files"]["failed_smoke_stdout"]["sha256"] = "0" * 64
+    _write_json(changed_path, changed)
+    monkeypatch.setattr(
+        prerequisites,
+        "validate_policy",
+        lambda _path: {
+            "recovery_contract": {
+                "evidence_manifest": {
+                    "path": str(relative),
+                    "sha256": prerequisites.sha256_file(changed_path),
+                }
+            }
+        },
+    )
+    with pytest.raises(prerequisites.PrerequisiteError, match="incident file changed"):
+        prerequisites.validate_retry2_recovery_evidence(
+            policy_path=tmp_path / "policy.json",
+            recovery_manifest=changed_path,
+            source_root=tmp_path,
+            evidence_root=RECOVERY_EVIDENCE_ROOT,
+        )
 
 
 def test_execution_lease_recovers_failed_terminal_write_before_archive(
@@ -214,6 +349,22 @@ def test_calibration_lease_recovers_failed_terminal_write_before_archive(
         source_remote_head="b" * 40,
         **inputs,
     )
+    assert binding["source_file_profile"] == (
+        "stage_c_generator_adaptation_retry2_v1"
+    )
+    legacy_binding = dict(binding)
+    legacy_binding["source_file_profile"] = "stage_c_generator_adaptation_v1"
+    legacy_binding["digest"] = calibration_control.digest_json(
+        {key: value for key, value in legacy_binding.items() if key != "digest"}
+    )
+    calibration_control._validate_binding(legacy_binding)
+    unknown_binding = dict(binding)
+    unknown_binding["source_file_profile"] = "unapproved"
+    unknown_binding["digest"] = calibration_control.digest_json(
+        {key: value for key, value in unknown_binding.items() if key != "digest"}
+    )
+    with pytest.raises(calibration_control.CalibrationLeaseError, match="not exact"):
+        calibration_control._validate_binding(unknown_binding)
     lease = tmp_path / "calibration/active_execution_lease"
     first_attestation = tmp_path / "calibration/attestations/92.0.json"
     first = calibration_control.acquire(
@@ -277,6 +428,11 @@ def test_stage_c_launch_chain_orders_cpu_calibration_smoke_then_pilot():
     assert "sinfo -C" not in launcher
     assert "unset WANDB_API_KEY" in launcher
     assert "WANDB_MODE=disabled" in launcher
+    assert "squeue -h" in launcher
+    assert "-t PENDING" not in launcher
+    assert "'%i|%j|%T'" in launcher
+    assert "active Stage-C Slurm job(s) already exist" in launcher
+    assert "scancel" not in launcher
     assert "Preview only" in launcher and '"$ACTION" == "--submit"' in launcher
     assert "validate-foundation" in launcher and "validate-smoke" in launcher
     assert "/smoke/PUBLICATION/READY" in launcher
@@ -306,13 +462,12 @@ def test_stage_c_launcher_isolates_all_publish_before_release_recovery():
     assert launcher.index("inspect-published") < launcher.index("validate-smoke")
 
 
-def test_stage_c_policy_predeclares_exact_non_authorizing_progression():
-    policy = json.loads(
-        (
-            CONFIG_DIR
-            / "csl_daily_stage_c_generator_adaptation_decision_policy_v1.json"
-        ).read_text(encoding="utf-8")
+def test_stage_c_policy_predeclares_exact_non_authorizing_progression(tmp_path):
+    policy_path = (
+        CONFIG_DIR
+        / "csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json"
     )
+    policy = stage_c_pilot_decision.validate_policy(policy_path)
     assert policy["execution"] == {
         "arms": ["memory", "matched_off"],
         "accumulation_steps": 2,
@@ -338,6 +493,53 @@ def test_stage_c_policy_predeclares_exact_non_authorizing_progression():
     }
     assert policy["authorization"]["authorized_purpose"] is None
     assert policy["authorization"]["non_authorizing"] is True
+    assert policy["recovery_contract"] == {
+        "evidence_manifest": {
+            "path": (
+                "NIAF/continuous_trajectory_field/configs/"
+                "csl_daily_stage_c_generator_adaptation_retry2_"
+                "recovery_evidence_v1.json"
+            ),
+            "sha256": (
+                "ccf47b72390c4be28775b207c67f7372d3cbc599fcddb3545df8295acc88b39b"
+            ),
+        },
+        "failed_smoke_job_id": "143525",
+        "failure_class": (
+            "pre_science_source_terminal_decision_schema_compatibility"
+        ),
+        "prior_evidence_must_be_preserved": True,
+        "prior_execution_lease_created": False,
+        "prior_scientific_output_observed": False,
+        "retry_authorization_reason": (
+            "attested_pre_claim_pre_science_implementation_failure"
+        ),
+        "retry_authorized": True,
+        "run_generation": "run_r2",
+        "supersedes_run_generation": "run_r1",
+    }
+    stage_c_pilot_decision.validate_policy(
+        CONFIG_DIR / "csl_daily_stage_c_generator_adaptation_decision_policy_v1.json"
+    )
+    tampered = json.loads(json.dumps(policy))
+    tampered["recovery_contract"]["prior_scientific_output_observed"] = True
+    tampered_path = (
+        tmp_path
+        / "csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json"
+    )
+    _write_json(tampered_path, tampered)
+    with pytest.raises(
+        stage_c_pilot_decision.StageCDecisionError,
+        match="recovery contract changed",
+    ):
+        stage_c_pilot_decision.validate_policy(tampered_path)
+    tampered["recovery_contract"] = None
+    _write_json(tampered_path, tampered)
+    with pytest.raises(
+        stage_c_pilot_decision.StageCDecisionError,
+        match="recovery contract changed",
+    ):
+        stage_c_pilot_decision.validate_policy(tampered_path)
 
 
 def test_stage_c_calibration_is_fresh_source_bound_and_train_only():
@@ -347,14 +549,14 @@ def test_stage_c_calibration_is_fresh_source_bound_and_train_only():
     runner = _script("run_csl_daily_stage_c_generator_adaptation_pilot.sh")
     config = (CONFIG_DIR / f"{MEMORY}.yaml").read_text(encoding="utf-8")
     combined = calibration + runner + config
-    assert "calibration_stage_c_generator_adaptation_v1" in combined
+    assert "calibration_stage_c_generator_adaptation_retry2_v1" in combined
     assert "calibration_v1_retry3" not in combined
     assert '"$STAGER" stage' in calibration and '"train"' in calibration
     assert '! -e "$STAGED_BANK/neighbors_val.npz"' in calibration
     assert '! -e "$STAGED_BANK/neighbors_test.npz"' in calibration
     assert "validate_relevance_calibration_source" in calibration
     assert "signtrajfield_stage_c_calibration_completion" in calibration
-    assert "stage_c_generator_adaptation_v1" in calibration
+    assert "stage_c_generator_adaptation_retry2_v1" in calibration
     assert "stage_c_calibration_control" in calibration
     assert "stage_c_calibration_transition" in calibration
     assert "calibration_transition_identity" in calibration
@@ -362,6 +564,16 @@ def test_stage_c_calibration_is_fresh_source_bound_and_train_only():
     assert "CPU_GATE_READY" in calibration and "CPU_GATE_READY" in runner
     assert "CALIBRATION_COMPLETION" in runner
     assert "stage_c_pilot_prerequisites" in runner
+    for script_name in (
+        "test_csl_daily_stage_c_generator_adaptation_sbatch.sh",
+        "calibrate_csl_daily_stage_c_generator_adaptation_sbatch.sh",
+        "run_csl_daily_stage_c_generator_adaptation_pilot.sh",
+        "launch_csl_daily_stage_c_generator_adaptation_pilot.sh",
+    ):
+        script = _script(script_name)
+        assert "validate-recovery" in script
+        assert "retry2_recovery_evidence_v1.json" in script
+    assert "--recovery_policy" in calibration and "--recovery_policy" in runner
 
 
 def test_stage_c_runner_pins_two_rank_effective_batch_and_roce_only():
@@ -649,6 +861,19 @@ def _foundation_gate(tmp_path, monkeypatch):
         "validate_relevance_calibration_source",
         lambda *_args, **_kwargs: {},
     )
+    monkeypatch.setattr(
+        prerequisites,
+        "validate_source_terminal_decision",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        prerequisites,
+        "validate_retry2_recovery_evidence",
+        lambda **_kwargs: {
+            "audit_identity": "e" * 64,
+            "recovery_manifest_sha256": "f" * 64,
+        },
+    )
     transition = {
         "schema_name": "signtrajfield_stage_c_calibration_transition_audit",
         "schema_version": 1,
@@ -754,6 +979,9 @@ def _foundation_gate(tmp_path, monkeypatch):
     )
     _write_json(terminal_dir / "TERMINAL.json", terminal)
     kwargs = {
+        "recovery_policy": tmp_path / "retry2_policy.json",
+        "recovery_manifest": tmp_path / "retry2_evidence.json",
+        "recovery_evidence_root": tmp_path,
         "cpu_gate": cpu_gate,
         "calibration_completion": completion_path,
         "calibration_dir": calibration_dir,
@@ -795,9 +1023,10 @@ def test_foundation_gate_binds_all_evidence_and_rejects_tampering(
     tmp_path, monkeypatch
 ):
     kwargs, cpu, completion = _foundation_gate(tmp_path, monkeypatch)
-    assert prerequisites.validate_foundation(**kwargs)["calibration_identity"] == (
-        "b" * 64
-    )
+    validated = prerequisites.validate_foundation(**kwargs)
+    assert validated["calibration_identity"] == "b" * 64
+    assert validated["recovery_evidence_audit_identity"] == "e" * 64
+    assert validated["recovery_evidence_manifest_sha256"] == "f" * 64
 
     cpu["test_data_accessed"] = True
     _write_json(kwargs["cpu_gate"], cpu)
@@ -899,10 +1128,11 @@ def _smoke_gate(tmp_path):
     attestation_path = control / "lease_attestations/202.0.json"
     _write_json(attestation_path, attestation)
     policy_path = (
-        CONFIG_DIR / "csl_daily_stage_c_generator_adaptation_decision_policy_v1.json"
+        CONFIG_DIR
+        / "csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json"
     )
     bound_files = dict(binding_files)
-    for index in range(22):
+    for index in range(23):
         path = tmp_path / "bound" / f"source_{index}.py"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"# source {index}\n", encoding="utf-8")

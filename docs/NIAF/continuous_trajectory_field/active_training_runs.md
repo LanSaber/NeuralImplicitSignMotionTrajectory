@@ -5,7 +5,7 @@ runs. Read it before answering an unqualified question such as "What is the
 current training progress?" The scheduler and logs remain the source of truth
 for live state; this registry determines **which run** the question refers to.
 
-Last observed: **2026-09-10 00:21 Asia/Dubai (UTC+04:00)**
+Last observed: **2026-09-10 02:19 Asia/Dubai (UTC+04:00)**
 
 ## Default run resolution
 
@@ -19,7 +19,7 @@ has the highest Slurm job ID or is already in the `RUNNING` state.
 Dataset-qualified requests override that default: "the How2Sign training"
 refers to `how2sign-signtrajfield-v2-full-20260807`, and "the CSL-Daily
 training" refers to
-`csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-pilot-v1-20260910`.
+`csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-pilot-run-r2-20260910`.
 
 ## Active prerequisite artifact jobs (not training)
 
@@ -84,23 +84,40 @@ logs/sbatch/csl_rag_neighbors_142745.out
 logs/sbatch/csl_rag_neighbors_142745.err
 ```
 
-## Preregistered CSL-Daily: Stage-C generator-adaptation pilot
+## Preregistered CSL-Daily: Stage-C generator-adaptation retry-2 pilot
 
 | Field | Value |
 |---|---|
-| Alias | `csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-pilot-v1-20260910` |
-| State | **Preregistered; no job submitted and no result observed at this registry timestamp.** This is a development-only, non-authorizing exploration and does not amend the terminal Stage-B `valid_infeasible` decision |
-| Exact source | Stage-B epoch-5/global-step-360 `best_infeasible.pt`, SHA256 `b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202`; terminal decision SHA256 `8993f4d7ae61d2ecd2bc41d523c45ab55073c63a061ce24629a564627724f8c5`, identity `7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69`, `authorized_purpose=null` |
+| Alias | `csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-pilot-run-r2-20260910` |
+| State | **Retry-2 preregistered; no retry-2 job submitted and no result observed at this registry timestamp.** This is a development-only, non-authorizing operational recovery and does not amend the terminal Stage-B `valid_infeasible` decision |
+| Exact source | Stage-B epoch-5/global-step-360 `best_infeasible.pt`, SHA256 `b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202`; terminal decision SHA256 `8993f4d7ae61d2ecd2bc41d523c45ab55073c63a061ce24629a564627724f8c5`, identity `7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69`. Its exact legacy schema omits top-level `authorized_purpose` and explicitly records no confirmation/test access |
 | Matched arms | Sequential `memory` (`dropout`, probability `0.25`) and `matched_off` (`off`, probability `1.0`) arms in one allocation; each independently reloads the same source and resets optimizer, epoch, selection, and RNG state |
 | Trainability | All 62 sentence-memory tensors frozen; exactly 20 generator tensors/1,109,395 parameters trainable under seven pinned hypernetwork prefixes; all other 213 model tensors frozen |
 | Batch and duration | Exactly two ranks on two GPUs; batch 64/rank and accumulation two, effective global batch 256; one uncapped epoch and global step 72 per arm after an exact one-update smoke |
 | Allocation | Exactly two Spark nodes sharing one explicit `pair01`--`pair15` feature, one GPU/rank per node. Both 200-Gb/s ConnectX-7 f1 RoCE rails must pass topology, peer, counter, NCCL `NET/IB`, and no-socket-fallback checks before training; single-versus-dual rail is benchmark-selected |
-| Ordered gates | Complete CPU/compile/Ruff/tests -> fresh source-bound train-only calibration -> paired forced-IB network and one-update smoke -> one-epoch paired pilot. Only `smoke_ready` permits the pilot |
+| Ordered gates | Complete CPU/compile/Ruff/tests on a new clean pushed HEAD -> fresh retry-2 source-bound train-only calibration -> paired forced-IB network and one-update smoke -> one-epoch paired pilot. Only `smoke_ready` permits the pilot |
 | Decision boundary | Smoke or pilot failure is `stop`/`none`. Passing pilot is `pilot_complete_development_signal` with `none_requires_fresh_preregistration_without_pilot_outcome_access`. No status authorizes a longer run, promotion, confirmation, or test |
 | Isolation | Only train/validation data may be staged; Stage-C code must not reference or open confirmation/test inputs, the global confirmation-spend marker must stay absent, and W&B is disabled |
-| Immutable source | To be recorded after the implementation/docs commit is pushed and copied into a clean standalone shared run clone; launch is forbidden before that binding exists |
-| Runbook | `docs/NIAF/continuous_trajectory_field/stage_c_generator_adaptation_v1.md` |
+| Retry isolation | New `*_pilot_run_r2` arm outputs, retry-2 policy, and `csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_retry2_v1`; CPU/control evidence uses the new source-commit namespace. Existing source-namespaced smoke/pilot singleton roots are retained because run-r1 produced neither scientific output nor a publication |
+| Recovery evidence | The retry-2 policy hash-binds the exact run-r1 CPU/calibration records, calibration artifact identity/hashes, empty smoke stdout and pinned failure stderr, old source head/job IDs, absent old smoke/pilot/attempt/publication and arm-output paths, and unspent confirmation marker. Each retry-2 stage reopens this evidence before work. The sole retry exception is the attested pre-claim/pre-science implementation failure; no prior execution lease existed |
+| Active-job guard | The launcher fails closed if `squeue` reports any nonterminal Stage-C job; it only diagnoses and never cancels jobs |
+| Immutable source | To be recorded after the retry-2 implementation/docs commit is pushed and copied into a clean standalone shared run clone; launch is forbidden before that binding exists |
+| Runbook | `docs/NIAF/continuous_trajectory_field/stage_c_generator_adaptation_retry2_v1.md` |
 | Default alias | Global PHOENIX default unchanged; this alias is only the dataset-qualified CSL-Daily resolution |
+
+## Stopped CSL-Daily Stage-C run-r1 before science
+
+| Field | Value |
+|---|---|
+| Alias | `csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-pilot-run-r1-20260910` |
+| Source | Clean pushed run-r1 commit `a883baf4a0a95b4ebb2007564837c4d9b4f817cc`, branch `origin/codex/csl-daily-centered-generator-stage-c-v1-run-r1` |
+| Completed prerequisites | CPU gate job `143523` completed 422 tests and published its source-bound gate. Calibration job `143524` published accepted train-only artifact identity `8999d9e81b2fccab6ed368d374e99a9f65f0dcdb4c8203f2d41d5e02f469cf49` and an exact semantic/map-equivalence transition audit |
+| Failure | Smoke job `143525` stopped after 12 seconds in the pre-science config validator with `KeyError: 'authorized_purpose'`: the runner indexed a field which the exact pinned legacy decision schema intentionally omits |
+| Scientific-output audit | **Zero scientific output.** No smoke execution lease, RoCE/network preflight, trainer process, optimizer update, checkpoint, decision, READY, or pilot publication was created |
+| Dependent pilot | Job `143526` remained dependency-blocked, received no allocation/runtime, and was explicitly cancelled after the dependency became unsatisfiable |
+| Preserved evidence | Run-r1 CPU/calibration controls remain below `.../csl_daily_stage_c_generator_adaptation_prerequisites/source_a883baf4a0a95b4ebb2007564837c4d9b4f817cc`; its calibration remains at `.../csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_v1`. Neither may be overwritten, deleted, or reused as retry-2 source evidence |
+| Authorization | None. The incident does not change Stage B, authorize a retry beyond the preregistered run-r2 contract, or permit confirmation/test/promotion |
+| Runbook | `docs/NIAF/continuous_trajectory_field/stage_c_generator_adaptation_v1.md` |
 
 ## Latest completed CSL-Daily: Phase-A''' centered-evidence and absolute-binding experiment
 
@@ -121,7 +138,7 @@ logs/sbatch/csl_rag_neighbors_142745.err
 | Stage-B authorization | Stage A emitted only `authorize_stage2.json`, authorization identity `ecca886ee2252a0db74f8ca8c404100cb1ea2fa8690f5e1e36bb68cc5e654d15`, file SHA256 `81978bc51af76741f9330010036e4c55e93bc219c6d8a0bfeb7f4397901c4b3a`. Stage-B fresh-v2 ordered-input identity `7a196496561c32df8ba1a71257775c31b20c75cad2944f200f7baee22facab57` preserved that predecessor chain |
 | Stage-B training | Slurm `143400`, same four-node envelope, completed all six validation events/global step 432, then returned the intentional no-feasible `FAILED/143`. Launch identity `59a0015755ed927f506b0e6785b779092f56578317365cac7212c99b76d8d029`; config SHA256 `7741da46d37a4b77f481663f25fa580281f6d29de6c2616baebcc30dac59b85e`; retained authenticated lease claim `3868b9018b8ddfb7f08ecf85dd0ac3e4cebba138ef4f29b0eb165a73aec66a7d` |
 | Stage-B selected checkpoint | `best_infeasible.pt`, epoch 5/global step 360, SHA256 `b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202`; metrics SHA256 `9171e1e65ceb57c6b291cf24825eb934bcfd4983f7d822fe01e56af33e4c9b10`; selection-summary SHA256 `41b5bcb5eeece4132f1c576399232010ac00e6c0fec168327d2c9d03095cd561`. It is audit-only and non-promotable |
-| Stage-B decision | Slurm `143427` completed all integrity work at `experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1/evaluation/ordered_development_decision` and wrote canonical `valid_infeasible`, `integrity_valid=true`, `development_feasible=false`, and `authorized_purpose=null`. Decision identity `7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69`; decision/READY SHA256 `8993f4d7ae61d2ecd2bc41d523c45ab55073c63a061ce24629a564627724f8c5` / `fdc8e0823ccd2b3f769b5fdf31cb21098cf719a542cd9556546ee91fa174cfde` |
+| Stage-B decision | Slurm `143427` completed all integrity work at `experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1/evaluation/ordered_development_decision` and wrote canonical `valid_infeasible`, `integrity_valid=true`, and `development_feasible=false`; the exact legacy v1 schema omits top-level `authorized_purpose` and explicitly records no confirmation/test access. Decision identity `7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69`; decision/READY SHA256 `8993f4d7ae61d2ecd2bc41d523c45ab55073c63a061ce24629a564627724f8c5` / `fdc8e0823ccd2b3f769b5fdf31cb21098cf719a542cd9556546ee91fa174cfde` |
 | Stage-B science | Correct/text-only/mean-derangement/cross-query/full composite `12.6293070649 / 12.7318543089 / 12.6497460611 / 12.6726873684 / 12.6987959243`. `Rpair=0.4059177979`; all nonces favored correct; matching top-1 `0.4660644531`. The mean-derangement gain was only **0.1616%**, identity utility `0.1993129743`, and true-minus-best-negative association margin `-0.0091593001`, so all three required gates failed |
 | Integrity identities | Stage-A/Stage-B architecture digests `a41da52ab3005f55f4c428926813cb6ff4244cb5c84f7764281d0e8e539c4c62` / `bc69fd35ac58e10bc894460c35175f13356b79416df40e8c57156b1929614236`; objective digests `8267d7875a277e9b9ffcc7fc4e4d04e0db3f11565e6a251f987a80db33680821` / `9180692d6585b0e4e508b0456e1d3562144db21742bab6b84c6570779300d484`; shared evaluation-control `359315546b1fe4a2542d66ee784d30d5ed222e01dcd832eb00402cd57f915743`; selection aggregation `cd5754faf3a45267452c0245589f1a57b9ab30cdb8773e40154be797cddca50f` |
 | Exact invariants and isolation | Every selected-checkpoint audit reported exact zero for uniform-final, broadcast-complete, all-null, joint-tuple, and v2 prediction/duration deltas, with all-null gate/candidate mass zero and null mass one. Eligible jobs staged only train and validation neighbor tables, with test absent before provider construction; all decision flags say `test_data_accessed=false` and `confirmation_manifest_opened=false`; W&B was disabled. Calibration and ordered-decision leases were released into immutable history; the two no-feasible training leases remain intentionally retained |

@@ -238,6 +238,20 @@ def test_stage_c_source_profile_is_exact_and_rejects_mixed_or_unknown_sets(tmp_p
     )
     assert validated["source_file_profile"] == MODULE.STAGE_C_SOURCE_FILE_PROFILE
 
+    retry2_source = copy.deepcopy(source)
+    retry2_source["source_file_profile"] = MODULE.STAGE_C_RETRY2_SOURCE_FILE_PROFILE
+    retry2 = validate_relevance_calibration_source(
+        {"source": retry2_source},
+        source_root=source_root,
+        expected_git_head="c" * 40,
+        expected_remote_ref="origin/stage-c",
+        expected_remote_head="c" * 40,
+        expected_source_file_profile=MODULE.STAGE_C_RETRY2_SOURCE_FILE_PROFILE,
+    )
+    assert retry2["source_file_profile"] == (
+        MODULE.STAGE_C_RETRY2_SOURCE_FILE_PROFILE
+    )
+
     wrong_expected = copy.deepcopy(source)
     with pytest.raises(RelevanceCalibrationError, match="profile changed"):
         validate_relevance_calibration_source(

@@ -24,6 +24,10 @@ LEASE_SCHEMA = "signtrajfield_stage_c_calibration_lease"
 ATTESTATION_SCHEMA = "signtrajfield_stage_c_calibration_lease_attestation"
 TERMINAL_SCHEMA = "signtrajfield_stage_c_calibration_lease_terminal"
 SCHEMA_VERSION = 1
+SOURCE_FILE_PROFILES = {
+    "stage_c_generator_adaptation_v1",
+    "stage_c_generator_adaptation_retry2_v1",
+}
 TERMINAL_STATES = {
     "BOOT_FAIL",
     "CANCELLED",
@@ -117,7 +121,7 @@ def calibration_binding(
         "source_remote_ref": source_remote_ref,
         "source_remote_head": head,
         **{name: sha256_file(path) for name, path in files.items()},
-        "source_file_profile": "stage_c_generator_adaptation_v1",
+        "source_file_profile": "stage_c_generator_adaptation_retry2_v1",
         "seed": 1234,
         "duration_weight": 0.05,
         "minimum_auroc": 0.75,
@@ -168,7 +172,7 @@ def _validate_binding(value: Any) -> dict[str, Any]:
             r"origin/[A-Za-z0-9._/-]+", str(value.get("source_remote_ref", ""))
         )
         is None
-        or value.get("source_file_profile") != "stage_c_generator_adaptation_v1"
+        or value.get("source_file_profile") not in SOURCE_FILE_PROFILES
         or value.get("seed") != 1234
         or value.get("duration_weight") != 0.05
         or value.get("minimum_auroc") != 0.75

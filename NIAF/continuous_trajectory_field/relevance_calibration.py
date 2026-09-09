@@ -43,6 +43,7 @@ REQUIRED_SOURCE_FILES = frozenset(
 )
 LEGACY_SOURCE_FILE_PROFILE = "sentence_memory_relevance_v1"
 STAGE_C_SOURCE_FILE_PROFILE = "stage_c_generator_adaptation_v1"
+STAGE_C_RETRY2_SOURCE_FILE_PROFILE = "stage_c_generator_adaptation_retry2_v1"
 STAGE_C_REQUIRED_SOURCE_FILES = frozenset(
     {
         "NIAF/continuous_trajectory_field/relevance_calibration.py",
@@ -55,6 +56,7 @@ STAGE_C_REQUIRED_SOURCE_FILES = frozenset(
 SOURCE_FILE_PROFILES = {
     LEGACY_SOURCE_FILE_PROFILE: REQUIRED_SOURCE_FILES,
     STAGE_C_SOURCE_FILE_PROFILE: STAGE_C_REQUIRED_SOURCE_FILES,
+    STAGE_C_RETRY2_SOURCE_FILE_PROFILE: STAGE_C_REQUIRED_SOURCE_FILES,
 }
 
 

@@ -1,11 +1,20 @@
 # CSL-Daily Stage-C generator-adaptation pilot v1
 
-Status: **preregistered development-only experiment; no result exists and no
-job had been submitted when this protocol was recorded.** This Stage C is a
-separate exploratory generator-adaptation pilot requested after the terminal
-Stage-A/B experiment. It does not amend the Stage-B `valid_infeasible`
-decision, create an authorization that Stage B did not issue, or make the
-source checkpoint deployable.
+Status: **run-r1 stopped before any scientific work.** CPU gate job `143523`
+and fresh train-only calibration job `143524` completed. Smoke job `143525`
+then failed in its pre-science config check because the pinned legacy Stage-B
+decision correctly omits top-level `authorized_purpose`, while the runner
+indexed that absent key. No execution lease, network preflight, optimizer
+update, checkpoint, or smoke/pilot result was created. The dependent pilot
+job `143526` had zero runtime/allocation and was cancelled after Slurm reported
+an unsatisfiable dependency. All run-r1 evidence remains preserved.
+
+This Stage C is a separate exploratory generator-adaptation pilot requested
+after the terminal Stage-A/B experiment. It does not amend the Stage-B
+`valid_infeasible` decision, create an authorization that Stage B did not
+issue, or make the source checkpoint deployable. The operationally corrected
+run-r2 contract is recorded in
+`docs/NIAF/continuous_trajectory_field/stage_c_generator_adaptation_retry2_v1.md`.
 
 The experiment asks one question: with the learned Stage-B sentence memory
 held fixed, does allowing a small, exactly defined part of the trajectory
@@ -37,8 +46,10 @@ SHA256 b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202
 epoch 5, global step 360, selection status best_infeasible
 ```
 
-The pinned Stage-B terminal decision is
-`valid_infeasible`, has `authorized_purpose=null`, decision identity
+The pinned Stage-B terminal decision uses the exact legacy v1 schema: it is
+`valid_infeasible`, has `integrity_valid=true` and
+`development_feasible=false`, forbids confirmation/test access, and omits the
+top-level `authorized_purpose` field. Its decision identity is
 `7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69`,
 and file SHA256
 `8993f4d7ae61d2ecd2bc41d523c45ab55073c63a061ce24629a564627724f8c5`.
@@ -163,8 +174,8 @@ scripts/NIAF/smoke_csl_daily_stage_c_generator_adaptation_pilot_sbatch.sh
 scripts/NIAF/train_csl_daily_stage_c_generator_adaptation_pilot_sbatch.sh
 ```
 
-The launcher is preview-only unless passed `--submit`. It must be invoked from
-the final immutable shared clone with exact `PROJECT_DIR`, `SOURCE_GIT_HEAD`,
-and `SOURCE_REMOTE_BRANCH`; the selected `pairNN` is supplied explicitly. The
-registry must be updated with the immutable source and job/evidence ledger
-after submission rather than guessing those values in advance.
+These were the run-r1 source-bound files at commit
+`a883baf4a0a95b4ebb2007564837c4d9b4f817cc`. The shared launchers now name the
+run-r2 recovery contract and must not be used to overwrite or delete run-r1
+calibration/prerequisite evidence. The launcher remains preview-only unless
+passed `--submit`.

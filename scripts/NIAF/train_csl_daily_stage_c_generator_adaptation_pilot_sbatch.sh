@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=csl_stage_c_pair
+#SBATCH --job-name=csl_stage_c_r2_pair
 #SBATCH --partition=spark
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1

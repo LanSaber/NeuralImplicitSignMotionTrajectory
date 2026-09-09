@@ -221,7 +221,7 @@ def _validate_network_evidence(
         or source_binding.get("development_only") is not True
         or source_binding.get("non_authorizing") is not True
         or not isinstance(bound_files, dict)
-        or len(bound_files) != 26
+        or len(bound_files) != 27
     ):
         raise StageCDecisionError("source binding manifest is malformed")
     for path_text, expected_sha in bound_files.items():
@@ -429,7 +429,7 @@ def _close(left: float, right: float) -> bool:
 
 def validate_policy(path: Path) -> dict[str, Any]:
     policy = _json(path, "Stage-C decision policy")
-    if set(policy) != {
+    base_fields = {
         "schema_name",
         "schema_version",
         "authorization",
@@ -440,8 +440,48 @@ def validate_policy(path: Path) -> dict[str, Any]:
         "retry_policy",
         "source_checkpoint",
         "status_values",
-    }:
+    }
+    allowed_field_sets = {
+        frozenset(base_fields),
+        frozenset(base_fields | {"recovery_contract"}),
+    }
+    if frozenset(policy) not in allowed_field_sets:
         raise StageCDecisionError("Stage-C decision policy fields are not exact")
+    recovery_contract = policy.get("recovery_contract")
+    if "recovery_contract" in policy:
+        if (
+            path.name
+            != "csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json"
+            or recovery_contract
+            != {
+                "evidence_manifest": {
+                    "path": (
+                        "NIAF/continuous_trajectory_field/configs/"
+                        "csl_daily_stage_c_generator_adaptation_retry2_"
+                        "recovery_evidence_v1.json"
+                    ),
+                    "sha256": (
+                        "ccf47b72390c4be28775b207c67f7372d3cbc599fcddb3545df8295acc88b39b"
+                    ),
+                },
+                "failed_smoke_job_id": "143525",
+                "failure_class": (
+                    "pre_science_source_terminal_decision_schema_compatibility"
+                ),
+                "prior_evidence_must_be_preserved": True,
+                "prior_execution_lease_created": False,
+                "prior_scientific_output_observed": False,
+                "retry_authorization_reason": (
+                    "attested_pre_claim_pre_science_implementation_failure"
+                ),
+                "retry_authorized": True,
+                "run_generation": "run_r2",
+                "supersedes_run_generation": "run_r1",
+            }
+        ):
+            raise StageCDecisionError("Stage-C retry-2 recovery contract changed")
+    elif path.name != "csl_daily_stage_c_generator_adaptation_decision_policy_v1.json":
+        raise StageCDecisionError("Stage-C legacy decision policy path changed")
     expected_authorization = {
         "authorized_purpose": None,
         "confirmation_manifest_opened": False,

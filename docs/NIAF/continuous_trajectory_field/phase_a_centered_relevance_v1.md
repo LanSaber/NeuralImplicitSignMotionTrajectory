@@ -47,7 +47,8 @@ published the source-bound train-only `_retry3` calibration, ran both
 `_smoke_retry3` arms, and trained Stage A afresh. Stage-A decision `143395`
 was `valid_infeasible` and emitted the sole Stage-B authorization. Stage B
 then started fresh from v2, completed all six epochs, and decision `143427`
-was also `valid_infeasible`, with `authorized_purpose=null`. This is the
+was also `valid_infeasible`; its legacy schema omits top-level
+`authorized_purpose` and records no confirmation/test access. This is the
 predeclared terminal stop. No diagnostic, confirmation, test-set job, or
 confirmation-spend operation was authorized by any attempt.
 
@@ -66,7 +67,7 @@ confirmation-spend operation was authorized by any attempt.
 | Stage-B authorization | Authorization identity `ecca886ee2252a0db74f8ca8c404100cb1ea2fa8690f5e1e36bb68cc5e654d15`; file SHA256 `81978bc51af76741f9330010036e4c55e93bc219c6d8a0bfeb7f4397901c4b3a`; fresh-v2 Stage-B input identity `7a196496561c32df8ba1a71257775c31b20c75cad2944f200f7baee22facab57` |
 | Stage-B training | Slurm `143400`, four nodes/GPUs, completed six validations/global step 432 and intentionally returned `FAILED/143` because no feasible checkpoint existed. Launch identity `59a0015755ed927f506b0e6785b779092f56578317365cac7212c99b76d8d029`; retained failed-training lease claim `3868b9018b8ddfb7f08ecf85dd0ac3e4cebba138ef4f29b0eb165a73aec66a7d` |
 | Stage-B selection | Epoch 5/global step 360 `best_infeasible.pt`, SHA256 `b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202`; metrics `9171e1e65ceb57c6b291cf24825eb934bcfd4983f7d822fe01e56af33e4c9b10`; selection summary `41b5bcb5eeece4132f1c576399232010ac00e6c0fec168327d2c9d03095cd561` |
-| Stage-B decision | Slurm `143427` completed. Canonical `valid_infeasible`, integrity valid, development infeasible, `authorized_purpose=null`; decision identity `7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69`; decision/READY SHA256 `8993f4d7ae61d2ecd2bc41d523c45ab55073c63a061ce24629a564627724f8c5` / `fdc8e0823ccd2b3f769b5fdf31cb21098cf719a542cd9556546ee91fa174cfde` |
+| Stage-B decision | Slurm `143427` completed. Canonical `valid_infeasible`, integrity valid, development infeasible; exact legacy schema omits top-level `authorized_purpose` and records no confirmation/test access. Decision identity `7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69`; decision/READY SHA256 `8993f4d7ae61d2ecd2bc41d523c45ab55073c63a061ce24629a564627724f8c5` / `fdc8e0823ccd2b3f769b5fdf31cb21098cf719a542cd9556546ee91fa174cfde` |
 | Isolation and spend | Every eligible job staged only train/validation tables; decisions record `test_data_accessed=false` and `confirmation_manifest_opened=false`; W&B was disabled. The global confirmation-spend marker is absent |
 
 The terminal r3 job-log SHA256 values are:
@@ -301,7 +302,7 @@ source commit.
 | Stage-A full job/launch/lease identities | `143380`; launch `0b1b9a8c089f88d9128027016cd5bb1ea7b39d3a67d5b5ab76c7dda2a078d97e`; retained failed-training lease claim `e588e1801b42148074b90970b42e60ea2edbb5a9fefee97c39208f498595cbb8` |
 | Stage-A selected checkpoint/decision | Epoch 3/step 216 `best_infeasible.pt` SHA `39a66ba0422ad5be1ccf2745ea7464d3c43894f3cc7c53c0a83e0dffcd979cb6`; decision job `143395`, `valid_infeasible`, identity `12c4fd20233f218422b36d977829cca5957c7c35c4a4e6be4aceec178642e837` |
 | Stage-B authorization/job | Authorization `ecca886ee2252a0db74f8ca8c404100cb1ea2fa8690f5e1e36bb68cc5e654d15`; fresh-v2 input `7a196496561c32df8ba1a71257775c31b20c75cad2944f200f7baee22facab57`; training `143400`; decision `143427` |
-| Stage-B selected checkpoint/decision | Epoch 5/step 360 `best_infeasible.pt` SHA `b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202`; `valid_infeasible`, decision identity `7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69`, `authorized_purpose=null` |
+| Stage-B selected checkpoint/decision | Epoch 5/step 360 `best_infeasible.pt` SHA `b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202`; `valid_infeasible`, decision identity `7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69`; exact legacy schema omits top-level `authorized_purpose` and records no confirmation/test access |
 | First development-feasible stage | None |
 | Locked diagnostic job/artifact | Not authorized or run |
 | Confirmation job/spend/bootstrap/promotion | Not authorized or run; global spend marker absent; holdout unopened; no promotion |

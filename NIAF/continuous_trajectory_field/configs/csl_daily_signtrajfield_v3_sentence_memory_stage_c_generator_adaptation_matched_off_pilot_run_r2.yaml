@@ -1,0 +1,16 @@
+_base_: csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_pilot_run_r2.yaml
+
+# Retry-2 matched control. It differs from the retry-2 memory arm only in
+# training-time sentence-memory availability and its no-replace output name.
+experiment_name: csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_matched_off_pilot_run_r2
+
+conditioning:
+  sentence_memory_train_mode: "off"
+  sentence_memory_dropout_probability: 1.0
+
+sentence_memory_safety:
+  stage_c:
+    arm: matched_off
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_matched_off_pilot_run_r2

@@ -37,8 +37,11 @@ PILOT_READY="$PREREQUISITE_ROOT/pilot/PUBLICATION/READY"
 CALIBRATION_LEASE="$PREREQUISITE_ROOT/calibration/active_execution_lease"
 SMOKE_LEASE="$PREREQUISITE_ROOT/smoke/active_execution_lease"
 PILOT_LEASE="$PREREQUISITE_ROOT/pilot/active_execution_lease"
-CALIBRATION_DIR="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_v1"
-MEMORY_CFG="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_pilot.yaml"
+CALIBRATION_DIR="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_retry2_v1"
+MEMORY_CFG="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_pilot_run_r2.yaml"
+RECOVERY_POLICY="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json"
+RECOVERY_MANIFEST="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_retry2_recovery_evidence_v1.json"
+RECOVERY_EVIDENCE_ROOT="/media/cvpr/haomian/NeuralImplicitSignMotionTrajectory"
 SOURCE_DECISION="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1/evaluation/ordered_development_decision/decision.json"
 SMOKE_ROOT="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_smoke"
 
@@ -61,6 +64,25 @@ REMOTE_HEAD="$(git ls-remote --heads origin "refs/heads/$SOURCE_REMOTE_BRANCH" |
   exit 1
 }
 export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}" PYTHONNOUSERSITE=1
+
+"$PYTHON_BIN" -m "$PREREQUISITE_MODULE" validate-recovery \
+  --policy_path "$RECOVERY_POLICY" --recovery_manifest "$RECOVERY_MANIFEST" \
+  --source_root "$PROJECT_DIR" --evidence_root "$RECOVERY_EVIDENCE_ROOT" \
+  >/dev/null
+
+# Refuse to create or preview a second dependency chain while any Stage-C job
+# from either run generation is live.  This is diagnostic only: recovery and
+# cancellation remain explicit operator actions.
+ACTIVE_STAGE_C_JOBS="$(
+  squeue -h -u "${USER:?USER is required for the Stage-C job audit}" \
+    -o '%i|%j|%T' |
+    awk -F'|' '$2 ~ /^csl_stage_c(_|$)/ {print}'
+)"
+if [[ -n "$ACTIVE_STAGE_C_JOBS" ]]; then
+  echo "ERROR: active Stage-C Slurm job(s) already exist; no job submitted:" >&2
+  printf '%s\n' "$ACTIVE_STAGE_C_JOBS" >&2
+  exit 1
+fi
 
 HAVE_CPU=0 HAVE_CALIBRATION=0 HAVE_SMOKE=0 HAVE_PILOT=0
 RECOVER_CALIBRATION=0 RECOVER_SMOKE=0 RECOVER_PILOT=0
@@ -101,6 +123,9 @@ if [[ -e "$CALIBRATION_COMPLETION" ]]; then
   else
     [[ ! -e "$CALIBRATION_LEASE" ]] || { echo "ERROR: calibration lease is malformed" >&2; exit 1; }
     "$PYTHON_BIN" -m "$PREREQUISITE_MODULE" validate-foundation \
+      --recovery_policy "$RECOVERY_POLICY" \
+      --recovery_manifest "$RECOVERY_MANIFEST" \
+      --recovery_evidence_root "$RECOVERY_EVIDENCE_ROOT" \
       --cpu_gate "$CPU_READY" --calibration_completion "$CALIBRATION_COMPLETION" \
       --calibration_dir "$CALIBRATION_DIR" --calibration_launcher "$CALIBRATION_SCRIPT" \
       --stage_c_config "$MEMORY_CFG" --source_terminal_decision "$SOURCE_DECISION" \

@@ -1,0 +1,61 @@
+{
+  "authorization": {
+    "confirmation_manifest_opened": false,
+    "development_only": true,
+    "non_authorizing": true,
+    "promotion_eligible": false,
+    "test_data_accessed": false
+  },
+  "calibration_artifact": {
+    "artifact_identity": "8999d9e81b2fccab6ed368d374e99a9f65f0dcdb4c8203f2d41d5e02f469cf49",
+    "calibration_sha256": "ee588597ef99708a748c8c7fdf2f1b457214d6886c07b9cfd9923b22e1036993",
+    "map_sha256": "948a7c2f7a8ec8fdbcfa8a9c130e665adfdf7615b8908cc31324b77c15e61411",
+    "path": "experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_v1",
+    "ready_sha256": "6ced37d1b909d0a41f30deba78c2cf0bee99dc79680f22e3cd78b74041f0f898"
+  },
+  "canonical_evidence_root": "/media/cvpr/haomian/NeuralImplicitSignMotionTrajectory",
+  "confirmation_spend_marker": "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_factorized_ordered_v1_control/confirmation_holdout_spent.json",
+  "incident": {
+    "calibration_job_id": "143524",
+    "cancelled_dependency_job_id": "143526",
+    "cpu_gate_job_id": "143523",
+    "failed_smoke_job_id": "143525",
+    "failure_class": "pre_science_source_terminal_decision_schema_compatibility",
+    "prior_scientific_output_observed": false,
+    "source_git_head": "a883baf4a0a95b4ebb2007564837c4d9b4f817cc",
+    "source_remote_ref": "origin/codex/csl-daily-centered-generator-stage-c-v1-run-r1"
+  },
+  "required_absent_paths": [
+    "experiments/NIAF/continuous_trajectory_field/csl_daily_stage_c_generator_adaptation_prerequisites/source_a883baf4a0a95b4ebb2007564837c4d9b4f817cc/smoke",
+    "experiments/NIAF/continuous_trajectory_field/csl_daily_stage_c_generator_adaptation_prerequisites/source_a883baf4a0a95b4ebb2007564837c4d9b4f817cc/pilot",
+    "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_smoke/sources/source_a883baf4a0a95b4ebb2007564837c4d9b4f817cc",
+    "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_pilot/sources/source_a883baf4a0a95b4ebb2007564837c4d9b4f817cc",
+    "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_pilot",
+    "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_matched_off_pilot"
+  ],
+  "required_files": {
+    "calibration_complete": {
+      "bytes": 2226,
+      "path": "experiments/NIAF/continuous_trajectory_field/csl_daily_stage_c_generator_adaptation_prerequisites/source_a883baf4a0a95b4ebb2007564837c4d9b4f817cc/calibration/COMPLETE.json",
+      "sha256": "587630bbc13371b6b4ab0739b2d8e873e96c2ef92d86dfb65ba972a0f69470c2"
+    },
+    "cpu_ready": {
+      "bytes": 575,
+      "path": "experiments/NIAF/continuous_trajectory_field/csl_daily_stage_c_generator_adaptation_prerequisites/source_a883baf4a0a95b4ebb2007564837c4d9b4f817cc/cpu_gate/READY",
+      "sha256": "4ff5ccaa0f6660defbf745788b5904ff92b45d4d5b99cb87062cede90b025237"
+    },
+    "failed_smoke_stderr": {
+      "bytes": 170,
+      "path": "logs/sbatch/csl_stage_c_smoke_143525.err",
+      "sha256": "1bee2ecfbcf85600e27fc69ee5cfb4d50fdf167fb79e3c8245475b24ed45c2ed"
+    },
+    "failed_smoke_stdout": {
+      "bytes": 0,
+      "path": "logs/sbatch/csl_stage_c_smoke_143525.out",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "run_generation": "run_r2",
+  "schema_name": "signtrajfield_stage_c_retry2_recovery_evidence",
+  "schema_version": 1
+}

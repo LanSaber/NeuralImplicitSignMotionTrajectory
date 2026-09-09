@@ -33,6 +33,45 @@ class PrerequisiteError(RuntimeError):
     """A Stage-C prerequisite is missing, stale, mutable, or out of scope."""
 
 
+SOURCE_TERMINAL_DECISION_FIELDS = {
+    "checkpoint",
+    "confirmation_manifest_opened",
+    "decision_identity",
+    "development_feasible",
+    "development_integrity",
+    "experiment_name",
+    "integrity_valid",
+    "partition",
+    "predecessor_authorization",
+    "run_launch_identity",
+    "schema_name",
+    "schema_version",
+    "stage",
+    "stage2_launch_input",
+    "status",
+    "test_data_accessed",
+}
+SOURCE_TERMINAL_DECISION_SCHEMA = "signtrajfield_centered_memory_ordered_decision"
+SOURCE_TERMINAL_DECISION_EXPERIMENT = (
+    "csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_"
+    "absolute_binding_motion_contrast_v1"
+)
+SOURCE_CHECKPOINT_SHA256 = (
+    "b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202"
+)
+SOURCE_TERMINAL_DECISION_SHA256 = (
+    "8993f4d7ae61d2ecd2bc41d523c45ab55073c63a061ce24629a564627724f8c5"
+)
+SOURCE_TERMINAL_DECISION_IDENTITY = (
+    "7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69"
+)
+RETRY2_RECOVERY_SCHEMA = "signtrajfield_stage_c_retry2_recovery_evidence"
+RUN_R1_SOURCE_GIT_HEAD = "a883baf4a0a95b4ebb2007564837c4d9b4f817cc"
+RUN_R1_SOURCE_REMOTE_REF = (
+    "origin/codex/csl-daily-centered-generator-stage-c-v1-run-r1"
+)
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -59,6 +98,284 @@ def _exact_json(path: Path, *, label: str, fields: set[str]) -> dict:
             f"{label} fields differ: expected={sorted(fields)}, observed={observed}"
         )
     return value
+
+
+def validate_source_terminal_decision(
+    *,
+    decision_path: Path,
+    expected_sha256: str,
+    expected_identity: str,
+) -> dict:
+    """Validate the exact pinned legacy Stage-B decision schema.
+
+    Schema v1 intentionally has no top-level ``authorized_purpose`` field.
+    Its absence, together with the explicit no-confirmation/no-test fields and
+    infeasible status, is the pinned non-authorizing state.  Adding the field,
+    even as null, is a schema change and is rejected here.
+    """
+
+    decision = _exact_json(
+        decision_path,
+        label="Stage-B source terminal decision",
+        fields=SOURCE_TERMINAL_DECISION_FIELDS,
+    )
+    checkpoint = decision.get("checkpoint")
+    unsigned = {
+        key: value for key, value in decision.items() if key != "decision_identity"
+    }
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_identity)
+        or sha256_file(decision_path) != expected_sha256
+        or decision["decision_identity"] != expected_identity
+        or decision["decision_identity"] != digest_json(unsigned)
+        or decision["schema_name"] != SOURCE_TERMINAL_DECISION_SCHEMA
+        or decision["schema_version"] != 1
+        or decision["stage"] != "stage2"
+        or decision["status"] != "valid_infeasible"
+        or decision["integrity_valid"] is not True
+        or decision["development_feasible"] is not False
+        or decision["confirmation_manifest_opened"] is not False
+        or decision["test_data_accessed"] is not False
+        or decision["experiment_name"] != SOURCE_TERMINAL_DECISION_EXPERIMENT
+        or not isinstance(checkpoint, dict)
+        or checkpoint.get("sha256") != SOURCE_CHECKPOINT_SHA256
+        or checkpoint.get("epoch") != 5
+        or checkpoint.get("global_step") != 360
+        or checkpoint.get("has_feasible_checkpoint") is not False
+    ):
+        raise PrerequisiteError(
+            "Stage-B source terminal decision is not the exact valid-infeasible "
+            "legacy decision"
+        )
+    return decision
+
+
+def validate_retry2_recovery_evidence(
+    *,
+    policy_path: Path,
+    recovery_manifest: Path,
+    source_root: Path,
+    evidence_root: Path,
+) -> dict:
+    """Reopen the immutable run-r1 incident evidence before retry-2 work."""
+
+    policy = validate_policy(policy_path)
+    recovery = policy.get("recovery_contract")
+    if not isinstance(recovery, dict):
+        raise PrerequisiteError("Stage-C retry-2 policy lacks recovery evidence")
+    manifest_binding = recovery.get("evidence_manifest")
+    if not isinstance(manifest_binding, dict) or set(manifest_binding) != {
+        "path",
+        "sha256",
+    }:
+        raise PrerequisiteError("Stage-C retry-2 evidence binding is malformed")
+    expected_manifest_path = (source_root / manifest_binding["path"]).resolve()
+    if recovery_manifest.resolve() != expected_manifest_path:
+        raise PrerequisiteError("Stage-C retry-2 evidence path changed")
+    _regular_file(recovery_manifest, "Stage-C retry-2 recovery evidence manifest")
+    if sha256_file(recovery_manifest) != manifest_binding["sha256"]:
+        raise PrerequisiteError("Stage-C retry-2 recovery evidence hash changed")
+
+    manifest = _exact_json(
+        recovery_manifest,
+        label="Stage-C retry-2 recovery evidence manifest",
+        fields={
+            "schema_name",
+            "schema_version",
+            "run_generation",
+            "incident",
+            "canonical_evidence_root",
+            "required_files",
+            "calibration_artifact",
+            "required_absent_paths",
+            "confirmation_spend_marker",
+            "authorization",
+        },
+    )
+    expected_incident = {
+        "calibration_job_id": "143524",
+        "cancelled_dependency_job_id": "143526",
+        "cpu_gate_job_id": "143523",
+        "failed_smoke_job_id": "143525",
+        "failure_class": (
+            "pre_science_source_terminal_decision_schema_compatibility"
+        ),
+        "prior_scientific_output_observed": False,
+        "source_git_head": RUN_R1_SOURCE_GIT_HEAD,
+        "source_remote_ref": RUN_R1_SOURCE_REMOTE_REF,
+    }
+    expected_authorization = {
+        "confirmation_manifest_opened": False,
+        "development_only": True,
+        "non_authorizing": True,
+        "promotion_eligible": False,
+        "test_data_accessed": False,
+    }
+    if (
+        manifest["schema_name"] != RETRY2_RECOVERY_SCHEMA
+        or manifest["schema_version"] != 1
+        or manifest["run_generation"] != "run_r2"
+        or manifest["incident"] != expected_incident
+        or manifest["authorization"] != expected_authorization
+        or evidence_root.resolve()
+        != Path(manifest["canonical_evidence_root"]).resolve()
+    ):
+        raise PrerequisiteError("Stage-C retry-2 recovery evidence scope changed")
+
+    required_files = manifest["required_files"]
+    expected_file_names = {
+        "calibration_complete",
+        "cpu_ready",
+        "failed_smoke_stderr",
+        "failed_smoke_stdout",
+    }
+    if not isinstance(required_files, dict) or set(required_files) != expected_file_names:
+        raise PrerequisiteError("Stage-C retry-2 incident file set changed")
+    reopened: dict[str, Path] = {}
+    for name, spec in required_files.items():
+        if (
+            not isinstance(spec, dict)
+            or set(spec) != {"bytes", "path", "sha256"}
+            or not isinstance(spec["bytes"], int)
+            or spec["bytes"] < 0
+            or not isinstance(spec["path"], str)
+            or Path(spec["path"]).is_absolute()
+            or ".." in Path(spec["path"]).parts
+            or re.fullmatch(r"[0-9a-f]{64}", str(spec["sha256"])) is None
+        ):
+            raise PrerequisiteError(f"Stage-C retry-2 incident file is malformed: {name}")
+        path = _regular_file(
+            evidence_root / spec["path"], f"Stage-C retry-2 incident file {name}"
+        )
+        if path.stat().st_size != spec["bytes"] or sha256_file(path) != spec["sha256"]:
+            raise PrerequisiteError(
+                f"Stage-C retry-2 incident file changed: {name}"
+            )
+        reopened[name] = path
+
+    cpu = validate_cpu_gate(
+        cpu_gate=reopened["cpu_ready"],
+        source_git_head=RUN_R1_SOURCE_GIT_HEAD,
+        source_remote_ref=RUN_R1_SOURCE_REMOTE_REF,
+        source_remote_head=RUN_R1_SOURCE_GIT_HEAD,
+    )
+    completion = _exact_json(
+        reopened["calibration_complete"],
+        label="Stage-C run-r1 calibration completion",
+        fields={
+            "schema_name",
+            "schema_version",
+            "source_git_head",
+            "source_remote_ref",
+            "source_remote_head",
+            "artifact_path",
+            "artifact_identity",
+            "calibration_sha256",
+            "map_sha256",
+            "ready_sha256",
+            "cpu_gate_sha256",
+            "launcher_sha256",
+            "calibration_transition_path",
+            "calibration_transition_sha256",
+            "calibration_transition_identity",
+            "active_lease_claim_identity",
+            "lease_attestation_path",
+            "lease_attestation_sha256",
+            "lease_attestation_identity",
+            "train_only",
+            "development_only",
+            "confirmation_manifest_opened",
+            "test_data_accessed",
+        },
+    )
+    calibration_spec = manifest["calibration_artifact"]
+    if not isinstance(calibration_spec, dict) or set(calibration_spec) != {
+        "path",
+        "artifact_identity",
+        "calibration_sha256",
+        "map_sha256",
+        "ready_sha256",
+    }:
+        raise PrerequisiteError("Stage-C run-r1 calibration specification changed")
+    calibration_dir = evidence_root / calibration_spec["path"]
+    if not calibration_dir.is_dir() or calibration_dir.is_symlink():
+        raise PrerequisiteError("Stage-C run-r1 calibration directory changed")
+    artifact = validate_relevance_calibration_artifact(calibration_dir)
+    expected_completion = {
+        "source_git_head": RUN_R1_SOURCE_GIT_HEAD,
+        "source_remote_ref": RUN_R1_SOURCE_REMOTE_REF,
+        "source_remote_head": RUN_R1_SOURCE_GIT_HEAD,
+        "artifact_path": str(calibration_dir.resolve()),
+        "artifact_identity": calibration_spec["artifact_identity"],
+        "calibration_sha256": calibration_spec["calibration_sha256"],
+        "map_sha256": calibration_spec["map_sha256"],
+        "ready_sha256": calibration_spec["ready_sha256"],
+        "cpu_gate_sha256": required_files["cpu_ready"]["sha256"],
+        "train_only": True,
+        "development_only": True,
+        "confirmation_manifest_opened": False,
+        "test_data_accessed": False,
+    }
+    if (
+        completion.get("schema_name")
+        != "signtrajfield_stage_c_calibration_completion"
+        or completion.get("schema_version") != 1
+        or any(completion.get(key) != value for key, value in expected_completion.items())
+        or artifact.get("identity") != calibration_spec["artifact_identity"]
+        or sha256_file(calibration_dir / "calibration.json")
+        != calibration_spec["calibration_sha256"]
+        or sha256_file(calibration_dir / "calibration_map.npz")
+        != calibration_spec["map_sha256"]
+        or sha256_file(calibration_dir / "READY")
+        != calibration_spec["ready_sha256"]
+        or cpu["slurm_job_id"] != "143523"
+    ):
+        raise PrerequisiteError("Stage-C run-r1 calibration evidence changed")
+
+    absent_paths = manifest["required_absent_paths"]
+    if (
+        not isinstance(absent_paths, list)
+        or len(absent_paths) != 6
+        or len(set(absent_paths)) != 6
+    ):
+        raise PrerequisiteError("Stage-C retry-2 absent-path contract changed")
+    for relative in absent_paths:
+        path = Path(relative)
+        if path.is_absolute() or ".." in path.parts:
+            raise PrerequisiteError("Stage-C retry-2 absent path is malformed")
+        target = evidence_root / path
+        if target.exists() or target.is_symlink():
+            raise PrerequisiteError(
+                f"Stage-C run-r1 scientific output unexpectedly exists: {relative}"
+            )
+    spend_relative = Path(manifest["confirmation_spend_marker"])
+    if spend_relative.is_absolute() or ".." in spend_relative.parts:
+        raise PrerequisiteError("Stage-C confirmation-spend path is malformed")
+    spend = evidence_root / spend_relative
+    if spend.exists() or spend.is_symlink():
+        raise PrerequisiteError("Stage-C confirmation holdout is already spent")
+
+    audit = {
+        "schema_name": "signtrajfield_stage_c_retry2_recovery_audit",
+        "schema_version": 1,
+        "recovery_manifest_sha256": manifest_binding["sha256"],
+        "run_r1_source_git_head": RUN_R1_SOURCE_GIT_HEAD,
+        "failed_smoke_job_id": "143525",
+        "prior_execution_lease_created": False,
+        "prior_scientific_output_observed": False,
+        "retry_authorization_reason": (
+            "attested_pre_claim_pre_science_implementation_failure"
+        ),
+        "retry_authorized": True,
+        "calibration_artifact_identity": artifact["identity"],
+        "required_absent_paths": absent_paths,
+        "confirmation_manifest_opened": False,
+        "test_data_accessed": False,
+        "development_only": True,
+        "non_authorizing": True,
+    }
+    return {**audit, "audit_identity": digest_json(audit)}
 
 
 def validate_cpu_gate(
@@ -114,6 +431,9 @@ def validate_cpu_gate(
 
 def validate_foundation(
     *,
+    recovery_policy: Path,
+    recovery_manifest: Path,
+    recovery_evidence_root: Path,
     cpu_gate: Path,
     calibration_completion: Path,
     calibration_dir: Path,
@@ -127,6 +447,17 @@ def validate_foundation(
 ) -> dict:
     head = source_git_head.lower()
     remote_head = source_remote_head.lower()
+    recovery_audit = validate_retry2_recovery_evidence(
+        policy_path=recovery_policy,
+        recovery_manifest=recovery_manifest,
+        source_root=source_root,
+        evidence_root=recovery_evidence_root,
+    )
+    validate_source_terminal_decision(
+        decision_path=source_terminal_decision,
+        expected_sha256=SOURCE_TERMINAL_DECISION_SHA256,
+        expected_identity=SOURCE_TERMINAL_DECISION_IDENTITY,
+    )
     validate_cpu_gate(
         cpu_gate=cpu_gate,
         source_git_head=head,
@@ -172,7 +503,7 @@ def validate_foundation(
         expected_git_head=head,
         expected_remote_ref=source_remote_ref,
         expected_remote_head=remote_head,
-        expected_source_file_profile="stage_c_generator_adaptation_v1",
+        expected_source_file_profile="stage_c_generator_adaptation_retry2_v1",
     )
     exact_completion = {
         "schema_name": "signtrajfield_stage_c_calibration_completion",
@@ -277,6 +608,8 @@ def validate_foundation(
         or claim.get("claim_identity") != digest_json(unsigned_claim)
         or claim.get("claim_identity") != completion["active_lease_claim_identity"]
         or claim.get("binding", {}).get("source_git_head") != head
+        or claim.get("binding", {}).get("source_file_profile")
+        != "stage_c_generator_adaptation_retry2_v1"
         or claim.get("binding", {}).get("cpu_gate_sha256") != sha256_file(cpu_gate)
         or claim.get("binding", {}).get("launcher_sha256")
         != sha256_file(calibration_launcher)
@@ -306,6 +639,10 @@ def validate_foundation(
     ):
         raise PrerequisiteError("Stage-C calibration terminal archive changed")
     return {
+        "recovery_evidence_audit_identity": recovery_audit["audit_identity"],
+        "recovery_evidence_manifest_sha256": recovery_audit[
+            "recovery_manifest_sha256"
+        ],
         "cpu_gate_sha256": sha256_file(cpu_gate),
         "calibration_completion_sha256": sha256_file(calibration_completion),
         "calibration_identity": artifact["identity"],
@@ -868,7 +1205,15 @@ def parse_args() -> argparse.Namespace:
     cpu.add_argument("--source_git_head", required=True)
     cpu.add_argument("--source_remote_ref", required=True)
     cpu.add_argument("--source_remote_head", required=True)
+    recovery = commands.add_parser("validate-recovery")
+    recovery.add_argument("--policy_path", type=Path, required=True)
+    recovery.add_argument("--recovery_manifest", type=Path, required=True)
+    recovery.add_argument("--source_root", type=Path, required=True)
+    recovery.add_argument("--evidence_root", type=Path, required=True)
     foundation = commands.add_parser("validate-foundation")
+    foundation.add_argument("--recovery_policy", type=Path, required=True)
+    foundation.add_argument("--recovery_manifest", type=Path, required=True)
+    foundation.add_argument("--recovery_evidence_root", type=Path, required=True)
     foundation.add_argument("--cpu_gate", type=Path, required=True)
     foundation.add_argument("--calibration_completion", type=Path, required=True)
     foundation.add_argument("--calibration_dir", type=Path, required=True)
@@ -893,6 +1238,8 @@ def main() -> None:
     command = kwargs.pop("command")
     if command == "validate-cpu":
         value = validate_cpu_gate(**kwargs)
+    elif command == "validate-recovery":
+        value = validate_retry2_recovery_evidence(**kwargs)
     elif command == "validate-foundation":
         value = validate_foundation(**kwargs)
     else:

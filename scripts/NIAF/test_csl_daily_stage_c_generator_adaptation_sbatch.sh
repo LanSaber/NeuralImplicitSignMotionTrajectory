@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=csl_stage_c_cpu
+#SBATCH --job-name=csl_stage_c_r2_cpu
 #SBATCH --partition=spark
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -22,6 +22,10 @@ UV_BIN="${UV_BIN:-/media/cvpr/haomian/python_envs/slt/bin/uv}"
 STAGE_C_LINT_BASE="97f785e3bc6bf48f3c2c686e3365215f4e9c5cb0"
 GLOBAL_HOLDOUT_SPEND="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_factorized_ordered_v1_control/confirmation_holdout_spent.json"
 GATE_DIR="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_stage_c_generator_adaptation_prerequisites/source_${SOURCE_GIT_HEAD,,}/cpu_gate"
+PREREQUISITE_MODULE="NIAF.continuous_trajectory_field.scripts.stage_c_pilot_prerequisites"
+RECOVERY_POLICY="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json"
+RECOVERY_MANIFEST="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_retry2_recovery_evidence_v1.json"
+RECOVERY_EVIDENCE_ROOT="/media/cvpr/haomian/NeuralImplicitSignMotionTrajectory"
 
 [[ -n "${SLURM_JOB_ID:-}" && "${SLURM_NNODES:-0}" == "1" ]] || {
   echo "ERROR: Stage-C CPU gate requires one Slurm node" >&2; exit 1;
@@ -45,11 +49,21 @@ REMOTE_HEAD="$(git ls-remote --heads origin "refs/heads/$SOURCE_REMOTE_BRANCH" |
   echo "ERROR: CPU-gate source is not the exact pushed branch head" >&2; exit 1;
 }
 
+for required in "$RECOVERY_POLICY" "$RECOVERY_MANIFEST"; do
+  [[ -f "$required" && ! -L "$required" ]] || {
+    echo "ERROR: missing Stage-C retry-2 recovery evidence: $required" >&2
+    exit 1
+  }
+done
+
 export PATH="$PYTHON_ENV/bin:$PATH" PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
 export PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=""
 export WANDB=0 WANDB_MODE=disabled WANDB_DISABLED=true
 export UV_CACHE_DIR="/tmp/signtraj_stage_c_cpu_uv_${SLURM_JOB_ID}.${SLURM_RESTART_COUNT:-0}"
 unset WANDB_API_KEY
+"$PYTHON_BIN" -m "$PREREQUISITE_MODULE" validate-recovery \
+  --policy_path "$RECOVERY_POLICY" --recovery_manifest "$RECOVERY_MANIFEST" \
+  --source_root "$PROJECT_DIR" --evidence_root "$RECOVERY_EVIDENCE_ROOT"
 [[ -x "$PYTHON_BIN" && -x "$UV_BIN" && "$($UV_BIN --version)" == "uv 0.10.0" ]] || {
   echo "ERROR: pinned Python/uv CPU-gate tools are unavailable" >&2; exit 1;
 }

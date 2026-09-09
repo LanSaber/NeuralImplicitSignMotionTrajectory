@@ -16,8 +16,8 @@ PYTHON_ENV="${PYTHON_ENV:-/media/cvpr/haomian/python_envs/SOKE}"
 PYTHON_BIN="${PYTHON_BIN:-$PYTHON_ENV/bin/python}"
 SOURCE_BANK="${SENTENCE_MEMORY_DIR:-/media/cvpr/haomian/data/SOKE_FLOW/csl_daily_upper_smplx/meta/niaf_sentence_memory/mt5_vae_mu_train_v1}"
 
-MEMORY_EXPERIMENT="csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_pilot"
-OFF_EXPERIMENT="csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_matched_off_pilot"
+MEMORY_EXPERIMENT="csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_pilot_run_r2"
+OFF_EXPERIMENT="csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_matched_off_pilot_run_r2"
 MEMORY_CFG="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/${MEMORY_EXPERIMENT}.yaml"
 OFF_CFG="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/${OFF_EXPERIMENT}.yaml"
 TRAINER_MODULE="NIAF.continuous_trajectory_field.scripts.train_continuous_trajectory_field"
@@ -31,7 +31,9 @@ PREREQUISITE_HELPER="$PROJECT_DIR/NIAF/continuous_trajectory_field/scripts/stage
 SMOKE_AUDIT_HELPER="$PROJECT_DIR/NIAF/continuous_trajectory_field/scripts/audit_stage_c_smoke_checkpoint.py"
 EXECUTION_CONTROL_HELPER="$PROJECT_DIR/NIAF/continuous_trajectory_field/scripts/stage_c_execution_control.py"
 DECISION_HELPER="$PROJECT_DIR/NIAF/continuous_trajectory_field/scripts/stage_c_pilot_decision.py"
-DECISION_POLICY="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_decision_policy_v1.json"
+DECISION_POLICY="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json"
+RECOVERY_MANIFEST="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_retry2_recovery_evidence_v1.json"
+RECOVERY_EVIDENCE_ROOT="/media/cvpr/haomian/NeuralImplicitSignMotionTrajectory"
 STAGER="$PROJECT_DIR/scripts/NIAF/stage_sentence_memory_train_val_only_node.sh"
 CALIBRATION_LAUNCHER="$PROJECT_DIR/scripts/NIAF/calibrate_csl_daily_stage_c_generator_adaptation_sbatch.sh"
 
@@ -41,7 +43,7 @@ STAGE_B_CHECKPOINT="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/$S
 STAGE_B_DECISION="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/$STAGE_B_EXPERIMENT/evaluation/ordered_development_decision/decision.json"
 V2_CFG="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v2_mt5_text_only_full.yaml"
 V2_CHECKPOINT="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v2_mt5_text_only_full/checkpoints/best.pt"
-CALIBRATION_DIR="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_v1"
+CALIBRATION_DIR="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_retry2_v1"
 PARTITION_DIR="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_motion_contrast_v1.prerequisites/validation_text_partition"
 DEV_MANIFEST="$PARTITION_DIR/manifest_development.jsonl"
 GLOBAL_HOLDOUT_SPEND="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_factorized_ordered_v1_control/confirmation_holdout_spent.json"
@@ -113,7 +115,8 @@ for required in "$PYTHON_BIN" "$MEMORY_CFG" "$OFF_CFG" "$STAGE_B_CFG" \
   "$SOURCE_BANK/bank.json" "$SOURCE_BANK/build_summary.json" \
   "$SOURCE_BANK/READY" "$STAGER" "$ROCE_HELPER" "$PREREQUISITE_HELPER" \
   "$SMOKE_AUDIT_HELPER" "$EXECUTION_CONTROL_HELPER" \
-  "$DECISION_HELPER" "$DECISION_POLICY" "$CALIBRATION_LAUNCHER"; do
+  "$DECISION_HELPER" "$DECISION_POLICY" "$RECOVERY_MANIFEST" \
+  "$CALIBRATION_LAUNCHER"; do
   [[ -e "$required" ]] || { echo "ERROR: missing Stage-C prerequisite: $required" >&2; exit 1; }
 done
 [[ ! -e "$GLOBAL_HOLDOUT_SPEND" ]] || {
@@ -180,6 +183,10 @@ export PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 export WANDB=0 WANDB_MODE=disabled WANDB_DISABLED=true
 unset WANDB_API_KEY
 
+"$PYTHON_BIN" -m "$PREREQUISITE_MODULE" validate-recovery \
+  --policy_path "$DECISION_POLICY" --recovery_manifest "$RECOVERY_MANIFEST" \
+  --source_root "$PROJECT_DIR" --evidence_root "$RECOVERY_EVIDENCE_ROOT"
+
 # Validate both complete configs together.  Apart from arm/name/output and the
 # training-time memory switch, the resolved arms must be exactly identical.
 "$PYTHON_BIN" - "$MEMORY_CFG" "$OFF_CFG" "$PROJECT_DIR" \
@@ -193,6 +200,9 @@ import sys
 from pathlib import Path
 
 from NIAF.continuous_sign_field.config import load_config
+from NIAF.continuous_trajectory_field.scripts.stage_c_pilot_prerequisites import (
+    validate_source_terminal_decision,
+)
 
 memory_path, off_path, project = map(Path, sys.argv[1:4])
 expected = {
@@ -244,7 +254,7 @@ for cfg, arm, mode, probability in (
             "architecture_identity": expected["architecture"],
         },
         "active_stage_c": {
-            "calibration_artifact_dir": "experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_v1",
+            "calibration_artifact_dir": "experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_retry2_v1",
             "calibration_schema_name": "signtrajfield_sentence_memory_relevance_calibration",
             "calibration_schema_version": 1,
         },
@@ -297,10 +307,11 @@ for cfg in (memory, off):
 assert normalized[0] == normalized[1], "Stage-C arms differ outside the approved training-memory switch"
 
 decision_path = project / memory["sentence_memory_safety"]["stage_c"]["source_terminal_decision"]["path"]
-decision = json.loads(decision_path.read_text(encoding="utf-8"))
-assert decision["status"] == "valid_infeasible"
-assert decision["authorized_purpose"] is None
-assert decision["decision_identity"] == expected["decision_identity"]
+validate_source_terminal_decision(
+    decision_path=decision_path,
+    expected_sha256=expected["decision"],
+    expected_identity=expected["decision_identity"],
+)
 print(json.dumps({
     "memory_config_sha256": hashlib.sha256(memory_path.read_bytes()).hexdigest(),
     "matched_off_config_sha256": hashlib.sha256(off_path.read_bytes()).hexdigest(),
@@ -311,6 +322,9 @@ PY
 # Reopen the complete CPU/calibration evidence chain and require exact schemas,
 # immutable hashes, no-access flags, and binding to this clean pushed source.
 "$PYTHON_BIN" -m "$PREREQUISITE_MODULE" validate-foundation \
+  --recovery_policy "$DECISION_POLICY" \
+  --recovery_manifest "$RECOVERY_MANIFEST" \
+  --recovery_evidence_root "$RECOVERY_EVIDENCE_ROOT" \
   --cpu_gate "$CPU_GATE_READY" \
   --calibration_completion "$CALIBRATION_COMPLETION" \
   --calibration_dir "$CALIBRATION_DIR" \
@@ -546,7 +560,7 @@ SOURCE_BINDING_FILES=(
   "$DEV_MANIFEST" "$SOURCE_BANK/bank.json" "$SOURCE_BANK/build_summary.json"
   "$SOURCE_BANK/READY" "$STAGER" "$ROCE_HELPER" "$PREREQUISITE_HELPER"
   "$SMOKE_AUDIT_HELPER" "$EXECUTION_CONTROL_HELPER" "$DECISION_HELPER"
-  "$DECISION_POLICY" "$CALIBRATION_LAUNCHER"
+  "$DECISION_POLICY" "$RECOVERY_MANIFEST" "$CALIBRATION_LAUNCHER"
   "$PROJECT_DIR/NIAF/continuous_trajectory_field/scripts/stage_c_atomic.py"
   "$PROJECT_DIR/NIAF/continuous_trajectory_field/scripts/train_continuous_trajectory_field.py"
   "$PROJECT_DIR/scripts/NIAF/run_csl_daily_stage_c_generator_adaptation_pilot.sh"
@@ -565,6 +579,10 @@ revalidate_source_binding() {
     echo "ERROR: Stage-C remote source head changed during paired execution" >&2
     return 1
   }
+  "$PYTHON_BIN" -m "$PREREQUISITE_MODULE" validate-recovery \
+    --policy_path "$DECISION_POLICY" --recovery_manifest "$RECOVERY_MANIFEST" \
+    --source_root "$PROJECT_DIR" --evidence_root "$RECOVERY_EVIDENCE_ROOT" \
+    >/dev/null
   "$PYTHON_BIN" - "$SOURCE_BINDING_MANIFEST" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
@@ -579,7 +597,7 @@ def sha256_file(path):
 value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 if value.get("schema_name") != "signtrajfield_stage_c_source_binding" or value.get("schema_version") != 1:
     raise SystemExit("ERROR: Stage-C source binding manifest schema changed")
-if len(value.get("files", {})) != 26:
+if len(value.get("files", {})) != 27:
     raise SystemExit("ERROR: Stage-C source binding file set is not exact")
 for path_text, expected in value.get("files", {}).items():
     path = Path(path_text)
@@ -608,7 +626,7 @@ def sha256_file(path):
 
 path = Path(sys.argv[1])
 files = [Path(value).resolve() for value in sys.argv[5:]]
-if len(files) != 26 or len(files) != len(set(files)) or any(not value.is_file() or value.is_symlink() for value in files):
+if len(files) != 27 or len(files) != len(set(files)) or any(not value.is_file() or value.is_symlink() for value in files):
     raise SystemExit("ERROR: Stage-C source binding inputs are not exact regular files")
 payload = {
     "schema_name": "signtrajfield_stage_c_source_binding",

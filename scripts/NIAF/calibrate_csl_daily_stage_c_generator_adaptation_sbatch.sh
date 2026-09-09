@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=csl_stage_c_cal
+#SBATCH --job-name=csl_stage_c_r2_cal
 #SBATCH --partition=spark
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -28,9 +28,12 @@ TRANSITION_MODULE="NIAF.continuous_trajectory_field.scripts.stage_c_calibration_
 PREREQUISITE_HELPER="$PROJECT_DIR/NIAF/continuous_trajectory_field/scripts/stage_c_pilot_prerequisites.py"
 CALIBRATION_CONTROL_HELPER="$PROJECT_DIR/NIAF/continuous_trajectory_field/scripts/stage_c_calibration_control.py"
 TRANSITION_HELPER="$PROJECT_DIR/NIAF/continuous_trajectory_field/scripts/stage_c_calibration_transition.py"
-STAGE_C_CONFIG="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_pilot.yaml"
+STAGE_C_CONFIG="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_pilot_run_r2.yaml"
+RECOVERY_POLICY="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json"
+RECOVERY_MANIFEST="$PROJECT_DIR/NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_retry2_recovery_evidence_v1.json"
+RECOVERY_EVIDENCE_ROOT="/media/cvpr/haomian/NeuralImplicitSignMotionTrajectory"
 SOURCE_DECISION="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1/evaluation/ordered_development_decision/decision.json"
-CALIBRATION_OUT="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_v1"
+CALIBRATION_OUT="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_retry2_v1"
 GLOBAL_HOLDOUT_SPEND="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_factorized_ordered_v1_control/confirmation_holdout_spent.json"
 PREREQUISITE_ROOT="$PROJECT_DIR/experiments/NIAF/continuous_trajectory_field/csl_daily_stage_c_generator_adaptation_prerequisites/source_${SOURCE_GIT_HEAD,,}"
 CPU_GATE_READY="$PREREQUISITE_ROOT/cpu_gate/READY"
@@ -57,7 +60,8 @@ EXPECTED_STAGER_SHA256="8cb3b6fb765af73c8d0fa9db074c267fcdbd4f8943b602b8caef3421
 }
 for required in "$PYTHON_BIN" "$AUDIT_CFG" "$LAUNCHER" "$STAGER" \
   "$PREREQUISITE_HELPER" "$CALIBRATION_CONTROL_HELPER" "$TRANSITION_HELPER" \
-  "$STAGE_C_CONFIG" "$SOURCE_DECISION" \
+  "$STAGE_C_CONFIG" "$RECOVERY_POLICY" "$RECOVERY_MANIFEST" \
+  "$SOURCE_DECISION" \
   "$SOURCE_BANK/bank.json" "$SOURCE_BANK/build_summary.json" \
   "$SOURCE_BANK/READY" "$SOURCE_BANK/neighbors_train.npz"; do
   [[ -e "$required" ]] || { echo "ERROR: missing calibration prerequisite: $required" >&2; exit 1; }
@@ -93,8 +97,15 @@ export WANDB=0 WANDB_MODE=disabled WANDB_DISABLED=true CUDA_VISIBLE_DEVICES=""
 unset WANDB_API_KEY
 mkdir -p -- "$CONTROL_DIR/execution_attempts"
 
+"$PYTHON_BIN" -m "$PREREQUISITE_MODULE" validate-recovery \
+  --policy_path "$RECOVERY_POLICY" --recovery_manifest "$RECOVERY_MANIFEST" \
+  --source_root "$PROJECT_DIR" --evidence_root "$RECOVERY_EVIDENCE_ROOT"
+
 validate_completed_calibration() {
   "$PYTHON_BIN" -m "$PREREQUISITE_MODULE" validate-foundation \
+    --recovery_policy "$RECOVERY_POLICY" \
+    --recovery_manifest "$RECOVERY_MANIFEST" \
+    --recovery_evidence_root "$RECOVERY_EVIDENCE_ROOT" \
     --cpu_gate "$CPU_GATE_READY" --calibration_completion "$COMPLETION" \
     --calibration_dir "$CALIBRATION_OUT" --calibration_launcher "$LAUNCHER" \
     --stage_c_config "$STAGE_C_CONFIG" \
@@ -175,7 +186,7 @@ if [[ ! -e "$COMPLETION" ]]; then
       --out_dir "$CALIBRATION_OUT" --source_root "$PROJECT_DIR" \
       --source_git_head "$SOURCE_GIT_HEAD" \
       --source_remote_ref "origin/$SOURCE_REMOTE_BRANCH" --source_remote_head "$REMOTE_HEAD" \
-      --source_file_profile stage_c_generator_adaptation_v1 \
+      --source_file_profile stage_c_generator_adaptation_retry2_v1 \
       --launcher "$LAUNCHER" --seed 1234 --duration_weight 0.05 \
       --minimum_auroc 0.75 --minimum_probability_gap 0.20 \
       --expected_bank_id "$EXPECTED_BANK_ID" \
@@ -209,7 +220,7 @@ artifact = validate_relevance_calibration_artifact(sys.argv[1])
 validate_relevance_calibration_source(
     artifact, source_root=sys.argv[2], expected_git_head=sys.argv[3],
     expected_remote_ref=sys.argv[4], expected_remote_head=sys.argv[5],
-    expected_source_file_profile="stage_c_generator_adaptation_v1",
+    expected_source_file_profile="stage_c_generator_adaptation_retry2_v1",
 )
 root = Path(sys.argv[1])
 transition_path = Path(sys.argv[9])
