@@ -421,7 +421,26 @@ def configured_sentence_memory_eval_modes(cfg):
             "eval.sentence_memory_modes supports only deterministic "
             f"{sorted(SENTENCE_MEMORY_EVAL_MODES)} modes, got {invalid}"
         )
-    if centered_sentence_memory_enabled(cfg):
+    centered = centered_sentence_memory_enabled(cfg)
+    if (
+        not centered
+        and not paired_sentence_memory_corruption_config(cfg)["enabled"]
+    ):
+        legacy_modes = {
+            "off",
+            "on",
+            "shuffled",
+            "motion_shuffled",
+            "analytic_prior",
+        }
+        unsupported = sorted(set(modes) - legacy_modes)
+        if unsupported:
+            raise ValueError(
+                "Non-centered sentence-memory evaluation without paired "
+                "corruption supports only legacy modes "
+                f"{sorted(legacy_modes)}, got unsupported modes {unsupported}"
+            )
+    if centered:
         expected = (
             "off",
             "on",
@@ -8645,7 +8664,14 @@ def evaluate_configured_modes(
             show_progress=show_progress,
         )
     if is_sentence_memory_model(cfg):
-        if paired_sentence_memory_corruption_config(cfg)["enabled"]:
+        # Stage C deliberately disables the paired *training* objective, but
+        # retains the centered joint validation protocol (including Rpair and
+        # the fixed evidence controls).  Dispatch by the validation protocol,
+        # not only by the training-objective flag.
+        if (
+            paired_sentence_memory_corruption_config(cfg)["enabled"]
+            or centered_sentence_memory_enabled(cfg)
+        ):
             return evaluate_paired_sentence_memory_modes(
                 model,
                 fk,

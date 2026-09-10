@@ -24,9 +24,11 @@ LEASE_SCHEMA = "signtrajfield_stage_c_calibration_lease"
 ATTESTATION_SCHEMA = "signtrajfield_stage_c_calibration_lease_attestation"
 TERMINAL_SCHEMA = "signtrajfield_stage_c_calibration_lease_terminal"
 SCHEMA_VERSION = 1
+DEFAULT_SOURCE_FILE_PROFILE = "stage_c_generator_adaptation_retry2_v1"
 SOURCE_FILE_PROFILES = {
     "stage_c_generator_adaptation_v1",
-    "stage_c_generator_adaptation_retry2_v1",
+    DEFAULT_SOURCE_FILE_PROFILE,
+    "stage_c_generator_adaptation_protocol_v2_run_r3",
 }
 TERMINAL_STATES = {
     "BOOT_FAIL",
@@ -97,6 +99,7 @@ def calibration_binding(
     bank_manifest: Path,
     bank_ready: Path,
     train_neighbors: Path,
+    source_file_profile: str = DEFAULT_SOURCE_FILE_PROFILE,
 ) -> dict[str, Any]:
     head = source_git_head.lower()
     files = {
@@ -111,6 +114,7 @@ def calibration_binding(
         re.fullmatch(r"[0-9a-f]{40}", head) is None
         or source_remote_head.lower() != head
         or re.fullmatch(r"origin/[A-Za-z0-9._/-]+", source_remote_ref) is None
+        or source_file_profile not in SOURCE_FILE_PROFILES
         or any(not path.is_file() or path.is_symlink() for path in files.values())
     ):
         raise CalibrationLeaseError("calibration lease binding is malformed")
@@ -121,7 +125,7 @@ def calibration_binding(
         "source_remote_ref": source_remote_ref,
         "source_remote_head": head,
         **{name: sha256_file(path) for name, path in files.items()},
-        "source_file_profile": "stage_c_generator_adaptation_retry2_v1",
+        "source_file_profile": source_file_profile,
         "seed": 1234,
         "duration_weight": 0.05,
         "minimum_auroc": 0.75,
@@ -625,6 +629,7 @@ def _binding_args(args: argparse.Namespace) -> dict[str, Any]:
         bank_manifest=args.bank_manifest,
         bank_ready=args.bank_ready,
         train_neighbors=args.train_neighbors,
+        source_file_profile=args.source_file_profile,
     )
 
 
@@ -639,6 +644,11 @@ def parse_args() -> argparse.Namespace:
     acquire_parser.add_argument("--source_git_head", required=True)
     acquire_parser.add_argument("--source_remote_ref", required=True)
     acquire_parser.add_argument("--source_remote_head", required=True)
+    acquire_parser.add_argument(
+        "--source_file_profile",
+        choices=sorted(SOURCE_FILE_PROFILES),
+        default=DEFAULT_SOURCE_FILE_PROFILE,
+    )
     for name in (
         "launcher",
         "cpu_gate",

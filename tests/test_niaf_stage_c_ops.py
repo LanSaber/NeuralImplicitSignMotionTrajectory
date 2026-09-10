@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 
@@ -358,6 +359,17 @@ def test_calibration_lease_recovers_failed_terminal_write_before_archive(
         {key: value for key, value in legacy_binding.items() if key != "digest"}
     )
     calibration_control._validate_binding(legacy_binding)
+    protocol_binding = calibration_control.calibration_binding(
+        source_git_head="b" * 40,
+        source_remote_ref="origin/stage-c",
+        source_remote_head="b" * 40,
+        source_file_profile="stage_c_generator_adaptation_protocol_v2_run_r3",
+        **inputs,
+    )
+    assert protocol_binding["source_file_profile"] == (
+        "stage_c_generator_adaptation_protocol_v2_run_r3"
+    )
+    calibration_control._validate_binding(protocol_binding)
     unknown_binding = dict(binding)
     unknown_binding["source_file_profile"] = "unapproved"
     unknown_binding["digest"] = calibration_control.digest_json(
@@ -540,6 +552,286 @@ def test_stage_c_policy_predeclares_exact_non_authorizing_progression(tmp_path):
         match="recovery contract changed",
     ):
         stage_c_pilot_decision.validate_policy(tampered_path)
+
+
+def test_protocol_v2_policy_is_exact_and_forbids_same_generation_retry(tmp_path):
+    policy_path = (
+        CONFIG_DIR
+        / "csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_"
+        "decision_policy_v1.json"
+    )
+    policy = stage_c_pilot_decision.validate_policy(policy_path)
+    assert policy["recovery_contract"]["prior_scientific_output_observed"] is True
+    assert policy["recovery_contract"]["prior_execution_lease_created"] is True
+    assert policy["recovery_contract"]["prior_memory_optimizer_updates_observed"] == 1
+    assert policy["recovery_contract"]["matched_off_arm_started"] is False
+    assert policy["recovery_contract"]["same_protocol_retry_authorized"] is False
+    assert policy["recovery_contract"]["resume_authorized"] is False
+    assert policy["retry_policy"] == {
+        "malformed_completion": "stop_no_replace",
+        "partial_scientific_output": "stop_no_retry",
+        "unique_complete_execution": "reuse_only_for_publication_recovery",
+        "zero_scientific_output": "stop_no_retry_within_protocol_generation",
+    }
+
+    changed = copy.deepcopy(policy)
+    changed["retry_policy"]["zero_scientific_output"] = (
+        "new_attempt_permitted_after_terminal_lease"
+    )
+    changed_path = tmp_path / policy_path.name
+    _write_json(changed_path, changed)
+    with pytest.raises(
+        stage_c_pilot_decision.StageCDecisionError,
+        match="policy content changed",
+    ):
+        stage_c_pilot_decision.validate_policy(changed_path)
+
+
+def test_recovery_dispatch_and_source_binding_generation_are_exact(
+    tmp_path, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(
+        prerequisites,
+        "validate_retry2_recovery_evidence",
+        lambda **kwargs: calls.append(("r2", kwargs)) or {"generation": "r2"},
+    )
+    monkeypatch.setattr(
+        prerequisites,
+        "validate_protocol_v2_run_r3_recovery_evidence",
+        lambda **kwargs: calls.append(("r3", kwargs)) or {"generation": "r3"},
+    )
+    common = {
+        "recovery_manifest": tmp_path / "manifest.json",
+        "source_root": tmp_path,
+        "evidence_root": tmp_path,
+    }
+    r2_policy = tmp_path / prerequisites.RETRY2_POLICY_NAME
+    r3_policy = tmp_path / prerequisites.PROTOCOL_V2_RUN_R3_POLICY_NAME
+    assert prerequisites.validate_recovery_evidence(
+        policy_path=r2_policy, **common
+    ) == {"generation": "r2"}
+    assert prerequisites.validate_recovery_evidence(
+        policy_path=r3_policy, **common
+    ) == {"generation": "r3"}
+    assert [item[0] for item in calls] == ["r2", "r3"]
+    with pytest.raises(prerequisites.PrerequisiteError, match="not registered"):
+        prerequisites.validate_recovery_evidence(
+            policy_path=tmp_path / "unknown.json", **common
+        )
+
+    policy_sha = "a" * 64
+    recovery_name = (
+        "csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_"
+        "recovery_evidence_v1.json"
+    )
+    r2_memory_name = (
+        "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_"
+        "memory_pilot_run_r2.yaml"
+    )
+    r2_off_name = (
+        "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_"
+        "matched_off_pilot_run_r2.yaml"
+    )
+    r3_memory_name = (
+        "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_"
+        "memory_protocol_v2_run_r3.yaml"
+    )
+    r3_off_name = (
+        "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_"
+        "matched_off_protocol_v2_run_r3.yaml"
+    )
+    r3_bound = {
+        str(r3_policy.resolve()): policy_sha,
+        str((tmp_path / recovery_name).resolve()): "b" * 64,
+        str((tmp_path / r2_memory_name).resolve()): "c" * 64,
+        str((tmp_path / r2_off_name).resolve()): "d" * 64,
+        str((tmp_path / r3_memory_name).resolve()): "1" * 64,
+        str((tmp_path / r3_off_name).resolve()): "2" * 64,
+        str(
+            (
+                tmp_path
+                / "run_csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3.sh"
+            ).resolve()
+        ): "3" * 64,
+        str(
+            (
+                tmp_path
+                / "calibrate_csl_daily_stage_c_generator_adaptation_"
+                "protocol_v2_run_r3_sbatch.sh"
+            ).resolve()
+        ): "4" * 64,
+        **{
+            str((tmp_path / f"r3_source_{index}.py").resolve()): "e" * 64
+            for index in range(21)
+        },
+    }
+    assert stage_c_pilot_decision._validate_source_binding_generation(
+        bound_files=r3_bound,
+        decision_policy={"path": str(r3_policy.resolve()), "sha256": policy_sha},
+        mode="smoke",
+    ) == 29
+    smoke_ready = tmp_path / "prerequisites/source_abc/smoke/PUBLICATION/READY"
+    smoke_sha = "9" * 64
+    pilot_bound = {**r3_bound, str(smoke_ready.resolve()): smoke_sha}
+    prior_smoke = {
+        "ready_path": str(smoke_ready.resolve()),
+        "ready_sha256": smoke_sha,
+    }
+    assert stage_c_pilot_decision._validate_source_binding_generation(
+        bound_files=pilot_bound,
+        decision_policy={"path": str(r3_policy.resolve()), "sha256": policy_sha},
+        mode="pilot",
+        prior_one_update_smoke=prior_smoke,
+    ) == 30
+    with pytest.raises(
+        stage_c_pilot_decision.StageCDecisionError,
+        match="does not hash-bind smoke READY",
+    ):
+        stage_c_pilot_decision._validate_source_binding_generation(
+            bound_files=pilot_bound,
+            decision_policy={
+                "path": str(r3_policy.resolve()),
+                "sha256": policy_sha,
+            },
+            mode="pilot",
+            prior_one_update_smoke={**prior_smoke, "ready_sha256": "0" * 64},
+        )
+    with pytest.raises(
+        stage_c_pilot_decision.StageCDecisionError,
+        match="lacks the one-update smoke prerequisite",
+    ):
+        stage_c_pilot_decision._validate_source_binding_generation(
+            bound_files=pilot_bound,
+            decision_policy={
+                "path": str(r3_policy.resolve()),
+                "sha256": policy_sha,
+            },
+            mode="pilot",
+        )
+    missing_marker = dict(r3_bound)
+    missing_marker.pop(str((tmp_path / recovery_name).resolve()))
+    missing_marker[str((tmp_path / "replacement.py").resolve())] = "f" * 64
+    with pytest.raises(
+        stage_c_pilot_decision.StageCDecisionError,
+        match="protocol-v2 source binding file set",
+    ):
+        stage_c_pilot_decision._validate_source_binding_generation(
+            bound_files=missing_marker,
+            decision_policy={"path": str(r3_policy.resolve()), "sha256": policy_sha},
+            mode="smoke",
+        )
+
+
+def test_protocol_v2_configs_deep_equal_run_r2_and_reject_scientific_drift(
+    tmp_path, monkeypatch
+):
+    names = {
+        "r2_memory": (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_"
+            "memory_pilot_run_r2.yaml"
+        ),
+        "r2_off": (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_"
+            "matched_off_pilot_run_r2.yaml"
+        ),
+        "r3_memory": (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_"
+            "memory_protocol_v2_run_r3.yaml"
+        ),
+        "r3_off": (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_"
+            "matched_off_protocol_v2_run_r3.yaml"
+        ),
+    }
+    source_paths = {
+        "r2_memory": CONFIG_DIR / names["r2_memory"],
+        "r2_off": CONFIG_DIR / names["r2_off"],
+        "r3_memory": CONFIG_DIR / names["r3_memory"],
+        "r3_off": CONFIG_DIR / names["r3_off"],
+    }
+    config_root = tmp_path / "NIAF/continuous_trajectory_field/configs"
+    paths = {name: config_root / filename for name, filename in names.items()}
+    for name, source in source_paths.items():
+        _write_json(paths[name], load_config(source))
+    archive_path = tmp_path / "ARCHIVE.json"
+    _write_json(
+        archive_path,
+        {
+            "retained_evidence": {
+                "run_source_configs": {
+                    str(paths["r2_memory"]): prerequisites.sha256_file(
+                        paths["r2_memory"]
+                    ),
+                    str(paths["r2_off"]): prerequisites.sha256_file(paths["r2_off"]),
+                }
+            },
+            "recovery": {
+                "new_calibration_root": (
+                    "experiments/NIAF/continuous_trajectory_field/"
+                    "csl_daily_sentence_memory_relevance_calibration_stage_c_"
+                    "generator_adaptation_protocol_v2_run_r3"
+                ),
+                "new_prerequisite_root": (
+                    "experiments/NIAF/continuous_trajectory_field/"
+                    "csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_"
+                    "prerequisites"
+                ),
+                "new_smoke_root": (
+                    "experiments/NIAF/continuous_trajectory_field/"
+                    "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+                    "adaptation_protocol_v2_run_r3_smoke"
+                ),
+                "new_pilot_root": (
+                    "experiments/NIAF/continuous_trajectory_field/"
+                    "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+                    "adaptation_protocol_v2_run_r3_pilot"
+                ),
+            },
+        },
+    )
+    monkeypatch.setattr(
+        prerequisites,
+        "validate_protocol_v2_run_r3_recovery_evidence",
+        lambda **_kwargs: {
+            "audit_identity": "1" * 64,
+            "incident_archive_path": str(archive_path),
+        },
+    )
+    kwargs = {
+        "policy_path": tmp_path / prerequisites.PROTOCOL_V2_RUN_R3_POLICY_NAME,
+        "recovery_manifest": tmp_path / "recovery.json",
+        "source_root": tmp_path,
+        "evidence_root": tmp_path,
+        "memory_config": paths["r3_memory"],
+        "matched_off_config": paths["r3_off"],
+    }
+    audit = prerequisites.validate_protocol_v2_run_r3_configs(**kwargs)
+    assert audit["scientific_settings_equal_run_r2"] is True
+    assert audit["same_settings_except_arm_switch"] is True
+    assert audit["original_stage_b_warm_start_pinned"] is True
+
+    changed = load_config(paths["r3_memory"])
+    changed["train"]["epochs"] = 2
+    _write_json(paths["r3_memory"], changed)
+    with pytest.raises(prerequisites.PrerequisiteError, match="differ"):
+        prerequisites.validate_protocol_v2_run_r3_configs(**kwargs)
+
+    changed = load_config(source_paths["r3_memory"])
+    changed["sentence_memory"]["relevance_calibration"]["artifact_dir"] = (
+        "experiments/NIAF/continuous_trajectory_field/"
+        "csl_daily_sentence_memory_relevance_calibration_stage_c_"
+        "generator_adaptation_retry2_v1"
+    )
+    changed["sentence_memory_safety"]["stage_c"]["active_stage_c"][
+        "calibration_artifact_dir"
+    ] = changed["sentence_memory"]["relevance_calibration"]["artifact_dir"]
+    _write_json(paths["r3_memory"], changed)
+    with pytest.raises(
+        prerequisites.PrerequisiteError,
+        match="scientific settings differ|fresh namespace changed",
+    ):
+        prerequisites.validate_protocol_v2_run_r3_configs(**kwargs)
 
 
 def test_stage_c_calibration_is_fresh_source_bound_and_train_only():
@@ -868,7 +1160,7 @@ def _foundation_gate(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         prerequisites,
-        "validate_retry2_recovery_evidence",
+        "validate_recovery_evidence",
         lambda **_kwargs: {
             "audit_identity": "e" * 64,
             "recovery_manifest_sha256": "f" * 64,
@@ -1131,8 +1423,8 @@ def _smoke_gate(tmp_path):
         CONFIG_DIR
         / "csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json"
     )
-    bound_files = dict(binding_files)
-    for index in range(23):
+    bound_files = {**binding_files, "decision_policy": policy_path}
+    for index in range(22):
         path = tmp_path / "bound" / f"source_{index}.py"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"# source {index}\n", encoding="utf-8")
@@ -1545,9 +1837,28 @@ def test_smoke_gate_binds_complete_scope_and_rejects_tampering(tmp_path):
     kwargs, ready, complete, complete_path = _smoke_gate(tmp_path)
     mode_complete_path = Path(ready["complete_path"])
     mode_complete = json.loads(mode_complete_path.read_text(encoding="utf-8"))
-    assert prerequisites.validate_smoke(**kwargs)["training_network_profile"] == (
-        "dual"
+    smoke_binding = prerequisites.validate_smoke(**kwargs)
+    launch = json.loads(
+        (complete_path.parent / "LAUNCH.json").read_text(encoding="utf-8")
     )
+    assert smoke_binding["schema_name"] == (
+        "signtrajfield_stage_c_prior_one_update_smoke_prerequisite"
+    )
+    assert smoke_binding["ready_path"] == str(Path(kwargs["smoke_ready"]).resolve())
+    assert smoke_binding["ready_sha256"] == prerequisites.sha256_file(
+        Path(kwargs["smoke_ready"])
+    )
+    assert smoke_binding["decision_identity"] == ready["decision_identity"]
+    assert smoke_binding["decision_status"] == "smoke_ready"
+    assert smoke_binding["source_git_head"] == kwargs["source_git_head"]
+    assert smoke_binding["pair_constraint"] == kwargs["pair_constraint"]
+    assert smoke_binding["memory_config_sha256"] == launch["artifacts"][
+        "memory_config"
+    ]["sha256"]
+    assert smoke_binding["cpu_gate_sha256"] == launch["artifacts"]["cpu_gate"][
+        "sha256"
+    ]
+    assert smoke_binding["training_network_profile"] == "dual"
 
     ready["one_optimizer_update_per_arm"] = False
     _write_json(kwargs["smoke_ready"], ready)

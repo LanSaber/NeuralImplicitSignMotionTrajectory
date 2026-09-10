@@ -542,6 +542,141 @@ def test_stage_c_contract_is_isolated_and_arm_locked(tmp_path):
         )
 
 
+def _checked_in_config(config_name):
+    return load_config(
+        Path(__file__).resolve().parents[1]
+        / "NIAF"
+        / "continuous_trajectory_field"
+        / "configs"
+        / config_name
+    )
+
+
+def _evaluation_dispatch_probe(cfg):
+    expected = {"sentence_memory/probe": 1.0}
+    with (
+        patch.object(
+            trainer,
+            "evaluate_paired_sentence_memory_modes",
+            return_value=expected,
+        ) as joint_evaluate,
+        patch.object(
+            trainer, "evaluate", return_value={"probe": 1.0}
+        ) as legacy_evaluate,
+    ):
+        actual = trainer.evaluate_configured_modes(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            cfg,
+            torch.device("cpu"),
+            max_batches=1,
+            show_progress=False,
+            sentence_memory_provider=object(),
+        )
+    return actual, joint_evaluate, legacy_evaluate
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    (
+        "csl_daily_signtrajfield_v3_sentence_memory_stage_c_"
+        "generator_adaptation_memory_pilot_run_r2.yaml",
+        "csl_daily_signtrajfield_v3_sentence_memory_stage_c_"
+        "generator_adaptation_matched_off_pilot_run_r2.yaml",
+    ),
+)
+def test_checked_in_stage_c_uses_joint_evaluation_when_training_corruption_off(
+    config_name,
+):
+    cfg = _checked_in_config(config_name)
+    stage_c = cfg["sentence_memory_safety"]["stage_c"]
+    validate_stage_c_training_contract(
+        cfg, stage_c_warm_start=Path(stage_c["source_checkpoint"]["path"])
+    )
+    assert trainer.paired_sentence_memory_corruption_config(cfg)["enabled"] is False
+    assert trainer.centered_sentence_memory_enabled(cfg)
+
+    actual, joint_evaluate, legacy_evaluate = _evaluation_dispatch_probe(cfg)
+    assert actual == {"sentence_memory/probe": 1.0}
+    joint_evaluate.assert_called_once()
+    legacy_evaluate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    (
+        "csl_daily_signtrajfield_v3_sentence_memory_phase_a_"
+        "centered_relevance_motion_contrast_v1.yaml",
+        "csl_daily_signtrajfield_v3_sentence_memory_phase_a_"
+        "centered_absolute_binding_motion_contrast_v1.yaml",
+    ),
+)
+def test_centered_stage_a_and_b_keep_joint_evaluation_dispatch(config_name):
+    cfg = _checked_in_config(config_name)
+    assert trainer.paired_sentence_memory_corruption_config(cfg)["enabled"] is True
+    assert trainer.centered_sentence_memory_enabled(cfg)
+
+    actual, joint_evaluate, legacy_evaluate = _evaluation_dispatch_probe(cfg)
+    assert actual == {"sentence_memory/probe": 1.0}
+    joint_evaluate.assert_called_once()
+    legacy_evaluate.assert_not_called()
+
+
+def test_noncentered_paired_off_keeps_legacy_evaluation_dispatch():
+    cfg = _checked_in_config(
+        "csl_daily_signtrajfield_v3_sentence_memory_phase_b.yaml"
+    )
+    assert trainer.paired_sentence_memory_corruption_config(cfg)["enabled"] is False
+    assert not trainer.centered_sentence_memory_enabled(cfg)
+
+    actual, joint_evaluate, legacy_evaluate = _evaluation_dispatch_probe(cfg)
+    assert actual == {
+        "text_only/probe": 1.0,
+        "sentence_memory/probe": 1.0,
+        "shuffled_sentence_memory/probe": 1.0,
+    }
+    joint_evaluate.assert_not_called()
+    assert legacy_evaluate.call_count == 3
+
+
+def test_noncentered_paired_off_rejects_centered_modes_before_evaluation():
+    cfg = {
+        "model": {"type": "sentence_memory_continuous_trajectory_field"},
+        "sentence_memory_safety": {"paired_corruption": {"enabled": False}},
+        "eval": {
+            "sentence_memory_modes": ["off", "on", "motion_shuffled_n0"],
+            "sentence_memory_word_prior_mode": "off",
+        },
+    }
+    with (
+        patch.object(trainer, "evaluate_paired_sentence_memory_modes") as joint_evaluate,
+        patch.object(trainer, "evaluate") as legacy_evaluate,
+        pytest.raises(
+            ValueError,
+            match="Non-centered.*unsupported modes.*motion_shuffled_n0",
+        ),
+    ):
+        trainer.evaluate_configured_modes(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            cfg,
+            torch.device("cpu"),
+            show_progress=False,
+            sentence_memory_provider=object(),
+        )
+
+    joint_evaluate.assert_not_called()
+    legacy_evaluate.assert_not_called()
+
+
 def test_stage_c_runtime_requires_two_one_gpu_nccl_ranks(tmp_path):
     cfg = _stage_c_cfg(tmp_path)
     runtime = {

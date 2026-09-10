@@ -5,7 +5,7 @@ runs. Read it before answering an unqualified question such as "What is the
 current training progress?" The scheduler and logs remain the source of truth
 for live state; this registry determines **which run** the question refers to.
 
-Last observed: **2026-09-10 02:19 Asia/Dubai (UTC+04:00)**
+Last observed: **2026-09-10 05:37 Asia/Dubai (UTC+04:00)**
 
 ## Default run resolution
 
@@ -19,7 +19,7 @@ has the highest Slurm job ID or is already in the `RUNNING` state.
 Dataset-qualified requests override that default: "the How2Sign training"
 refers to `how2sign-signtrajfield-v2-full-20260807`, and "the CSL-Daily
 training" refers to
-`csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-pilot-run-r2-20260910`.
+`csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-protocol-v2-run-r3-20260910`.
 
 ## Active prerequisite artifact jobs (not training)
 
@@ -84,26 +84,50 @@ logs/sbatch/csl_rag_neighbors_142745.out
 logs/sbatch/csl_rag_neighbors_142745.err
 ```
 
-## Preregistered CSL-Daily: Stage-C generator-adaptation retry-2 pilot
+## Preregistered CSL-Daily: Stage-C protocol-v2/run-r3 generator-adaptation pilot
+
+| Field | Value |
+|---|---|
+| Alias | `csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-protocol-v2-run-r3-20260910` |
+| State | **Fresh protocol generation preregistered; no protocol-v2/run-r3 job submitted and no result observed at this registry timestamp.** This is development-only and non-authorizing; it does not amend Stage B or make a checkpoint deployable |
+| Why a new generation | Run-r2 produced one optimizer update and began validation before its evaluator-dispatch failure. Its v1 contract therefore makes that attempt terminal and forbids a retry. Protocol v2 is a wholly fresh generation defined from the operational failure class, without a pilot decision or validation outcome and without changing scientific choices |
+| Exact source | Both arms independently reload the Stage-B epoch-5/global-step-360 `best_infeasible.pt`, SHA256 `b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202`; terminal decision SHA256 `8993f4d7ae61d2ecd2bc41d523c45ab55073c63a061ce24629a564627724f8c5`, identity `7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69`, status `valid_infeasible` |
+| Matched arms | Sequential `memory` (`dropout`, probability `0.25`) and `matched_off` (`off`, probability `1.0`) arms in one allocation; each resets optimizer, epoch/global-step, selection, and RNG state. Paired-corruption training remains disabled |
+| Trainability | All 62 sentence-memory tensors frozen; exactly 20 generator tensors/1,109,395 parameters trainable under seven pinned hypernetwork prefixes; all other 213 model tensors frozen |
+| Batch and duration | Exactly two ranks/two GPUs; batch 64/rank and accumulation two, effective global batch 256. Smoke is one optimizer update per arm; pilot is one uncapped epoch/global step 72 per arm |
+| Allocation | Exactly two nodes from one explicit `pair01`--`pair15`, one GPU/rank/node. Both ConnectX-7 f1 RoCE rails must pass 200-Gb/s link, MTU 9000, GID 5, peer, raw-counter, NCCL `NET/IB`, and no-socket checks; the exact 4,437,580-byte gradient benchmark chooses single or dual rail |
+| Sole implementation change | Centered 11-mode evaluation dispatches to the paired evaluator when paired-corruption training **or centered sentence-memory evaluation** is enabled. A companion fail-fast guard rejects centered-only mode names in otherwise noncentered, paired-off custom configs. This fixes the run-r2 `motion_shuffled_n0` namespace failure without enabling paired training or changing any checked-in arm, metric, mode, hyperparameter, threshold, data split, or duration |
+| Ordered gates | Fresh complete CPU/compile/Ruff/tests on the final clean pushed HEAD -> fresh source-bound train-only calibration -> fresh paired forced-IB network and one-update two-arm smoke -> one-epoch paired pilot only after atomic `smoke_ready` |
+| Isolation | New `protocol_v2_run_r3` configs, scripts, policy/recovery manifest, calibration, prerequisite, smoke, pilot, arm-output, lease, and log namespaces. Run-r2 `last.pt`, calibration, outputs, leases, and logs cannot be reused, moved, deleted, or modified |
+| Decision boundary | Smoke pass is only `smoke_ready` -> `run_one_epoch_development_pilot`; every smoke failure is `stop`/`none`. Pilot pass is only `pilot_complete_development_signal` -> `none_requires_fresh_preregistration_without_pilot_outcome_access`; every pilot failure is `stop`/`none`. No status authorizes a longer run, retry, promotion, confirmation, or test |
+| Data boundary | Only train and the sealed development subset of validation; only train/validation neighbor tables may be staged. No test/confirmation input may be referenced or opened, the global confirmation-spend marker must remain absent, and W&B is disabled |
+| Incident prerequisite | No-replace run-r2 archive `...generator_adaptation_smoke.invalid_attempts/source_f12b993b5de361423df3b8cbfb4e873f4a95ad1e_smoke143541_pilot143542/ARCHIVE.json`, SHA256 `82ce35cf3d7337f218bda189080a45b9e3faedec200750310d0958296f9d1855`, must be reopened and validated before each gate |
+| Immutable source | Intended branch `codex/csl-daily-centered-generator-stage-c-v2-run-r3` and standalone clone `/media/cvpr/haomian/SignTrajField_centered_stage_c_v2_run_source_r3`; launch is forbidden until the final pushed HEAD, matching remote ref/head, and all source/config/script hashes are bound |
+| Runbook | `docs/NIAF/continuous_trajectory_field/stage_c_generator_adaptation_protocol_v2_run_r3.md` |
+| Default alias | Global PHOENIX default unchanged; this alias is only the dataset-qualified CSL-Daily resolution |
+
+## Stopped CSL-Daily Stage-C retry2-v1/run-r2 after partial smoke
 
 | Field | Value |
 |---|---|
 | Alias | `csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-pilot-run-r2-20260910` |
-| State | **Retry-2 preregistered; no retry-2 job submitted and no result observed at this registry timestamp.** This is a development-only, non-authorizing operational recovery and does not amend the terminal Stage-B `valid_infeasible` decision |
+| State | **Terminal stop after partial scientific output; not retryable under retry2-v1/run-r2.** CPU job `143539` and fresh calibration job `143540` completed. Smoke job `143541` failed after one optimizer update and partial validation. No pilot result exists |
+| Immutable source | Clean pushed commit `f12b993b5de361423df3b8cbfb4e873f4a95ad1e`, `origin/codex/csl-daily-centered-generator-stage-c-v1-run-r2`, standalone clone `/media/cvpr/haomian/SignTrajField_centered_stage_c_run_source_r2` |
 | Exact source | Stage-B epoch-5/global-step-360 `best_infeasible.pt`, SHA256 `b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202`; terminal decision SHA256 `8993f4d7ae61d2ecd2bc41d523c45ab55073c63a061ce24629a564627724f8c5`, identity `7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69`. Its exact legacy schema omits top-level `authorized_purpose` and explicitly records no confirmation/test access |
 | Matched arms | Sequential `memory` (`dropout`, probability `0.25`) and `matched_off` (`off`, probability `1.0`) arms in one allocation; each independently reloads the same source and resets optimizer, epoch, selection, and RNG state |
 | Trainability | All 62 sentence-memory tensors frozen; exactly 20 generator tensors/1,109,395 parameters trainable under seven pinned hypernetwork prefixes; all other 213 model tensors frozen |
 | Batch and duration | Exactly two ranks on two GPUs; batch 64/rank and accumulation two, effective global batch 256; one uncapped epoch and global step 72 per arm after an exact one-update smoke |
-| Allocation | Exactly two Spark nodes sharing one explicit `pair01`--`pair15` feature, one GPU/rank per node. Both 200-Gb/s ConnectX-7 f1 RoCE rails must pass topology, peer, counter, NCCL `NET/IB`, and no-socket-fallback checks before training; single-versus-dual rail is benchmark-selected |
-| Ordered gates | Complete CPU/compile/Ruff/tests on a new clean pushed HEAD -> fresh retry-2 source-bound train-only calibration -> paired forced-IB network and one-update smoke -> one-epoch paired pilot. Only `smoke_ready` permits the pilot |
-| Decision boundary | Smoke or pilot failure is `stop`/`none`. Passing pilot is `pilot_complete_development_signal` with `none_requires_fresh_preregistration_without_pilot_outcome_access`. No status authorizes a longer run, promotion, confirmation, or test |
-| Isolation | Only train/validation data may be staged; Stage-C code must not reference or open confirmation/test inputs, the global confirmation-spend marker must stay absent, and W&B is disabled |
-| Retry isolation | New `*_pilot_run_r2` arm outputs, retry-2 policy, and `csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_retry2_v1`; CPU/control evidence uses the new source-commit namespace. Existing source-namespaced smoke/pilot singleton roots are retained because run-r1 produced neither scientific output nor a publication |
-| Recovery evidence | The retry-2 policy hash-binds the exact run-r1 CPU/calibration records, calibration artifact identity/hashes, empty smoke stdout and pinned failure stderr, old source head/job IDs, absent old smoke/pilot/attempt/publication and arm-output paths, and unspent confirmation marker. Each retry-2 stage reopens this evidence before work. The sole retry exception is the attested pre-claim/pre-science implementation failure; no prior execution lease existed |
-| Active-job guard | The launcher fails closed if `squeue` reports any nonterminal Stage-C job; it only diagnoses and never cancels jobs |
-| Immutable source | To be recorded after the retry-2 implementation/docs commit is pushed and copied into a clean standalone shared run clone; launch is forbidden before that binding exists |
+| Completed prerequisites | CPU gate `143539` completed compile, Ruff, and all 424 repository tests and published source-bound `READY`. Calibration `143540` published accepted train-only artifact `be670961a7ab1c3976ceba3427a4541c629517a08b46e65070e91699a85d4419`; no confirmation/test access |
+| Verified allocation/network | Smoke `143541` used exactly nodes `ADUAED21043WKLX04` and `ADUAED21044WKLX03`, pair `pair02`, two ranks/two GPUs. Both 200-Gb/s RoCE rails, peer connectivity, raw pre-counters, forced-NCCL `NET/IB`, and no socket fallback passed. The gradient benchmark selected single-primary `rocep1s0f1:1` because dual was 1.7218 times the fastest-single gradient latency |
+| Partial scientific output | Only `memory` started. It completed logical batches 1/2 with printed losses `12.083765`/`11.824976`, wrote `last.pt` at epoch 1/global step 1 with validation pending, and computed the first `off`, `on`, and `motion_shuffled_n0` validation batches. No validation value, metrics file, completed checkpoint, scope audit, or decision was published; all 20-changed/213-frozen post-update assertions therefore remain unaudited |
+| Failure | Both ranks raised `KeyError: 'motion_shuffled_n0'` because the dispatcher tied the centered evaluator to the disabled paired-training flag and entered a legacy five-namespace evaluator. Rank 1's later TCPStore error was consequential, not primary |
+| Unrun arm and pilot | `matched_off` never started. Pilot `143542` remained `DependencyNeverSatisfied` with zero runtime/allocation and no logs, then was explicitly cancelled at `2026-09-10T03:54:12` |
+| Publication and access | No smoke `READY`, `COMPLETE`, publication, selection summary, or decision exists. No pilot source namespace/result exists. Only train/validation tables were staged; no confirmation/test access occurred and the global spend marker remains absent |
+| Scheduler-history caveat | The terminal fields are operator-attested prior live-`scontrol` observations. The controller has since purged jobs `143539`--`143542`, current `squeue` returns no rows, and `sacct` is unavailable because `slurmdbd` refuses the connection; no historical scheduler file is fabricated |
+| Incident archive | Evidence remains in place and is hash-bound by no-replace `...generator_adaptation_smoke.invalid_attempts/source_f12b993b5de361423df3b8cbfb4e873f4a95ad1e_smoke143541_pilot143542/ARCHIVE.json`, SHA256 `82ce35cf3d7337f218bda189080a45b9e3faedec200750310d0958296f9d1855` |
+| Authorization | None. Run-r2 cannot resume or rerun and its checkpoint/calibration cannot seed a new execution. It authorizes no longer run, promotion, confirmation, or test. Only the separately preregistered protocol-v2/run-r3 generation can proceed from a fresh source-bound CPU gate/calibration/smoke namespace |
 | Runbook | `docs/NIAF/continuous_trajectory_field/stage_c_generator_adaptation_retry2_v1.md` |
-| Default alias | Global PHOENIX default unchanged; this alias is only the dataset-qualified CSL-Daily resolution |
+| Historical alias | Preserved, but no longer the dataset-qualified CSL-Daily resolution |
 
 ## Stopped CSL-Daily Stage-C run-r1 before science
 

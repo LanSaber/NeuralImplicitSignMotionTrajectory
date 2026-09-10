@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import re
+import subprocess
 from pathlib import Path
+from typing import Any, Mapping
+
+from NIAF.continuous_sign_field.config import load_config
 
 from NIAF.continuous_trajectory_field.relevance_calibration import (
     validate_relevance_calibration_artifact,
@@ -26,11 +31,30 @@ from NIAF.continuous_trajectory_field.scripts.stage_c_calibration_control import
 from NIAF.continuous_trajectory_field.scripts.stage_c_execution_control import (
     StageCExecutionControlError,
     _validate_binding as validate_execution_lease_binding,
+    _validate_claim as validate_execution_lease_claim,
 )
 
 
 class PrerequisiteError(RuntimeError):
     """A Stage-C prerequisite is missing, stale, mutable, or out of scope."""
+
+
+def validate_unspent_confirmation_holdout(*, spend_marker: Path) -> dict[str, Any]:
+    """Fail closed when the confirmation-holdout spend marker exists in any form."""
+
+    marker = spend_marker.resolve(strict=False)
+    if spend_marker.exists() or spend_marker.is_symlink():
+        raise PrerequisiteError(
+            f"confirmation-holdout spend marker exists: {spend_marker}"
+        )
+    return {
+        "schema_name": "signtrajfield_stage_c_confirmation_holdout_absence",
+        "schema_version": 1,
+        "spend_marker_path": str(marker),
+        "spend_marker_absent": True,
+        "development_only": True,
+        "non_authorizing": True,
+    }
 
 
 SOURCE_TERMINAL_DECISION_FIELDS = {
@@ -70,6 +94,70 @@ RUN_R1_SOURCE_GIT_HEAD = "a883baf4a0a95b4ebb2007564837c4d9b4f817cc"
 RUN_R1_SOURCE_REMOTE_REF = (
     "origin/codex/csl-daily-centered-generator-stage-c-v1-run-r1"
 )
+RUN_R2_SOURCE_GIT_HEAD = "f12b993b5de361423df3b8cbfb4e873f4a95ad1e"
+RUN_R2_SOURCE_REMOTE_REF = (
+    "origin/codex/csl-daily-centered-generator-stage-c-v1-run-r2"
+)
+PROTOCOL_V2_RUN_R3_POLICY_NAME = (
+    "csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_"
+    "decision_policy_v1.json"
+)
+RETRY2_POLICY_NAME = (
+    "csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json"
+)
+PROTOCOL_V2_RUN_R3_RECOVERY_SCHEMA = (
+    "signtrajfield_stage_c_protocol_v2_run_r3_recovery_evidence"
+)
+PROTOCOL_V2_RUN_R3_SOURCE_FILE_PROFILE = (
+    "stage_c_generator_adaptation_protocol_v2_run_r3"
+)
+RETRY2_SOURCE_FILE_PROFILE = "stage_c_generator_adaptation_retry2_v1"
+PROTOCOL_V2_RUN_R3_RECOVERY_SHA256 = (
+    "f955dbc7ce03f5f6a400d8ae2fa21c7ca5a280fec7f7a37da674d35a027e9209"
+)
+RUN_R2_POLICY_SHA256 = (
+    "8eacff17c161127573ad784a77542a089ebc7eca468b7f6bc4ac9263c6a66edc"
+)
+RUN_R2_RECOVERY_SHA256 = (
+    "ccf47b72390c4be28775b207c67f7372d3cbc599fcddb3545df8295acc88b39b"
+)
+RUN_R2_INCIDENT_ARCHIVE_SHA256 = (
+    "82ce35cf3d7337f218bda189080a45b9e3faedec200750310d0958296f9d1855"
+)
+RUN_R2_INCIDENT_ARCHIVE_BYTES = 30_003
+TREE_DIGEST_ALGORITHM = (
+    "sha256 of sorted NUL-safe sha256sum inventory with paths relative to root "
+    "prefixed by ./"
+)
+SOURCE_CHECKPOINT_PATH = (
+    "experiments/NIAF/continuous_trajectory_field/"
+    "csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_"
+    "absolute_binding_motion_contrast_v1/checkpoints/best_infeasible.pt"
+)
+SOURCE_DECISION_PATH = (
+    "experiments/NIAF/continuous_trajectory_field/"
+    "csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_"
+    "absolute_binding_motion_contrast_v1/evaluation/"
+    "ordered_development_decision/decision.json"
+)
+FROZEN_V2_TEACHER_PATH = (
+    "experiments/NIAF/continuous_trajectory_field/"
+    "csl_daily_signtrajfield_v2_mt5_text_only_full/checkpoints/best.pt"
+)
+FROZEN_V2_TEACHER_SHA256 = (
+    "06ca0a2613005b6e3949bab0e5d7ded999b212723debd3e7685a58c077e44c54"
+)
+SOURCE_STAGE_B_CONFIG_PATH = (
+    "NIAF/continuous_trajectory_field/configs/"
+    "csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_"
+    "absolute_binding_motion_contrast_v1.yaml"
+)
+SOURCE_STAGE_B_CONFIG_SHA256 = (
+    "7741da46d37a4b77f481663f25fa580281f6d29de6c2616baebcc30dac59b85e"
+)
+SOURCE_STAGE_B_ARCHITECTURE_IDENTITY = (
+    "bc69fd35ac58e10bc894460c35175f13356b79416df40e8c57156b1929614236"
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -98,6 +186,191 @@ def _exact_json(path: Path, *, label: str, fields: set[str]) -> dict:
             f"{label} fields differ: expected={sorted(fields)}, observed={observed}"
         )
     return value
+
+
+def _safe_relative_path(value: Any, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise PrerequisiteError(f"{label} path is malformed")
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise PrerequisiteError(f"{label} path is malformed")
+    return path
+
+
+def _reopen_bound_file(
+    *,
+    root: Path,
+    binding: Any,
+    label: str,
+    allow_absolute: bool = False,
+    expected_bytes: int | None = None,
+) -> Path:
+    if not isinstance(binding, Mapping) or set(binding) != {"path", "sha256"}:
+        raise PrerequisiteError(f"{label} binding is malformed")
+    raw_path = binding["path"]
+    if not isinstance(raw_path, str) or not raw_path:
+        raise PrerequisiteError(f"{label} path is malformed")
+    relative = Path(raw_path)
+    if relative.is_absolute():
+        if not allow_absolute:
+            raise PrerequisiteError(f"{label} path must be relative")
+        path = relative
+    else:
+        if ".." in relative.parts:
+            raise PrerequisiteError(f"{label} path is malformed")
+        path = root / relative
+        resolved_root = root.resolve()
+        resolved_path = path.resolve()
+        if resolved_path != resolved_root and resolved_root not in resolved_path.parents:
+            raise PrerequisiteError(f"{label} path escapes its evidence root")
+    path = _regular_file(path, label)
+    expected_sha256 = binding["sha256"]
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", str(expected_sha256)) is None
+        or sha256_file(path) != expected_sha256
+        or (expected_bytes is not None and path.stat().st_size != expected_bytes)
+    ):
+        raise PrerequisiteError(f"{label} hash/size changed")
+    return path
+
+
+def _reopen_file_specs(
+    *, root: Path, specs: Any, label: str, allow_absolute: bool = False
+) -> dict[str, Path]:
+    if not isinstance(specs, Mapping):
+        raise PrerequisiteError(f"{label} inventory is malformed")
+    reopened: dict[str, Path] = {}
+    for name, spec in specs.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(spec, Mapping)
+            or set(spec) != {"bytes", "sha256"}
+            or not isinstance(spec["bytes"], int)
+            or spec["bytes"] < 0
+        ):
+            raise PrerequisiteError(f"{label} inventory entry is malformed: {name}")
+        relative = Path(name)
+        if relative.is_absolute():
+            if not allow_absolute:
+                raise PrerequisiteError(f"{label} inventory path is absolute: {name}")
+            path = relative
+        else:
+            if ".." in relative.parts:
+                raise PrerequisiteError(f"{label} inventory path is malformed: {name}")
+            path = root / relative
+            resolved_root = root.resolve()
+            resolved_path = path.resolve()
+            if resolved_path != resolved_root and resolved_root not in resolved_path.parents:
+                raise PrerequisiteError(f"{label} inventory path escapes its root: {name}")
+        path = _regular_file(path, f"{label} file {name}")
+        if (
+            path.stat().st_size != spec["bytes"]
+            or re.fullmatch(r"[0-9a-f]{64}", str(spec["sha256"])) is None
+            or sha256_file(path) != spec["sha256"]
+        ):
+            raise PrerequisiteError(f"{label} file changed: {name}")
+        reopened[name] = path
+    return reopened
+
+
+def _tree_digest(files: Mapping[str, Mapping[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for relative in sorted(files, key=lambda value: value.encode("utf-8")):
+        digest.update(f"{files[relative]['sha256']}  ./{relative}\n".encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _reopen_tree_inventory(
+    *, evidence_root: Path, inventory: Any, label: str, expected_fields: set[str]
+) -> Path:
+    if not isinstance(inventory, Mapping) or set(inventory) != expected_fields:
+        raise PrerequisiteError(f"{label} tree inventory fields changed")
+    relative_root = _safe_relative_path(inventory["root"], f"{label} root")
+    root = evidence_root / relative_root
+    resolved_evidence_root = evidence_root.resolve()
+    resolved_root = root.resolve()
+    if (
+        resolved_root != resolved_evidence_root
+        and resolved_evidence_root not in resolved_root.parents
+    ):
+        raise PrerequisiteError(f"{label} root escapes the canonical evidence root")
+    if not root.is_dir() or root.is_symlink():
+        raise PrerequisiteError(f"{label} root is not a regular directory")
+    entries = list(root.rglob("*"))
+    if any(path.is_symlink() for path in entries):
+        raise PrerequisiteError(f"{label} tree contains a symlink")
+    if any(not path.is_dir() and not path.is_file() for path in entries):
+        raise PrerequisiteError(f"{label} tree contains a special filesystem node")
+    files = inventory["files"]
+    reopened = _reopen_file_specs(root=root, specs=files, label=label)
+    observed_files = {
+        path.relative_to(root).as_posix() for path in entries if path.is_file()
+    }
+    if observed_files != set(files):
+        raise PrerequisiteError(f"{label} tree file set changed")
+    if (
+        inventory["tree_digest_algorithm"] != TREE_DIGEST_ALGORITHM
+        or inventory["file_count"] != len(files)
+        or inventory["file_count"] != len(reopened)
+        or inventory["total_bytes"]
+        != sum(int(spec["bytes"]) for spec in files.values())
+        or inventory["tree_digest"] != _tree_digest(files)
+    ):
+        raise PrerequisiteError(f"{label} tree inventory totals changed")
+    return root
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return left == right or left in right.parents or right in left.parents
+
+
+def _validate_standalone_source_clone(
+    *, clone: Path, expected_head: str, expected_remote_ref: str
+) -> None:
+    if not clone.is_dir() or clone.is_symlink() or not (clone / ".git").is_dir():
+        raise PrerequisiteError("Stage-C archived source clone is not standalone")
+
+    def git(*arguments: str) -> str:
+        try:
+            result = subprocess.run(
+                (
+                    "git",
+                    "-c",
+                    f"safe.directory={clone}",
+                    "-C",
+                    str(clone),
+                    *arguments,
+                ),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise PrerequisiteError(
+                "cannot revalidate Stage-C archived source clone"
+            ) from error
+        if result.returncode:
+            raise PrerequisiteError(
+                "cannot revalidate Stage-C archived source clone: "
+                f"{result.stderr.strip()}"
+            )
+        return result.stdout.strip()
+
+    top_level = Path(git("rev-parse", "--show-toplevel")).resolve()
+    observed_head = git("rev-parse", "HEAD").lower()
+    status = git("status", "--porcelain", "--untracked-files=all")
+    if (
+        top_level != clone.resolve()
+        or observed_head != expected_head
+        or status
+        or not expected_remote_ref.startswith("origin/")
+    ):
+        raise PrerequisiteError("Stage-C archived source clone identity changed")
+    branch = expected_remote_ref.removeprefix("origin/")
+    remote_row = git("ls-remote", "--heads", "origin", f"refs/heads/{branch}")
+    if remote_row.split() != [expected_head, f"refs/heads/{branch}"]:
+        raise PrerequisiteError("Stage-C archived remote ref/head changed")
 
 
 def validate_source_terminal_decision(
@@ -378,6 +651,1148 @@ def validate_retry2_recovery_evidence(
     return {**audit, "audit_identity": digest_json(audit)}
 
 
+def _validate_protocol_v2_archive_semantics(
+    *, archive: Mapping[str, Any], evidence_root: Path
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_name",
+        "schema_version",
+        "created_at",
+        "reason",
+        "immutable_no_replace_contract",
+        "protocol_generation",
+        "source_science",
+        "jobs",
+        "observed_execution_boundary",
+        "failure",
+        "retained_evidence",
+        "required_absent_paths_revalidated_at",
+        "required_absent_paths",
+        "authorization",
+        "recovery",
+    }
+    immutable_contract = {
+        "logical_immutability": True,
+        "existing_destination_policy": "reject_no_replace",
+        "evidence_moved": False,
+        "evidence_deleted": False,
+        "evidence_overwritten": False,
+        "archive_is_a_manifest_only": True,
+        "retained_evidence_must_remain_at_original_paths": True,
+    }
+    protocol = archive.get("protocol_generation")
+    source_science = archive.get("source_science")
+    jobs = archive.get("jobs")
+    boundary = archive.get("observed_execution_boundary")
+    failure = archive.get("failure")
+    authorization = archive.get("authorization")
+    recovery = archive.get("recovery")
+    if (
+        set(archive) != expected_fields
+        or archive.get("schema_name")
+        != "signtrajfield_stage_c_generator_adaptation_terminal_incident_archive"
+        or archive.get("schema_version") != 2
+        or archive.get("reason")
+        != "post_update_mid_validation_centered_evaluator_dispatch_failure"
+        or archive.get("immutable_no_replace_contract") != immutable_contract
+        or not isinstance(protocol, Mapping)
+        or not isinstance(source_science, Mapping)
+        or not isinstance(jobs, Mapping)
+        or not isinstance(boundary, Mapping)
+        or not isinstance(failure, Mapping)
+        or not isinstance(authorization, Mapping)
+        or not isinstance(recovery, Mapping)
+    ):
+        raise PrerequisiteError("Stage-C run-r2 incident archive scope changed")
+
+    expected_protocol = {
+        "protocol": RETRY2_SOURCE_FILE_PROFILE,
+        "run": "run-r2",
+        "source_git_head": RUN_R2_SOURCE_GIT_HEAD,
+        "source_remote_head": RUN_R2_SOURCE_GIT_HEAD,
+        "source_remote_ref": RUN_R2_SOURCE_REMOTE_REF,
+        "source_clone": (
+            "/media/cvpr/haomian/SignTrajField_centered_stage_c_run_source_r2"
+        ),
+        "source_clone_clean_when_independently_rechecked": True,
+        "runbook": {
+            "path": (
+                "docs/NIAF/continuous_trajectory_field/"
+                "stage_c_generator_adaptation_retry2_v1.md"
+            ),
+            "sha256": (
+                "0ab73312aa0c8d5e684d70a0246b3ac993e63f2b1cbf55a8ab9bfcbd250e8b50"
+            ),
+        },
+        "predecessor_runbook": {
+            "path": (
+                "docs/NIAF/continuous_trajectory_field/"
+                "stage_c_generator_adaptation_v1.md"
+            ),
+            "sha256": (
+                "d73af22a40e60791f857d10837ef3b482ed23f2925ab98928c4f654dd779ec7a"
+            ),
+        },
+        "decision_policy": {
+            "path": (
+                "NIAF/continuous_trajectory_field/configs/"
+                "csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json"
+            ),
+            "sha256": RUN_R2_POLICY_SHA256,
+        },
+        "recovery_evidence": {
+            "path": (
+                "NIAF/continuous_trajectory_field/configs/"
+                "csl_daily_stage_c_generator_adaptation_retry2_"
+                "recovery_evidence_v1.json"
+            ),
+            "sha256": RUN_R2_RECOVERY_SHA256,
+        },
+    }
+    if protocol != expected_protocol:
+        raise PrerequisiteError("Stage-C run-r2 protocol generation changed")
+    source_clone = Path(protocol["source_clone"])
+    _validate_standalone_source_clone(
+        clone=source_clone,
+        expected_head=RUN_R2_SOURCE_GIT_HEAD,
+        expected_remote_ref=RUN_R2_SOURCE_REMOTE_REF,
+    )
+    for name in ("runbook", "predecessor_runbook", "decision_policy", "recovery_evidence"):
+        _reopen_bound_file(
+            root=source_clone,
+            binding=protocol[name],
+            label=f"Stage-C run-r2 {name.replace('_', ' ')}",
+        )
+
+    expected_stage_b = {
+        "path": SOURCE_CHECKPOINT_PATH,
+        "sha256": SOURCE_CHECKPOINT_SHA256,
+        "selection_status": "best_infeasible",
+        "epoch": 5,
+        "global_step": 360,
+    }
+    expected_decision = {
+        "path": SOURCE_DECISION_PATH,
+        "sha256": SOURCE_TERMINAL_DECISION_SHA256,
+        "decision_identity": SOURCE_TERMINAL_DECISION_IDENTITY,
+        "stage": "stage2",
+        "status": "valid_infeasible",
+        "integrity_valid": True,
+        "development_feasible": False,
+        "top_level_authorized_purpose_present": False,
+        "confirmation_manifest_opened": False,
+        "test_data_accessed": False,
+    }
+    expected_teacher = {
+        "path": FROZEN_V2_TEACHER_PATH,
+        "sha256": FROZEN_V2_TEACHER_SHA256,
+    }
+    if source_science != {
+        "stage_b_checkpoint": expected_stage_b,
+        "stage_b_terminal_decision": expected_decision,
+        "frozen_v2_teacher": expected_teacher,
+    }:
+        raise PrerequisiteError("Stage-C run-r2 source science changed")
+    _reopen_bound_file(
+        root=evidence_root,
+        binding={key: expected_stage_b[key] for key in ("path", "sha256")},
+        label="Stage-B source checkpoint",
+    )
+    decision_path = _reopen_bound_file(
+        root=evidence_root,
+        binding={key: expected_decision[key] for key in ("path", "sha256")},
+        label="Stage-B source terminal decision",
+    )
+    validate_source_terminal_decision(
+        decision_path=decision_path,
+        expected_sha256=SOURCE_TERMINAL_DECISION_SHA256,
+        expected_identity=SOURCE_TERMINAL_DECISION_IDENTITY,
+    )
+    _reopen_bound_file(
+        root=evidence_root,
+        binding=expected_teacher,
+        label="frozen v2 teacher checkpoint",
+    )
+
+    if (
+        set(jobs) != {"provenance", "cpu_gate", "calibration", "smoke", "pilot", "current_scheduler_availability"}
+        or jobs.get("cpu_gate", {}).get("job_id") != "143539"
+        or jobs.get("cpu_gate", {}).get("state") != "COMPLETED"
+        or jobs.get("calibration", {}).get("job_id") != "143540"
+        or jobs.get("calibration", {}).get("state") != "COMPLETED"
+        or jobs.get("smoke", {}).get("job_id") != "143541"
+        or jobs.get("smoke", {}).get("state") != "FAILED"
+        or jobs.get("smoke", {}).get("exit_code") != "143:0"
+        or jobs.get("pilot", {}).get("job_id") != "143542"
+        or jobs.get("pilot", {}).get("post_cancel_state") != "CANCELLED"
+        or jobs.get("pilot", {}).get("post_cancel_runtime") != "00:00:00"
+        or jobs.get("pilot", {}).get("post_cancel_node_list") is not None
+        or jobs.get("pilot", {}).get("post_cancel_alloc_tres") is not None
+    ):
+        raise PrerequisiteError("Stage-C run-r2 incident jobs changed")
+
+    expected_boundary_values = {
+        "requested_arm_order": ["memory", "matched_off"],
+        "arms_started": ["memory"],
+        "arms_not_started": ["matched_off"],
+        "world_size": 2,
+        "batch_per_rank": 64,
+        "accumulation_steps": 2,
+        "effective_global_batch": 256,
+        "memory_arm_logical_batches_completed": 2,
+        "memory_arm_optimizer_updates_completed": 1,
+        "memory_arm_checkpoint_epoch": 1,
+        "memory_arm_checkpoint_global_step": 1,
+        "memory_arm_checkpoint_validation_pending": True,
+        "validation_computation_reached": [
+            "off_first_batch",
+            "on_first_batch",
+            "motion_shuffled_n0_first_batch",
+        ],
+        "validation_values_published": False,
+        "metrics_jsonl_published": False,
+        "selection_summary_published": False,
+        "completed_checkpoint_published": False,
+        "smoke_checkpoint_audit_published": False,
+        "smoke_decision_published": False,
+        "smoke_ready_published": False,
+        "pilot_started": False,
+    }
+    if any(boundary.get(key) != value for key, value in expected_boundary_values.items()):
+        raise PrerequisiteError("Stage-C run-r2 scientific boundary changed")
+    if (
+        boundary.get("declared_trainability", {}).get(
+            "post_update_changed_and_frozen_bitwise_audit_completed"
+        )
+        is not False
+        or boundary.get("data_scope", {}).get("test_neighbor_table_staged") is not False
+        or boundary.get("data_scope", {}).get("confirmation_manifest_opened") is not False
+        or boundary.get("data_scope", {}).get("test_data_accessed") is not False
+        or boundary.get("network", {}).get(
+            "post_training_counter_delta_audit_completed"
+        )
+        is not False
+    ):
+        raise PrerequisiteError("Stage-C run-r2 partial-science scope changed")
+
+    expected_source_trainer = {
+        "path": (
+            "/media/cvpr/haomian/SignTrajField_centered_stage_c_run_source_r2/"
+            "NIAF/continuous_trajectory_field/scripts/"
+            "train_continuous_trajectory_field.py"
+        ),
+        "sha256": (
+            "8a284a491c5bd65894f8cba44ad83e3d699a3ee301212b8be4974632502ff254"
+        ),
+    }
+    if (
+        set(failure) != {
+            "primary_exception",
+            "primary_rank",
+            "same_key_error_observed_on_rank_1",
+            "rank_1_tcp_store_error_is_consequential",
+            "source_trainer",
+            "root_cause",
+            "operational_fix_boundary",
+        }
+        or failure.get("primary_exception") != "KeyError: 'motion_shuffled_n0'"
+        or failure.get("primary_rank") != 0
+        or failure.get("same_key_error_observed_on_rank_1") is not True
+        or failure.get("rank_1_tcp_store_error_is_consequential") is not True
+        or failure.get("source_trainer") != expected_source_trainer
+        or failure.get("operational_fix_boundary")
+        != (
+            "Dispatch to the paired centered evaluator when paired-corruption "
+            "training is enabled OR centered sentence-memory evaluation is enabled. "
+            "Do not enable the paired training objective, change the evaluation suite, "
+            "extend only the legacy namespace map, or change scientific hyperparameters "
+            "or thresholds."
+        )
+    ):
+        raise PrerequisiteError("Stage-C run-r2 failure classification changed")
+    _reopen_bound_file(
+        root=source_clone,
+        binding=expected_source_trainer,
+        label="Stage-C run-r2 source trainer",
+        allow_absolute=True,
+    )
+
+    if authorization != {
+        "development_only": True,
+        "non_authorizing": True,
+        "promotion_eligible": False,
+        "checkpoint_promotion_authorized": False,
+        "confirmation_authorized": False,
+        "test_authorized": False,
+        "longer_run_authorized": False,
+        "additional_retry_under_protocol_v1_authorized": False,
+        "r2_last_checkpoint_resume_authorized": False,
+        "r2_calibration_reuse_authorized": False,
+        "r2_smoke_or_pilot_output_reuse_authorized": False,
+        "confirmation_holdout_spent": False,
+    }:
+        raise PrerequisiteError("Stage-C run-r2 incident authorization changed")
+
+    expected_recovery = {
+        "run_r2_disposition": "terminal_stop_partial_scientific_output",
+        "current_retry2_policy_allows_rerun": False,
+        "new_protocol_generation_required": True,
+        "new_protocol_must_be_preregistered_without_pilot_outcome_access": True,
+        "new_protocol_basis": (
+            "operational evaluator-dispatch correction only; no pilot decision or "
+            "validation value was published and no scientific hyperparameter, arm, "
+            "threshold, data split, or duration may be adapted from run-r2"
+        ),
+        "required_archive_path": (
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_"
+            "smoke.invalid_attempts/"
+            "source_f12b993b5de361423df3b8cbfb4e873f4a95ad1e_"
+            "smoke143541_pilot143542/ARCHIVE.json"
+        ),
+        "new_runbook": (
+            "docs/NIAF/continuous_trajectory_field/"
+            "stage_c_generator_adaptation_protocol_v2_run_r3.md"
+        ),
+        "new_branch": "codex/csl-daily-centered-generator-stage-c-v2-run-r3",
+        "new_source_clone": (
+            "/media/cvpr/haomian/SignTrajField_centered_stage_c_v2_run_source_r3"
+        ),
+        "new_decision_policy": (
+            "NIAF/continuous_trajectory_field/configs/"
+            "csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_"
+            "decision_policy_v1.json"
+        ),
+        "new_recovery_evidence": (
+            "NIAF/continuous_trajectory_field/configs/"
+            "csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_"
+            "recovery_evidence_v1.json"
+        ),
+        "new_calibration_root": (
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_sentence_memory_relevance_calibration_stage_c_generator_"
+            "adaptation_protocol_v2_run_r3"
+        ),
+        "new_prerequisite_root": (
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_prerequisites"
+        ),
+        "new_smoke_root": (
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_"
+            "protocol_v2_run_r3_smoke"
+        ),
+        "new_pilot_root": (
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_"
+            "protocol_v2_run_r3_pilot"
+        ),
+        "new_logs_prefix": "logs/sbatch/csl_stage_c_protocol_v2_run_r3_",
+        "mandatory_order": [
+            "fresh_complete_cpu_gate",
+            "fresh_source_bound_train_only_calibration",
+            "fresh_two_node_forced_ib_network_and_one_update_smoke",
+            "one_epoch_pilot_only_if_smoke_ready",
+        ],
+        "new_source_head_and_all_file_hashes_must_be_bound_after_immutable_commit": True,
+        "new_smoke_and_pilot_must_use_fresh_no_replace_namespaces": True,
+        "retained_run_r2_evidence_must_not_be_deleted_moved_or_modified": True,
+    }
+    if recovery != expected_recovery:
+        raise PrerequisiteError("Stage-C protocol-v2 recovery contract changed")
+    return {
+        "source_clone": source_clone,
+        "fresh_namespace_roots": {
+            name: evidence_root / _safe_relative_path(recovery[name], name)
+            for name in (
+                "new_calibration_root",
+                "new_prerequisite_root",
+                "new_smoke_root",
+                "new_pilot_root",
+            )
+        },
+    }
+
+
+def validate_protocol_v2_run_r3_recovery_evidence(
+    *,
+    policy_path: Path,
+    recovery_manifest: Path,
+    source_root: Path,
+    evidence_root: Path,
+) -> dict:
+    """Reopen the terminal run-r2 incident before protocol-v2/run-r3 work."""
+
+    policy = validate_policy(policy_path)
+    if policy_path.name != PROTOCOL_V2_RUN_R3_POLICY_NAME:
+        raise PrerequisiteError("Stage-C protocol-v2 recovery policy path changed")
+    recovery_contract = policy.get("recovery_contract")
+    if not isinstance(recovery_contract, Mapping):
+        raise PrerequisiteError("Stage-C protocol-v2 policy lacks recovery evidence")
+    manifest_binding = recovery_contract.get("evidence_manifest")
+    if not isinstance(manifest_binding, Mapping):
+        raise PrerequisiteError("Stage-C protocol-v2 manifest binding is malformed")
+    expected_manifest = (source_root / str(manifest_binding.get("path", ""))).resolve()
+    if recovery_manifest.resolve() != expected_manifest:
+        raise PrerequisiteError("Stage-C protocol-v2 recovery evidence path changed")
+    _reopen_bound_file(
+        root=source_root,
+        binding=manifest_binding,
+        label="Stage-C protocol-v2 recovery evidence manifest",
+    )
+    manifest = _exact_json(
+        recovery_manifest,
+        label="Stage-C protocol-v2 recovery evidence manifest",
+        fields={
+            "schema_name",
+            "schema_version",
+            "authorization",
+            "canonical_evidence_root",
+            "incident_archive",
+            "new_protocol",
+            "predecessor_chain",
+            "run_r2_scientific_boundary",
+            "source_checkpoint",
+        },
+    )
+    expected_authorization = {
+        "confirmation_manifest_opened": False,
+        "development_only": True,
+        "longer_run_authorized": False,
+        "non_authorizing": True,
+        "promotion_eligible": False,
+        "test_data_accessed": False,
+    }
+    expected_new_protocol = {
+        "allowed_operational_change": (
+            "centered_evaluator_dispatch_when_centered_evaluation_enabled"
+        ),
+        "calibration_source_file_profile": PROTOCOL_V2_RUN_R3_SOURCE_FILE_PROFILE,
+        "protocol_generation": "protocol_v2",
+        "run_generation": "run_r3",
+        "same_protocol_resume_authorized": False,
+        "same_protocol_retry_authorized": False,
+        "scientific_settings_must_equal_run_r2": True,
+        "source_branch": "codex/csl-daily-centered-generator-stage-c-v2-run-r3",
+        "source_clone": (
+            "/media/cvpr/haomian/SignTrajField_centered_stage_c_v2_run_source_r3"
+        ),
+    }
+    expected_predecessors = {
+        "run_r1": {
+            "decision_policy_path": (
+                "NIAF/continuous_trajectory_field/configs/"
+                "csl_daily_stage_c_generator_adaptation_decision_policy_v1.json"
+            ),
+            "decision_policy_sha256": (
+                "728813f4a504b9673eac8f35fc77ed4b19e3e862467bf26cdff8427c9ef0a896"
+            ),
+            "run_generation": "run_r1",
+            "source_git_head": RUN_R1_SOURCE_GIT_HEAD,
+            "source_remote_ref": RUN_R1_SOURCE_REMOTE_REF,
+        },
+        "run_r2": {
+            "decision_policy_path": (
+                "NIAF/continuous_trajectory_field/configs/"
+                "csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json"
+            ),
+            "decision_policy_sha256": RUN_R2_POLICY_SHA256,
+            "recovery_evidence_path": (
+                "NIAF/continuous_trajectory_field/configs/"
+                "csl_daily_stage_c_generator_adaptation_retry2_"
+                "recovery_evidence_v1.json"
+            ),
+            "recovery_evidence_sha256": RUN_R2_RECOVERY_SHA256,
+            "run_generation": "run_r2",
+            "source_git_head": RUN_R2_SOURCE_GIT_HEAD,
+            "source_remote_ref": RUN_R2_SOURCE_REMOTE_REF,
+        },
+    }
+    expected_incident = {
+        "attempt_file_count": 27,
+        "calibration_file_count": 3,
+        "job_log_file_count": 6,
+        "path": recovery_contract["incident_archive"]["path"],
+        "prerequisite_file_count": 11,
+        "required_absent_path_count": 27,
+        "schema_name": (
+            "signtrajfield_stage_c_generator_adaptation_terminal_incident_archive"
+        ),
+        "schema_version": 2,
+        "sha256": RUN_R2_INCIDENT_ARCHIVE_SHA256,
+    }
+    expected_source_checkpoint = {
+        "epoch": 5,
+        "global_step": 360,
+        "path": SOURCE_CHECKPOINT_PATH,
+        "selection_status": "best_infeasible",
+        "sha256": SOURCE_CHECKPOINT_SHA256,
+    }
+    if (
+        manifest["schema_name"] != PROTOCOL_V2_RUN_R3_RECOVERY_SCHEMA
+        or manifest["schema_version"] != 1
+        or manifest["authorization"] != expected_authorization
+        or evidence_root.resolve()
+        != Path(str(manifest["canonical_evidence_root"])).resolve()
+        or manifest["new_protocol"] != expected_new_protocol
+        or manifest["predecessor_chain"] != expected_predecessors
+        or manifest["incident_archive"] != expected_incident
+        or manifest["source_checkpoint"] != expected_source_checkpoint
+    ):
+        raise PrerequisiteError("Stage-C protocol-v2 recovery manifest scope changed")
+
+    incident_binding = recovery_contract.get("incident_archive")
+    if not isinstance(incident_binding, Mapping):
+        raise PrerequisiteError("Stage-C protocol-v2 incident binding is malformed")
+    archive_path = _reopen_bound_file(
+        root=evidence_root,
+        binding=incident_binding,
+        label="Stage-C run-r2 incident archive",
+        expected_bytes=RUN_R2_INCIDENT_ARCHIVE_BYTES,
+    )
+    archive = _exact_json(
+        archive_path,
+        label="Stage-C run-r2 incident archive",
+        fields={
+            "schema_name",
+            "schema_version",
+            "created_at",
+            "reason",
+            "immutable_no_replace_contract",
+            "protocol_generation",
+            "source_science",
+            "jobs",
+            "observed_execution_boundary",
+            "failure",
+            "retained_evidence",
+            "required_absent_paths_revalidated_at",
+            "required_absent_paths",
+            "authorization",
+            "recovery",
+        },
+    )
+    archive_scope = _validate_protocol_v2_archive_semantics(
+        archive=archive, evidence_root=evidence_root
+    )
+    source_clone = archive_scope["source_clone"]
+
+    r1 = expected_predecessors["run_r1"]
+    r1_policy = _reopen_bound_file(
+        root=source_clone,
+        binding={
+            "path": r1["decision_policy_path"],
+            "sha256": r1["decision_policy_sha256"],
+        },
+        label="Stage-C run-r1 decision policy",
+    )
+    validate_policy(r1_policy)
+    r2 = expected_predecessors["run_r2"]
+    r2_policy = _reopen_bound_file(
+        root=source_clone,
+        binding={
+            "path": r2["decision_policy_path"],
+            "sha256": r2["decision_policy_sha256"],
+        },
+        label="Stage-C run-r2 decision policy",
+    )
+    r2_manifest = _reopen_bound_file(
+        root=source_clone,
+        binding={
+            "path": r2["recovery_evidence_path"],
+            "sha256": r2["recovery_evidence_sha256"],
+        },
+        label="Stage-C run-r2 recovery evidence",
+    )
+    retry2_audit = validate_retry2_recovery_evidence(
+        policy_path=r2_policy,
+        recovery_manifest=r2_manifest,
+        source_root=source_clone,
+        evidence_root=evidence_root,
+    )
+
+    retained = archive["retained_evidence"]
+    if not isinstance(retained, Mapping) or set(retained) != {
+        "attempt",
+        "prerequisites",
+        "calibration",
+        "job_logs",
+        "run_source_configs",
+    }:
+        raise PrerequisiteError("Stage-C run-r2 retained-evidence set changed")
+    attempt_root = _reopen_tree_inventory(
+        evidence_root=evidence_root,
+        inventory=retained["attempt"],
+        label="Stage-C run-r2 attempt",
+        expected_fields={
+            "root",
+            "file_count",
+            "total_bytes",
+            "tree_digest_algorithm",
+            "tree_digest",
+            "files",
+        },
+    )
+    prerequisite_root = _reopen_tree_inventory(
+        evidence_root=evidence_root,
+        inventory=retained["prerequisites"],
+        label="Stage-C run-r2 prerequisites",
+        expected_fields={
+            "root",
+            "file_count",
+            "total_bytes",
+            "tree_digest_algorithm",
+            "tree_digest",
+            "files",
+            "smoke_lease",
+        },
+    )
+    calibration_root = _reopen_tree_inventory(
+        evidence_root=evidence_root,
+        inventory=retained["calibration"],
+        label="Stage-C run-r2 calibration",
+        expected_fields={
+            "root",
+            "file_count",
+            "total_bytes",
+            "tree_digest_algorithm",
+            "tree_digest",
+            "files",
+            "artifact_identity",
+            "calibration_identity",
+            "map_content_digest",
+            "transition_identity",
+            "heldout_auroc",
+            "heldout_probability_gap",
+            "coefficient_a",
+            "coefficient_b",
+            "intercept",
+            "train_only",
+            "confirmation_manifest_opened",
+            "test_data_accessed",
+        },
+    )
+    if (
+        retained["attempt"]["file_count"] != manifest["incident_archive"]["attempt_file_count"]
+        or retained["prerequisites"]["file_count"]
+        != manifest["incident_archive"]["prerequisite_file_count"]
+        or retained["calibration"]["file_count"]
+        != manifest["incident_archive"]["calibration_file_count"]
+        or retained["prerequisites"].get("smoke_lease", {}).get("terminal_outcome")
+        != "failed"
+        or retained["prerequisites"].get("smoke_lease", {}).get(
+            "self_reported_exit_code"
+        )
+        != 143
+        or retained["calibration"].get("train_only") is not True
+        or retained["calibration"].get("confirmation_manifest_opened") is not False
+        or retained["calibration"].get("test_data_accessed") is not False
+    ):
+        raise PrerequisiteError("Stage-C run-r2 retained evidence semantics changed")
+
+    smoke_lease = retained["prerequisites"]["smoke_lease"]
+    expected_smoke_lease = {
+        "claim_identity": (
+            "306531a6e845d8ba5c7f589f37dfb2f188285ff0ec5ab95fe582102ac95f2692"
+        ),
+        "execution_binding_digest": (
+            "47e534c79aed7a8eb2691eb369ff602177475f88d721411cdcdee31a0be2eaf9"
+        ),
+        "terminal_identity": (
+            "ac6e8f80d4665a2b05d4d4e3bd85f7d32852e231295b35e30bffd15b9fd3b551"
+        ),
+        "terminal_outcome": "failed",
+        "self_reported_exit_code": 143,
+        "active_lease_released_to_failed_history": True,
+    }
+    if smoke_lease != expected_smoke_lease:
+        raise PrerequisiteError("Stage-C run-r2 smoke lease summary changed")
+    lease_directory = (
+        prerequisite_root
+        / "smoke/active_execution_lease.history"
+        / f"{smoke_lease['claim_identity']}.failed"
+    )
+    attestation_path = prerequisite_root / "smoke/lease_attestations/143541.0.json"
+    terminal_path = lease_directory / "TERMINAL.json"
+    try:
+        claim = validate_execution_lease_claim(lease_directory)
+    except StageCExecutionControlError as error:
+        raise PrerequisiteError("Stage-C run-r2 smoke lease claim changed") from error
+    attestation = _exact_json(
+        attestation_path,
+        label="Stage-C run-r2 smoke lease attestation",
+        fields={
+            "schema_name",
+            "schema_version",
+            "lease_path",
+            "current_slurm_job_id",
+            "current_slurm_restart_count",
+            "claim",
+            "restart_reconciliation",
+            "attestation_identity",
+        },
+    )
+    terminal = _exact_json(
+        terminal_path,
+        label="Stage-C run-r2 smoke lease terminal",
+        fields={
+            "schema_name",
+            "schema_version",
+            "outcome",
+            "claim_identity",
+            "current_slurm_job_id",
+            "current_slurm_restart_count",
+            "attestation_sha256",
+            "self_reported_exit_code",
+            "terminal_identity",
+        },
+    )
+    unsigned_attestation = {
+        key: value
+        for key, value in attestation.items()
+        if key != "attestation_identity"
+    }
+    unsigned_terminal = {
+        key: value for key, value in terminal.items() if key != "terminal_identity"
+    }
+    if (
+        claim.get("claim_identity") != smoke_lease["claim_identity"]
+        or claim.get("slurm_job_id") != "143541"
+        or claim.get("slurm_restart_count") != 0
+        or claim.get("mode") != "smoke"
+        or claim.get("execution_binding", {}).get("digest")
+        != smoke_lease["execution_binding_digest"]
+        or claim.get("execution_binding", {}).get("source_git_head")
+        != RUN_R2_SOURCE_GIT_HEAD
+        or claim.get("execution_binding", {}).get("source_remote_ref")
+        != RUN_R2_SOURCE_REMOTE_REF
+        or attestation.get("claim") != claim
+        or attestation.get("current_slurm_job_id") != "143541"
+        or attestation.get("current_slurm_restart_count") != 0
+        or attestation.get("restart_reconciliation") is not None
+        or attestation.get("attestation_identity")
+        != digest_json(unsigned_attestation)
+        or terminal.get("schema_name")
+        != "signtrajfield_stage_c_execution_lease_terminal"
+        or terminal.get("schema_version") != 1
+        or terminal.get("outcome") != smoke_lease["terminal_outcome"]
+        or terminal.get("claim_identity") != smoke_lease["claim_identity"]
+        or terminal.get("current_slurm_job_id") != "143541"
+        or terminal.get("current_slurm_restart_count") != 0
+        or terminal.get("attestation_sha256") != sha256_file(attestation_path)
+        or terminal.get("self_reported_exit_code")
+        != smoke_lease["self_reported_exit_code"]
+        or terminal.get("terminal_identity") != smoke_lease["terminal_identity"]
+        or terminal.get("terminal_identity") != digest_json(unsigned_terminal)
+    ):
+        raise PrerequisiteError("Stage-C run-r2 smoke lease evidence changed")
+    job_logs = _reopen_file_specs(
+        root=evidence_root,
+        specs=retained["job_logs"],
+        label="Stage-C run-r2 job log",
+    )
+    if len(job_logs) != manifest["incident_archive"]["job_log_file_count"]:
+        raise PrerequisiteError("Stage-C run-r2 job-log count changed")
+
+    run_source_configs = retained["run_source_configs"]
+    if not isinstance(run_source_configs, Mapping) or len(run_source_configs) != 2:
+        raise PrerequisiteError("Stage-C run-r2 source-config inventory changed")
+    expected_config_hashes = {
+        (
+            "/media/cvpr/haomian/SignTrajField_centered_stage_c_run_source_r2/"
+            "NIAF/continuous_trajectory_field/configs/"
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_memory_pilot_run_r2.yaml"
+        ): "62a6b955594580377638ee1d7a2f47ae4e62ae1ba7258f1cbedd474cf998612d",
+        (
+            "/media/cvpr/haomian/SignTrajField_centered_stage_c_run_source_r2/"
+            "NIAF/continuous_trajectory_field/configs/"
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_matched_off_pilot_run_r2.yaml"
+        ): "dc3722d838c45cb4480552f1db224b9c63f1fdc04cc363219f4d01f625f3b7a4",
+    }
+    if run_source_configs != expected_config_hashes:
+        raise PrerequisiteError("Stage-C run-r2 source-config bindings changed")
+    for path_value, expected_sha256 in run_source_configs.items():
+        _reopen_bound_file(
+            root=source_clone,
+            binding={"path": path_value, "sha256": expected_sha256},
+            label="Stage-C run-r2 source config",
+            allow_absolute=True,
+        )
+
+    absent_paths = archive["required_absent_paths"]
+    if (
+        not isinstance(absent_paths, list)
+        or len(absent_paths) != manifest["incident_archive"]["required_absent_path_count"]
+        or len(set(absent_paths)) != len(absent_paths)
+    ):
+        raise PrerequisiteError("Stage-C run-r2 absent-path inventory changed")
+    old_paths = {attempt_root, prerequisite_root, calibration_root}
+    for relative_value in absent_paths:
+        relative = _safe_relative_path(relative_value, "Stage-C run-r2 absent evidence")
+        target = evidence_root / relative
+        old_paths.add(target)
+        if target.exists() or target.is_symlink():
+            raise PrerequisiteError(
+                f"Stage-C run-r2 required-absent output now exists: {relative_value}"
+            )
+
+    fresh_roots = archive_scope["fresh_namespace_roots"]
+    fresh_values = list(fresh_roots.values())
+    if len(set(fresh_values)) != len(fresh_values) or any(
+        _paths_overlap(fresh, old) for fresh in fresh_values for old in old_paths
+    ):
+        raise PrerequisiteError("Stage-C protocol-v2 namespaces are not fresh/distinct")
+
+    boundary = archive["observed_execution_boundary"]
+    manifest_boundary = manifest["run_r2_scientific_boundary"]
+    expected_manifest_boundary = {
+        "completed_checkpoint_published": boundary["completed_checkpoint_published"],
+        "matched_off_arm_started": "matched_off" in boundary["arms_started"],
+        "memory_arm_logical_batches_completed": boundary[
+            "memory_arm_logical_batches_completed"
+        ],
+        "memory_arm_optimizer_updates_completed": boundary[
+            "memory_arm_optimizer_updates_completed"
+        ],
+        "metrics_jsonl_published": boundary["metrics_jsonl_published"],
+        "pilot_started": boundary["pilot_started"],
+        "prior_execution_lease_created": True,
+        "prior_scientific_output_observed": True,
+        "smoke_ready_published": boundary["smoke_ready_published"],
+        "validation_computation_reached": boundary["validation_computation_reached"],
+        "validation_values_published": boundary["validation_values_published"],
+    }
+    if manifest_boundary != expected_manifest_boundary:
+        raise PrerequisiteError("Stage-C protocol-v2 scientific boundary changed")
+
+    audit = {
+        "schema_name": "signtrajfield_stage_c_protocol_v2_run_r3_recovery_audit",
+        "schema_version": 1,
+        "recovery_manifest_sha256": PROTOCOL_V2_RUN_R3_RECOVERY_SHA256,
+        "incident_archive_path": str(archive_path.resolve()),
+        "incident_archive_sha256": RUN_R2_INCIDENT_ARCHIVE_SHA256,
+        "run_r2_source_git_head": RUN_R2_SOURCE_GIT_HEAD,
+        "failed_smoke_job_id": "143541",
+        "prior_execution_lease_created": True,
+        "prior_scientific_output_observed": True,
+        "prior_memory_optimizer_updates_observed": 1,
+        "matched_off_arm_started": False,
+        "same_protocol_retry_authorized": False,
+        "resume_authorized": False,
+        "calibration_source_file_profile": PROTOCOL_V2_RUN_R3_SOURCE_FILE_PROFILE,
+        "predecessor_recovery_audit_identity": retry2_audit["audit_identity"],
+        "required_absent_paths": absent_paths,
+        "confirmation_manifest_opened": False,
+        "test_data_accessed": False,
+        "development_only": True,
+        "non_authorizing": True,
+    }
+    return {**audit, "audit_identity": digest_json(audit)}
+
+
+def validate_recovery_evidence(
+    *,
+    policy_path: Path,
+    recovery_manifest: Path,
+    source_root: Path,
+    evidence_root: Path,
+) -> dict:
+    """Dispatch exact recovery validation by immutable policy filename."""
+
+    if policy_path.name == RETRY2_POLICY_NAME:
+        return validate_retry2_recovery_evidence(
+            policy_path=policy_path,
+            recovery_manifest=recovery_manifest,
+            source_root=source_root,
+            evidence_root=evidence_root,
+        )
+    if policy_path.name == PROTOCOL_V2_RUN_R3_POLICY_NAME:
+        return validate_protocol_v2_run_r3_recovery_evidence(
+            policy_path=policy_path,
+            recovery_manifest=recovery_manifest,
+            source_root=source_root,
+            evidence_root=evidence_root,
+        )
+    raise PrerequisiteError("Stage-C recovery policy filename is not registered")
+
+
+_CROSS_GENERATION_CONFIG_FIELDS = (
+    ("experiment_name",),
+    ("output", "out_dir"),
+    ("sentence_memory", "relevance_calibration", "artifact_dir"),
+    (
+        "sentence_memory_safety",
+        "stage_c",
+        "active_stage_c",
+        "calibration_artifact_dir",
+    ),
+)
+_ARM_CONFIG_FIELDS = _CROSS_GENERATION_CONFIG_FIELDS + (
+    ("conditioning", "sentence_memory_train_mode"),
+    ("conditioning", "sentence_memory_dropout_probability"),
+    ("sentence_memory_safety", "stage_c", "arm"),
+)
+
+
+def _normalize_config_fields(
+    value: Mapping[str, Any], fields: tuple[tuple[str, ...], ...], label: str
+) -> dict[str, Any]:
+    normalized = copy.deepcopy(dict(value))
+    for field_path in fields:
+        parent: Any = normalized
+        for name in field_path[:-1]:
+            if not isinstance(parent, dict) or name not in parent:
+                raise PrerequisiteError(
+                    f"{label} lacks normalization field {'.'.join(field_path)}"
+                )
+            parent = parent[name]
+        leaf = field_path[-1]
+        if not isinstance(parent, dict) or leaf not in parent:
+            raise PrerequisiteError(
+                f"{label} lacks normalization field {'.'.join(field_path)}"
+            )
+        parent.pop(leaf)
+    return normalized
+
+
+def _validate_stage_c_arm_config(
+    *, config: Mapping[str, Any], arm: str, generation: str
+) -> None:
+    expected_mode = "dropout" if arm == "memory" else "off"
+    expected_dropout = 0.25 if arm == "memory" else 1.0
+    stage = config.get("sentence_memory_safety", {}).get("stage_c", {})
+    expected_checkpoint = {
+        "path": SOURCE_CHECKPOINT_PATH,
+        "sha256": SOURCE_CHECKPOINT_SHA256,
+        "selection_status": "best_infeasible",
+        "epoch": 5,
+        "global_step": 360,
+    }
+    expected_source_decision = {
+        "path": SOURCE_DECISION_PATH,
+        "sha256": SOURCE_TERMINAL_DECISION_SHA256,
+        "decision_identity": SOURCE_TERMINAL_DECISION_IDENTITY,
+        "status": "valid_infeasible",
+        "authorized_purpose": None,
+    }
+    expected_source_stage_b = {
+        "config_path": SOURCE_STAGE_B_CONFIG_PATH,
+        "config_sha256": SOURCE_STAGE_B_CONFIG_SHA256,
+        "architecture_identity": SOURCE_STAGE_B_ARCHITECTURE_IDENTITY,
+    }
+    expected_teacher = {
+        "path": FROZEN_V2_TEACHER_PATH,
+        "sha256": FROZEN_V2_TEACHER_SHA256,
+    }
+    conditioning = config.get("conditioning", {})
+    train = config.get("train", {})
+    if (
+        not isinstance(stage, Mapping)
+        or stage.get("arm") != arm
+        or stage.get("source_checkpoint") != expected_checkpoint
+        or stage.get("source_terminal_decision") != expected_source_decision
+        or stage.get("source_stage_b") != expected_source_stage_b
+        or stage.get("frozen_v2_teacher") != expected_teacher
+        or conditioning.get("sentence_memory_train_mode") != expected_mode
+        or conditioning.get("sentence_memory_dropout_probability") != expected_dropout
+        or train.get("base_checkpoint") is not None
+    ):
+        raise PrerequisiteError(
+            f"Stage-C {generation} {arm} config changed its arm or Stage-B warm start"
+        )
+
+
+def validate_protocol_v2_run_r3_configs(
+    *,
+    policy_path: Path,
+    recovery_manifest: Path,
+    source_root: Path,
+    evidence_root: Path,
+    memory_config: Path,
+    matched_off_config: Path,
+) -> dict[str, Any]:
+    """Prove run-r3 settings equal immutable run-r2 outside fresh identities."""
+
+    recovery_audit = validate_protocol_v2_run_r3_recovery_evidence(
+        policy_path=policy_path,
+        recovery_manifest=recovery_manifest,
+        source_root=source_root,
+        evidence_root=evidence_root,
+    )
+    expected_names = {
+        "memory": (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_"
+            "memory_protocol_v2_run_r3.yaml"
+        ),
+        "matched_off": (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_"
+            "matched_off_protocol_v2_run_r3.yaml"
+        ),
+    }
+    for arm, path in (("memory", memory_config), ("matched_off", matched_off_config)):
+        _regular_file(path, f"Stage-C protocol-v2 {arm} config")
+        expected_path = (
+            source_root
+            / "NIAF/continuous_trajectory_field/configs"
+            / expected_names[arm]
+        ).resolve()
+        if path.resolve() != expected_path:
+            raise PrerequisiteError(f"Stage-C protocol-v2 {arm} config path changed")
+
+    archive_path = Path(recovery_audit["incident_archive_path"])
+    archive = json.loads(archive_path.read_text(encoding="utf-8"))
+    run_r2_bindings = archive["retained_evidence"]["run_source_configs"]
+    run_r2_paths: dict[str, Path] = {}
+    for raw_path, expected_sha256 in run_r2_bindings.items():
+        path = _regular_file(Path(raw_path), "Stage-C run-r2 source config")
+        if sha256_file(path) != expected_sha256:
+            raise PrerequisiteError("Stage-C run-r2 source config changed")
+        if "matched_off_pilot_run_r2" in path.name:
+            arm = "matched_off"
+        elif "memory_pilot_run_r2" in path.name:
+            arm = "memory"
+        else:
+            raise PrerequisiteError("Stage-C run-r2 source config name changed")
+        if arm in run_r2_paths:
+            raise PrerequisiteError("Stage-C run-r2 source config arms are not unique")
+        run_r2_paths[arm] = path
+    if set(run_r2_paths) != {"memory", "matched_off"}:
+        raise PrerequisiteError("Stage-C run-r2 source config pair changed")
+
+    configs = {
+        "run_r2": {
+            arm: load_config(path) for arm, path in run_r2_paths.items()
+        },
+        "run_r3": {
+            "memory": load_config(memory_config),
+            "matched_off": load_config(matched_off_config),
+        },
+    }
+    for generation, generation_configs in configs.items():
+        for arm, config in generation_configs.items():
+            if not isinstance(config, Mapping):
+                raise PrerequisiteError(f"Stage-C {generation} {arm} config is malformed")
+            _validate_stage_c_arm_config(
+                config=config, arm=arm, generation=generation
+            )
+        memory_normalized = _normalize_config_fields(
+            generation_configs["memory"], _ARM_CONFIG_FIELDS, f"{generation} memory"
+        )
+        off_normalized = _normalize_config_fields(
+            generation_configs["matched_off"],
+            _ARM_CONFIG_FIELDS,
+            f"{generation} matched-off",
+        )
+        if memory_normalized != off_normalized:
+            raise PrerequisiteError(
+                f"Stage-C {generation} arms differ outside the approved memory switch"
+            )
+
+    for arm in ("memory", "matched_off"):
+        run_r2_normalized = _normalize_config_fields(
+            configs["run_r2"][arm],
+            _CROSS_GENERATION_CONFIG_FIELDS,
+            f"run_r2 {arm}",
+        )
+        run_r3_normalized = _normalize_config_fields(
+            configs["run_r3"][arm],
+            _CROSS_GENERATION_CONFIG_FIELDS,
+            f"run_r3 {arm}",
+        )
+        if run_r2_normalized != run_r3_normalized:
+            raise PrerequisiteError(
+                f"Stage-C run-r3 {arm} scientific settings differ from run-r2"
+            )
+
+    calibration_root = (
+        "experiments/NIAF/continuous_trajectory_field/"
+        "csl_daily_sentence_memory_relevance_calibration_stage_c_generator_"
+        "adaptation_protocol_v2_run_r3"
+    )
+    expected_outputs = {
+        "memory": (
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_memory_protocol_v2_run_r3"
+        ),
+        "matched_off": (
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_matched_off_protocol_v2_run_r3"
+        ),
+    }
+    for arm, config in configs["run_r3"].items():
+        stage = config["sentence_memory_safety"]["stage_c"]
+        if (
+            config.get("experiment_name") != Path(expected_outputs[arm]).name
+            or config.get("output", {}).get("out_dir") != expected_outputs[arm]
+            or config.get("sentence_memory", {})
+            .get("relevance_calibration", {})
+            .get("artifact_dir")
+            != calibration_root
+            or stage.get("active_stage_c", {}).get("calibration_artifact_dir")
+            != calibration_root
+        ):
+            raise PrerequisiteError(
+                f"Stage-C protocol-v2 {arm} fresh namespace changed"
+            )
+    r3_outputs = [
+        evidence_root / _safe_relative_path(value, "Stage-C protocol-v2 arm output")
+        for value in expected_outputs.values()
+    ]
+    r2_outputs = [
+        evidence_root
+        / _safe_relative_path(
+            config["output"]["out_dir"], "Stage-C run-r2 arm output"
+        )
+        for config in configs["run_r2"].values()
+    ]
+    archive_recovery = archive["recovery"]
+    protocol_roots = r3_outputs + [
+        evidence_root
+        / _safe_relative_path(
+            archive_recovery[name], f"Stage-C protocol-v2 {name}"
+        )
+        for name in (
+            "new_calibration_root",
+            "new_prerequisite_root",
+            "new_smoke_root",
+            "new_pilot_root",
+        )
+    ]
+    if (
+        len(set(protocol_roots)) != len(protocol_roots)
+        or any(
+            _paths_overlap(left, right)
+            for index, left in enumerate(protocol_roots)
+            for right in protocol_roots[index + 1 :]
+        )
+        or any(
+            _paths_overlap(new, old) for new in protocol_roots for old in r2_outputs
+        )
+    ):
+        raise PrerequisiteError("Stage-C protocol-v2 arm namespaces are not distinct")
+
+    audit = {
+        "schema_name": "signtrajfield_stage_c_protocol_v2_run_r3_config_audit",
+        "schema_version": 1,
+        "recovery_audit_identity": recovery_audit["audit_identity"],
+        "memory_config_sha256": sha256_file(memory_config),
+        "matched_off_config_sha256": sha256_file(matched_off_config),
+        "run_r2_memory_config_sha256": sha256_file(run_r2_paths["memory"]),
+        "run_r2_matched_off_config_sha256": sha256_file(
+            run_r2_paths["matched_off"]
+        ),
+        "scientific_settings_equal_run_r2": True,
+        "same_settings_except_arm_switch": True,
+        "original_stage_b_warm_start_pinned": True,
+        "development_only": True,
+        "non_authorizing": True,
+    }
+    return {**audit, "audit_identity": digest_json(audit)}
+
+
 def validate_cpu_gate(
     *,
     cpu_gate: Path,
@@ -447,11 +1862,14 @@ def validate_foundation(
 ) -> dict:
     head = source_git_head.lower()
     remote_head = source_remote_head.lower()
-    recovery_audit = validate_retry2_recovery_evidence(
+    recovery_audit = validate_recovery_evidence(
         policy_path=recovery_policy,
         recovery_manifest=recovery_manifest,
         source_root=source_root,
         evidence_root=recovery_evidence_root,
+    )
+    expected_source_file_profile = recovery_audit.get(
+        "calibration_source_file_profile", RETRY2_SOURCE_FILE_PROFILE
     )
     validate_source_terminal_decision(
         decision_path=source_terminal_decision,
@@ -503,7 +1921,7 @@ def validate_foundation(
         expected_git_head=head,
         expected_remote_ref=source_remote_ref,
         expected_remote_head=remote_head,
-        expected_source_file_profile="stage_c_generator_adaptation_retry2_v1",
+        expected_source_file_profile=expected_source_file_profile,
     )
     exact_completion = {
         "schema_name": "signtrajfield_stage_c_calibration_completion",
@@ -609,7 +2027,7 @@ def validate_foundation(
         or claim.get("claim_identity") != completion["active_lease_claim_identity"]
         or claim.get("binding", {}).get("source_git_head") != head
         or claim.get("binding", {}).get("source_file_profile")
-        != "stage_c_generator_adaptation_retry2_v1"
+        != expected_source_file_profile
         or claim.get("binding", {}).get("cpu_gate_sha256") != sha256_file(cpu_gate)
         or claim.get("binding", {}).get("launcher_sha256")
         != sha256_file(calibration_launcher)
@@ -1188,12 +2606,53 @@ def validate_smoke(
     ):
         raise PrerequisiteError("Stage-C smoke terminal lease archive changed")
     return {
-        "smoke_ready_sha256": sha256_file(smoke_ready),
-        "smoke_complete_sha256": sha256_file(complete_path),
-        "smoke_decision_sha256": sha256_file(decision_path),
-        "smoke_decision_identity": decision["decision_identity"],
-        "smoke_decision_status": decision["status"],
+        "schema_name": (
+            "signtrajfield_stage_c_prior_one_update_smoke_prerequisite"
+        ),
+        "schema_version": 1,
+        "smoke_root_path": str(smoke_root.resolve()),
+        "ready_path": str(smoke_ready.resolve()),
+        "ready_sha256": sha256_file(smoke_ready),
+        "mode_complete_path": str(mode_complete_path.resolve()),
+        "mode_complete_sha256": sha256_file(mode_complete_path),
+        "execution_complete_path": str(complete_path.resolve()),
+        "execution_complete_sha256": sha256_file(complete_path),
+        "decision_path": str(decision_path.resolve()),
+        "decision_sha256": sha256_file(decision_path),
+        "decision_identity": decision["decision_identity"],
+        "decision_status": decision["status"],
+        "decision_policy_path": str(policy_path.resolve()),
+        "decision_policy_sha256": sha256_file(policy_path),
+        "source_git_head": head,
+        "source_remote_ref": complete["source_remote_ref"],
+        "source_remote_head": complete["source_remote_head"],
+        "pair_constraint": pair_constraint,
+        "memory_config_sha256": binding["memory_config_sha256"],
+        "matched_off_config_sha256": binding["matched_off_config_sha256"],
+        "cpu_gate_sha256": binding["cpu_gate_sha256"],
+        "calibration_completion_sha256": binding[
+            "calibration_completion_sha256"
+        ],
+        "source_binding_sha256": complete["execution_artifacts"][
+            "source_binding"
+        ],
+        "active_lease_claim_identity": ready["active_lease_claim_identity"],
+        "execution_lease_claim_identity": ready[
+            "execution_lease_claim_identity"
+        ],
+        "expected_epoch": 1,
+        "expected_global_step_per_arm": 1,
+        "world_size": 2,
+        "batch_per_rank": 64,
+        "accumulation_steps": 2,
+        "effective_global_batch": 256,
         "training_network_profile": comparison["training_profile"],
+        "development_only": True,
+        "non_authorizing": True,
+        "promotion_eligible": False,
+        "authorized_purpose": None,
+        "confirmation_manifest_opened": False,
+        "test_data_accessed": False,
     }
 
 
@@ -1210,6 +2669,13 @@ def parse_args() -> argparse.Namespace:
     recovery.add_argument("--recovery_manifest", type=Path, required=True)
     recovery.add_argument("--source_root", type=Path, required=True)
     recovery.add_argument("--evidence_root", type=Path, required=True)
+    configs = commands.add_parser("validate-protocol-v2-configs")
+    configs.add_argument("--policy_path", type=Path, required=True)
+    configs.add_argument("--recovery_manifest", type=Path, required=True)
+    configs.add_argument("--source_root", type=Path, required=True)
+    configs.add_argument("--evidence_root", type=Path, required=True)
+    configs.add_argument("--memory_config", type=Path, required=True)
+    configs.add_argument("--matched_off_config", type=Path, required=True)
     foundation = commands.add_parser("validate-foundation")
     foundation.add_argument("--recovery_policy", type=Path, required=True)
     foundation.add_argument("--recovery_manifest", type=Path, required=True)
@@ -1229,6 +2695,8 @@ def parse_args() -> argparse.Namespace:
     smoke.add_argument("--smoke_root", type=Path, required=True)
     smoke.add_argument("--source_git_head", required=True)
     smoke.add_argument("--pair_constraint", required=True)
+    unspent = commands.add_parser("validate-unspent")
+    unspent.add_argument("--spend_marker", type=Path, required=True)
     return parser.parse_args()
 
 
@@ -1239,11 +2707,15 @@ def main() -> None:
     if command == "validate-cpu":
         value = validate_cpu_gate(**kwargs)
     elif command == "validate-recovery":
-        value = validate_retry2_recovery_evidence(**kwargs)
+        value = validate_recovery_evidence(**kwargs)
+    elif command == "validate-protocol-v2-configs":
+        value = validate_protocol_v2_run_r3_configs(**kwargs)
     elif command == "validate-foundation":
         value = validate_foundation(**kwargs)
-    else:
+    elif command == "validate-smoke":
         value = validate_smoke(**kwargs)
+    else:
+        value = validate_unspent_confirmation_holdout(**kwargs)
     print(json.dumps(value, indent=2, sort_keys=True))
 
 

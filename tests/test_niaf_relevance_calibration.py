@@ -251,6 +251,57 @@ def test_stage_c_source_profile_is_exact_and_rejects_mixed_or_unknown_sets(tmp_p
     assert retry2["source_file_profile"] == (
         MODULE.STAGE_C_RETRY2_SOURCE_FILE_PROFILE
     )
+    with pytest.raises(RelevanceCalibrationError, match="profile changed"):
+        validate_relevance_calibration_source(
+            {"source": retry2_source},
+            source_root=source_root,
+            expected_git_head="c" * 40,
+            expected_source_file_profile=(
+                MODULE.STAGE_C_PROTOCOL_V2_RUN_R3_SOURCE_FILE_PROFILE
+            ),
+        )
+
+    protocol_root = tmp_path / "protocol-v2-source"
+    protocol_root.mkdir()
+    protocol_files = {}
+    for relative in MODULE.STAGE_C_PROTOCOL_V2_RUN_R3_REQUIRED_SOURCE_FILES:
+        path = protocol_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"protocol-v2:{relative}\n", encoding="utf-8")
+        protocol_files[relative] = {
+            "bytes": path.stat().st_size,
+            "sha256": MODULE.sha256_file(path),
+        }
+    protocol_source = {
+        "git_head": "d" * 40,
+        "remote_head": "d" * 40,
+        "remote_ref": "origin/protocol-v2",
+        "repository_root": str(protocol_root),
+        "source_file_profile": MODULE.STAGE_C_PROTOCOL_V2_RUN_R3_SOURCE_FILE_PROFILE,
+        "source_files": protocol_files,
+    }
+    protocol = validate_relevance_calibration_source(
+        {"source": protocol_source},
+        source_root=protocol_root,
+        expected_git_head="d" * 40,
+        expected_remote_ref="origin/protocol-v2",
+        expected_remote_head="d" * 40,
+        expected_source_file_profile=(
+            MODULE.STAGE_C_PROTOCOL_V2_RUN_R3_SOURCE_FILE_PROFILE
+        ),
+    )
+    assert protocol["source_file_profile"] == (
+        MODULE.STAGE_C_PROTOCOL_V2_RUN_R3_SOURCE_FILE_PROFILE
+    )
+    assert (
+        "scripts/NIAF/calibrate_csl_daily_stage_c_generator_adaptation_"
+        "protocol_v2_run_r3_sbatch.sh"
+        in protocol["source_files"]
+    )
+    assert (
+        "scripts/NIAF/calibrate_csl_daily_stage_c_generator_adaptation_sbatch.sh"
+        not in protocol["source_files"]
+    )
 
     wrong_expected = copy.deepcopy(source)
     with pytest.raises(RelevanceCalibrationError, match="profile changed"):

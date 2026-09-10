@@ -26,6 +26,10 @@ ATTESTATION_SCHEMA_NAME = "signtrajfield_stage_c_execution_lease_attestation"
 TERMINAL_SCHEMA_NAME = "signtrajfield_stage_c_execution_lease_terminal"
 SCHEMA_VERSION = 1
 MODES = {"smoke", "pilot"}
+PROTOCOL_V2_RUN_R3_POLICY_NAME = (
+    "csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_"
+    "decision_policy_v1.json"
+)
 PAIR_RE = re.compile(r"pair(0[1-9]|1[0-5])")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 BINDING_FIELDS = {
@@ -192,6 +196,51 @@ def _validate_binding(value: Any) -> dict[str, Any]:
     ):
         raise StageCExecutionControlError("execution binding content is malformed")
     return value
+
+
+def _validate_protocol_v2_smoke_prerequisite(
+    *,
+    mode: str,
+    completion: Mapping[str, Any],
+    ready: Mapping[str, Any],
+    execution_complete: Mapping[str, Any],
+    decision: Mapping[str, Any],
+    launch: Mapping[str, Any],
+) -> None:
+    records = (completion, ready, execution_complete, decision, launch)
+    if mode == "smoke":
+        if any("prior_one_update_smoke" in value for value in records):
+            raise StageCExecutionControlError(
+                "smoke publication contains a forbidden self-prerequisite"
+            )
+        return
+    if mode != "pilot":
+        raise StageCExecutionControlError(
+            "protocol-v2 publication mode is not exact"
+        )
+    prior_smoke = completion.get("prior_one_update_smoke")
+    if not isinstance(prior_smoke, dict) or any(
+        value.get("prior_one_update_smoke") != prior_smoke
+        for value in records[1:]
+    ):
+        raise StageCExecutionControlError(
+            "pilot smoke prerequisite differs across publication evidence"
+        )
+    from NIAF.continuous_trajectory_field.scripts.stage_c_pilot_decision import (
+        StageCDecisionError,
+        _validate_pilot_smoke_prerequisite,
+    )
+
+    try:
+        _validate_pilot_smoke_prerequisite(
+            value=prior_smoke,
+            complete=execution_complete,
+            launch=launch,
+        )
+    except StageCDecisionError as error:
+        raise StageCExecutionControlError(
+            f"pilot smoke prerequisite is invalid: {error}"
+        ) from error
 
 
 def _validate_claim(path: Path) -> dict[str, Any]:
@@ -736,6 +785,11 @@ def _validate_publication(
     decision_path = Path(str(completion.get("decision_path", "")))
     policy_path = Path(str(completion.get("decision_policy_path", "")))
     execution_path = Path(str(completion.get("execution_complete_path", "")))
+    protocol_v2 = policy_path.name == PROTOCOL_V2_RUN_R3_POLICY_NAME
+    requires_smoke_prerequisite = protocol_v2 and mode == "pilot"
+    if requires_smoke_prerequisite:
+        completion_fields.add("prior_one_update_smoke")
+        ready_fields.add("prior_one_update_smoke")
     if (
         set(completion) != completion_fields
         or set(ready) != ready_fields
@@ -806,6 +860,15 @@ def _validate_publication(
             "authorized_purpose": None,
             "confirmation_manifest_opened": False,
             "test_data_accessed": False,
+            **(
+                {
+                    "prior_one_update_smoke": completion.get(
+                        "prior_one_update_smoke"
+                    )
+                }
+                if requires_smoke_prerequisite
+                else {}
+            ),
         }
     ):
         raise StageCExecutionControlError(
@@ -843,6 +906,17 @@ def _validate_publication(
         or decision.get("authorized_purpose") is not None
     ):
         raise StageCExecutionControlError("immutable Stage-C decision is malformed")
+    if protocol_v2:
+        execution_complete = _json(execution_path)
+        launch = _json(execution_path.parent / "LAUNCH.json")
+        _validate_protocol_v2_smoke_prerequisite(
+            mode=mode,
+            completion=completion,
+            ready=ready,
+            execution_complete=execution_complete,
+            decision=decision,
+            launch=launch,
+        )
     return claim, completion, ready, publication_attestation
 
 
