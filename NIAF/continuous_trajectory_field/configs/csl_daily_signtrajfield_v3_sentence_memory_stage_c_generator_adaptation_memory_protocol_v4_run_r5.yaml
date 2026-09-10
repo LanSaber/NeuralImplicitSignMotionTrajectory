@@ -1,0 +1,21 @@
+_base_: csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_pilot_run_r2.yaml
+
+# Protocol-v4/run-r5 is a fresh, no-replace execution generation. Its sole
+# operational correction is the canonical evidence-root fixture/binding; all
+# scientific settings remain byte-semantically identical to protocol-v2/run-r3.
+experiment_name: csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_protocol_v4_run_r5
+
+sentence_memory:
+  relevance_calibration:
+    artifact_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_protocol_v4_run_r5
+    artifact_identity: null
+
+sentence_memory_safety:
+  stage_c:
+    active_stage_c:
+      calibration_artifact_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_protocol_v4_run_r5
+      calibration_schema_name: signtrajfield_sentence_memory_relevance_calibration
+      calibration_schema_version: 1
+
+output:
+  out_dir: experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_protocol_v4_run_r5

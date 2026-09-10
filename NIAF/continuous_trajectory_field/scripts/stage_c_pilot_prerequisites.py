@@ -139,6 +139,26 @@ PROTOCOL_V3_RUN_R4_ARCHIVED_SOURCE_REMOTE_REF = (
 )
 PROTOCOL_V3_RUN_R4_LOCAL_GIT_TIMEOUT_SECONDS = 600
 PROTOCOL_V3_RUN_R4_REMOTE_REF_TIMEOUT_SECONDS = 120
+PROTOCOL_V4_RUN_R5_POLICY_NAME = (
+    "csl_daily_stage_c_generator_adaptation_protocol_v4_run_r5_"
+    "decision_policy_v1.json"
+)
+PROTOCOL_V4_RUN_R5_RECOVERY_SCHEMA = (
+    "signtrajfield_stage_c_protocol_v4_run_r5_recovery_evidence"
+)
+PROTOCOL_V4_RUN_R5_SOURCE_FILE_PROFILE = (
+    "stage_c_generator_adaptation_protocol_v4_run_r5"
+)
+PROTOCOL_V4_RUN_R5_INCIDENT_ARCHIVE_PATH = (
+    "experiments/NIAF/continuous_trajectory_field/"
+    "csl_daily_stage_c_generator_adaptation_protocol_v3_run_r4_cpu.invalid_attempts/"
+    "source_740400412386d60a8d6f56b0f871bc16dee755b0_"
+    "cpu143593_dependents143594_143596/ARCHIVE.json"
+)
+PROTOCOL_V4_RUN_R5_INCIDENT_ARCHIVE_SHA256 = (
+    "a23682b584bcc05ccee67ccec7526d33efc924104a0ea34209740bb4131e5f71"
+)
+PROTOCOL_V4_RUN_R5_INCIDENT_ARCHIVE_BYTES = 11_168
 RETRY2_SOURCE_FILE_PROFILE = "stage_c_generator_adaptation_retry2_v1"
 PROTOCOL_V2_RUN_R3_RECOVERY_SHA256 = (
     "f955dbc7ce03f5f6a400d8ae2fa21c7ca5a280fec7f7a37da674d35a027e9209"
@@ -2095,6 +2115,13 @@ def validate_recovery_evidence(
             source_root=source_root,
             evidence_root=evidence_root,
         )
+    if policy_path.name == PROTOCOL_V4_RUN_R5_POLICY_NAME:
+        return validate_protocol_v4_run_r5_recovery_evidence(
+            policy_path=policy_path,
+            recovery_manifest=recovery_manifest,
+            source_root=source_root,
+            evidence_root=evidence_root,
+        )
     raise PrerequisiteError("Stage-C recovery policy filename is not registered")
 
 
@@ -2735,6 +2762,448 @@ def validate_protocol_v3_run_r4_cpu_gate(
     return cpu
 
 
+def _protocol_v4_run_r5_archive_absences() -> dict[str, Any]:
+    """Return the exact r4 zero-science paths retained by the r5 archive."""
+
+    return {
+        "arm_roots": [
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_memory_protocol_v3_run_r4",
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_matched_off_protocol_v3_run_r4",
+        ],
+        "prerequisite_calibration_smoke_pilot_roots": [
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_stage_c_generator_adaptation_protocol_v3_run_r4_prerequisites",
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_sentence_memory_relevance_calibration_stage_c_generator_"
+            "adaptation_protocol_v3_run_r4",
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_protocol_v3_run_r4_smoke",
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_protocol_v3_run_r4_pilot",
+        ],
+        "six_runtime_logs": [
+            "logs/sbatch/csl_stage_c_protocol_v3_run_r4_calibration_143594.out",
+            "logs/sbatch/csl_stage_c_protocol_v3_run_r4_calibration_143594.err",
+            "logs/sbatch/csl_stage_c_protocol_v3_run_r4_smoke_143595.out",
+            "logs/sbatch/csl_stage_c_protocol_v3_run_r4_smoke_143595.err",
+            "logs/sbatch/csl_stage_c_protocol_v3_run_r4_pilot_143596.out",
+            "logs/sbatch/csl_stage_c_protocol_v3_run_r4_pilot_143596.err",
+        ],
+        "confirmation_holdout_spend_marker": (
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_signtrajfield_v3_sentence_memory_phase_a_factorized_"
+            "ordered_v1_control/confirmation_holdout_spent.json"
+        ),
+    }
+
+
+def _validate_protocol_v4_run_r5_recovery(
+    *,
+    policy_path: Path,
+    recovery_manifest: Path,
+    source_root: Path,
+    evidence_root: Path,
+    validate_historical_clone_metadata: bool,
+) -> dict[str, Any]:
+    """Authenticate r4 evidence, with clone Git I/O only in the CPU gate."""
+
+    policy = validate_policy(policy_path)
+    if policy_path.name != PROTOCOL_V4_RUN_R5_POLICY_NAME:
+        raise PrerequisiteError("Stage-C protocol-v4 recovery policy path changed")
+    contract = policy.get("recovery_contract")
+    if not isinstance(contract, Mapping):
+        raise PrerequisiteError("Stage-C protocol-v4 policy lacks recovery contract")
+    manifest_binding = contract.get("evidence_manifest")
+    incident_binding = contract.get("incident_archive")
+    if not isinstance(manifest_binding, Mapping) or not isinstance(incident_binding, Mapping):
+        raise PrerequisiteError("Stage-C protocol-v4 recovery binding is malformed")
+    if recovery_manifest.resolve() != (source_root / str(manifest_binding.get("path", ""))).resolve():
+        raise PrerequisiteError("Stage-C protocol-v4 recovery manifest path changed")
+    _reopen_bound_file(root=source_root, binding=manifest_binding, label="Stage-C protocol-v4 recovery manifest")
+    manifest = _exact_json(
+        recovery_manifest,
+        label="Stage-C protocol-v4 recovery manifest",
+        fields={"schema_name", "schema_version", "authorization", "canonical_evidence_root", "incident_archive", "new_protocol", "predecessor_chain", "source_checkpoint", "zero_science_boundary", "zero_science_runtime_absences"},
+    )
+    expected_incident = {
+        "path": PROTOCOL_V4_RUN_R5_INCIDENT_ARCHIVE_PATH,
+        "sha256": PROTOCOL_V4_RUN_R5_INCIDENT_ARCHIVE_SHA256,
+        "bytes": PROTOCOL_V4_RUN_R5_INCIDENT_ARCHIVE_BYTES,
+        "schema_name": "signtrajfield_stage_c_generator_adaptation_terminal_incident_archive",
+        "schema_version": 3,
+        "required_absent_path_count": 13,
+    }
+    expected_boundary = {
+        "calibration_started": False, "compileall_started": True,
+        "cpu_gate_ready_published": False, "data_or_neighbor_table_opened": False,
+        "execution_lease_created": False, "gpu_allocated": False,
+        "optimizer_updates": 0, "pytest_started": True, "ruff_started": True,
+        "scientific_output_observed": False, "trainer_started": False,
+        "validation_batches": 0,
+    }
+    expected_authorization = {
+        "confirmation_manifest_opened": False,
+        "development_only": True,
+        "longer_run_authorized": False,
+        "non_authorizing": True,
+        "promotion_eligible": False,
+        "test_data_accessed": False,
+    }
+    expected_new_protocol = {
+        "allowed_operational_change": (
+            "correct_only_the_standalone_clone_cpu_test_fixture_evidence_root_binding"
+        ),
+        "calibration_source_file_profile": PROTOCOL_V4_RUN_R5_SOURCE_FILE_PROFILE,
+        "downstream_proof_delegation": (
+            "validation_preserving_execution_safety: CPU READY authenticates the "
+            "one-time historical proof; downstream reopens only bound hashes and "
+            "current source/config identities."
+        ),
+        "historical_archived_clone_local_git_metadata_timeout_seconds": 600,
+        "historical_remote_ref_timeout_seconds": 120,
+        "protocol_generation": "protocol_v4",
+        "run_generation": "run_r5",
+        "same_protocol_resume_authorized": False,
+        "same_protocol_retry_authorized": False,
+        "scientific_settings_must_equal_protocol_v3_run_r4": True,
+        "source_branch": "codex/csl-daily-centered-generator-stage-c-v4-run-r5",
+        "source_clone": (
+            "/media/cvpr/haomian/SignTrajField_centered_stage_c_v4_run_source_r5"
+        ),
+    }
+    expected_predecessors = {
+        "run_r4": {
+            "incident_archive_path": PROTOCOL_V4_RUN_R5_INCIDENT_ARCHIVE_PATH,
+            "incident_archive_sha256": PROTOCOL_V4_RUN_R5_INCIDENT_ARCHIVE_SHA256,
+            "run_generation": "run_r4",
+            "source_git_head": "740400412386d60a8d6f56b0f871bc16dee755b0",
+            "source_remote_ref": (
+                "origin/codex/csl-daily-centered-generator-stage-c-v3-run-r4"
+            ),
+        },
+        "run_r3": {
+            "run_generation": "run_r3",
+            "source_git_head": "90cad3d3a7a09279b4a882e8c28a13b2a320ec1a",
+            "source_remote_ref": (
+                "origin/codex/csl-daily-centered-generator-stage-c-v2-run-r3"
+            ),
+        },
+    }
+    expected_contract = {
+        "allowed_operational_change": expected_new_protocol[
+            "allowed_operational_change"
+        ],
+        "downstream_proof_delegation": expected_new_protocol[
+            "downstream_proof_delegation"
+        ],
+        "evidence_manifest": {
+            "path": (
+                "NIAF/continuous_trajectory_field/configs/"
+                "csl_daily_stage_c_generator_adaptation_protocol_v4_run_r5_"
+                "recovery_evidence_v1.json"
+            ),
+            "sha256": "c6ab0d7626622c8163ac1917906ba606b2cc582d09cc8b44fe592008ee727d24",
+        },
+        "incident_archive": {
+            "path": PROTOCOL_V4_RUN_R5_INCIDENT_ARCHIVE_PATH,
+            "sha256": PROTOCOL_V4_RUN_R5_INCIDENT_ARCHIVE_SHA256,
+        },
+        "new_protocol_generation_authorized": True,
+        "prior_execution_lease_created": False,
+        "prior_scientific_output_observed": False,
+        "protocol_generation": "protocol_v4",
+        "resume_authorized": False,
+        "run_generation": "run_r5",
+        "same_protocol_retry_authorized": False,
+        "supersedes_protocol": "protocol_v3",
+        "supersedes_run_generation": "run_r4",
+        "zero_science_archive_required": True,
+    }
+    if (
+        manifest["schema_name"] != PROTOCOL_V4_RUN_R5_RECOVERY_SCHEMA
+        or manifest["schema_version"] != 1
+        or manifest["authorization"] != expected_authorization
+        or evidence_root.resolve() != Path(str(manifest["canonical_evidence_root"])).resolve()
+        or manifest["incident_archive"] != expected_incident
+        or manifest["new_protocol"] != expected_new_protocol
+        or manifest["predecessor_chain"] != expected_predecessors
+        or manifest["zero_science_boundary"] != expected_boundary
+        or manifest["zero_science_runtime_absences"] != _protocol_v4_run_r5_archive_absences()
+        or manifest["new_protocol"].get("protocol_generation") != "protocol_v4"
+        or manifest["new_protocol"].get("run_generation") != "run_r5"
+        or manifest["new_protocol"].get("allowed_operational_change")
+        != "correct_only_the_standalone_clone_cpu_test_fixture_evidence_root_binding"
+        or incident_binding != {"path": PROTOCOL_V4_RUN_R5_INCIDENT_ARCHIVE_PATH, "sha256": PROTOCOL_V4_RUN_R5_INCIDENT_ARCHIVE_SHA256}
+        or contract != expected_contract
+    ):
+        raise PrerequisiteError("Stage-C protocol-v4 recovery manifest scope changed")
+    archive_path = _reopen_bound_file(
+        root=evidence_root, binding=incident_binding,
+        label="Stage-C protocol-v3/run-r4 zero-science archive",
+        expected_bytes=PROTOCOL_V4_RUN_R5_INCIDENT_ARCHIVE_BYTES,
+    )
+    archive = _exact_json(
+        archive_path, label="Stage-C protocol-v3/run-r4 zero-science archive",
+        fields={"authorization", "created_at", "failure", "immutable_no_replace_contract", "jobs", "observed_execution_boundary", "protocol_generation", "reason", "recovery", "required_absent_paths", "required_absent_paths_revalidated_at", "retained_evidence", "schema_name", "schema_version", "source_science"},
+    )
+    flattened = (
+        _protocol_v4_run_r5_archive_absences()["prerequisite_calibration_smoke_pilot_roots"]
+        + _protocol_v4_run_r5_archive_absences()["arm_roots"]
+        + _protocol_v4_run_r5_archive_absences()["six_runtime_logs"]
+        + [_protocol_v4_run_r5_archive_absences()["confirmation_holdout_spend_marker"]]
+    )
+    if (
+        archive["schema_name"] != expected_incident["schema_name"]
+        or archive["schema_version"] != 3
+        or archive["required_absent_paths"] != flattened
+        or archive["observed_execution_boundary"] != expected_boundary
+        or archive["protocol_generation"] != {"protocol": "protocol_v3", "run": "run_r4", "status": "terminal_zero_science_cpu_test_failure"}
+        or archive["recovery"].get("allowed_change_class")
+        != "correct_only_the_standalone_clone_cpu_test_fixture_evidence_root_binding"
+    ):
+        raise PrerequisiteError("Stage-C protocol-v4 archive scope changed")
+    for relative in flattened:
+        target = evidence_root / _safe_relative_path(
+            relative, "Stage-C protocol-v4 archived absence"
+        )
+        if target.exists() or target.is_symlink():
+            raise PrerequisiteError(
+                f"Stage-C protocol-v4 archived zero-science path now exists: {relative}"
+            )
+    retained = archive["retained_evidence"]
+    if not isinstance(retained, Mapping):
+        raise PrerequisiteError("Stage-C protocol-v4 retained archive evidence changed")
+    incident_logs = retained.get("incident_logs")
+    run_source = retained.get("run_source")
+    if (
+        not isinstance(incident_logs, Mapping)
+        or not isinstance(run_source, Mapping)
+        or run_source
+        != {
+            "branch": "codex/csl-daily-centered-generator-stage-c-v3-run-r4",
+            "clone": (
+                "/media/cvpr/haomian/"
+                "SignTrajField_centered_stage_c_v3_run_source_r4"
+            ),
+            "git_head": "740400412386d60a8d6f56b0f871bc16dee755b0",
+            "git_tree": "23613b49d5ac9d9ac1c9ec0ef17320b6e80d5249",
+            "remote_head": "740400412386d60a8d6f56b0f871bc16dee755b0",
+            "remote_ref": (
+                "origin/codex/csl-daily-centered-generator-stage-c-v3-run-r4"
+            ),
+            "status_clean": True,
+            "tracked_file_count": 524,
+        }
+    ):
+        raise PrerequisiteError("Stage-C protocol-v4 archived source identity changed")
+    for relative, binding in incident_logs.items():
+        if not isinstance(relative, str) or not isinstance(binding, Mapping):
+            raise PrerequisiteError("Stage-C protocol-v4 incident log binding changed")
+        _reopen_bound_file(
+            root=evidence_root,
+            binding={"path": relative, "sha256": binding.get("sha256")},
+            label=f"Stage-C protocol-v4 archived incident log {relative}",
+            expected_bytes=binding.get("bytes"),
+        )
+    if validate_historical_clone_metadata:
+        _validate_standalone_source_clone(
+            clone=Path(str(run_source["clone"])),
+            expected_head=str(run_source["git_head"]),
+            expected_remote_ref=str(run_source["remote_ref"]),
+            local_metadata_timeout_seconds=600,
+            remote_ref_timeout_seconds=120,
+        )
+    audit = {
+        "schema_name": "signtrajfield_stage_c_protocol_v4_run_r5_recovery_audit",
+        "schema_version": 1,
+        "incident_archive_sha256": sha256_file(archive_path),
+        "decision_policy_sha256": sha256_file(policy_path),
+        "recovery_manifest_sha256": sha256_file(recovery_manifest),
+        "calibration_source_file_profile": PROTOCOL_V4_RUN_R5_SOURCE_FILE_PROFILE,
+        "development_only": True, "non_authorizing": True,
+        "historical_clone_metadata_checked_in_cpu_gate": bool(
+            validate_historical_clone_metadata
+        ),
+    }
+    identity_payload = dict(audit)
+    identity_payload.pop("historical_clone_metadata_checked_in_cpu_gate")
+    return {**audit, "audit_identity": digest_json(identity_payload)}
+
+
+def validate_protocol_v4_run_r5_runtime_bindings(**kwargs: Any) -> dict[str, Any]:
+    """Reopen immutable recovery artifacts without archived-clone Git I/O."""
+
+    return _validate_protocol_v4_run_r5_recovery(
+        **kwargs, validate_historical_clone_metadata=False
+    )
+
+
+def validate_protocol_v4_run_r5_recovery_evidence(**kwargs: Any) -> dict[str, Any]:
+    """Run the preserved r4 archived-clone proof before CPU-gate publication."""
+
+    return _validate_protocol_v4_run_r5_recovery(
+        **kwargs, validate_historical_clone_metadata=True
+    )
+
+
+def _validate_protocol_v4_run_r5_configs(
+    *,
+    recovery_audit: Mapping[str, Any],
+    source_root: Path,
+    memory_config: Path,
+    matched_off_config: Path,
+) -> dict[str, Any]:
+    r4_names = {
+        "memory": "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_protocol_v3_run_r4.yaml",
+        "matched_off": "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_matched_off_protocol_v3_run_r4.yaml",
+    }
+    calibration_root = (
+        "experiments/NIAF/continuous_trajectory_field/"
+        "csl_daily_sentence_memory_relevance_calibration_stage_c_generator_"
+        "adaptation_protocol_v4_run_r5"
+    )
+    expected_outputs = {
+        "memory": (
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_memory_protocol_v4_run_r5"
+        ),
+        "matched_off": (
+            "experiments/NIAF/continuous_trajectory_field/"
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_matched_off_protocol_v4_run_r5"
+        ),
+    }
+    current = {"memory": load_config(memory_config), "matched_off": load_config(matched_off_config)}
+    for arm, config in current.items():
+        baseline = load_config(source_root / "NIAF/continuous_trajectory_field/configs" / r4_names[arm])
+        stage = config["sentence_memory_safety"]["stage_c"]
+        if (
+            config["experiment_name"] != Path(expected_outputs[arm]).name
+            or config["output"]["out_dir"] != expected_outputs[arm]
+            or config["sentence_memory"]["relevance_calibration"]["artifact_dir"]
+            != calibration_root
+            or stage["active_stage_c"]["calibration_artifact_dir"]
+            != calibration_root
+        ):
+            raise PrerequisiteError(f"Stage-C protocol-v4 {arm} namespace changed")
+        for value in (config, baseline):
+            value.pop("experiment_name")
+            value["output"].pop("out_dir")
+            value["sentence_memory"]["relevance_calibration"].pop("artifact_dir")
+            value["sentence_memory_safety"]["stage_c"]["active_stage_c"].pop("calibration_artifact_dir")
+        if config != baseline:
+            raise PrerequisiteError(f"Stage-C protocol-v4 {arm} science differs from run-r4")
+    audit = {
+        "schema_name": "signtrajfield_stage_c_protocol_v4_run_r5_config_audit",
+        "schema_version": 1,
+        "recovery_audit_identity": recovery_audit["audit_identity"],
+        "memory_config_sha256": sha256_file(memory_config),
+        "matched_off_config_sha256": sha256_file(matched_off_config),
+        "scientific_settings_equal_protocol_v3_run_r4": True,
+        "development_only": True, "non_authorizing": True,
+    }
+    return {**audit, "audit_identity": digest_json(audit)}
+
+
+def validate_protocol_v4_run_r5_configs(
+    *,
+    policy_path: Path,
+    recovery_manifest: Path,
+    source_root: Path,
+    evidence_root: Path,
+    memory_config: Path,
+    matched_off_config: Path,
+) -> dict[str, Any]:
+    """Run the one-time archived-clone proof before CPU-gate publication."""
+
+    return _validate_protocol_v4_run_r5_configs(
+        recovery_audit=validate_protocol_v4_run_r5_recovery_evidence(
+            policy_path=policy_path,
+            recovery_manifest=recovery_manifest,
+            source_root=source_root,
+            evidence_root=evidence_root,
+        ),
+        source_root=source_root,
+        memory_config=memory_config,
+        matched_off_config=matched_off_config,
+    )
+
+
+def validate_protocol_v4_run_r5_runtime_configs(
+    *,
+    policy_path: Path,
+    recovery_manifest: Path,
+    source_root: Path,
+    evidence_root: Path,
+    memory_config: Path,
+    matched_off_config: Path,
+) -> dict[str, Any]:
+    """Recompute config bindings without archived-clone Git operations."""
+
+    return _validate_protocol_v4_run_r5_configs(
+        recovery_audit=validate_protocol_v4_run_r5_runtime_bindings(
+            policy_path=policy_path,
+            recovery_manifest=recovery_manifest,
+            source_root=source_root,
+            evidence_root=evidence_root,
+        ),
+        source_root=source_root,
+        memory_config=memory_config,
+        matched_off_config=matched_off_config,
+    )
+
+
+def validate_protocol_v4_run_r5_cpu_gate(
+    *, cpu_gate: Path, source_git_head: str, source_remote_ref: str,
+    source_remote_head: str, policy_path: Path, recovery_manifest: Path,
+    source_root: Path, evidence_root: Path, memory_config: Path,
+    matched_off_config: Path,
+) -> dict[str, Any]:
+    """Authenticate the fresh r5 schema-v2 CPU gate."""
+
+    recovery = validate_protocol_v4_run_r5_runtime_bindings(
+        policy_path=policy_path, recovery_manifest=recovery_manifest,
+        source_root=source_root, evidence_root=evidence_root,
+    )
+    configs = validate_protocol_v4_run_r5_runtime_configs(
+        policy_path=policy_path, recovery_manifest=recovery_manifest,
+        source_root=source_root, evidence_root=evidence_root,
+        memory_config=memory_config, matched_off_config=matched_off_config,
+    )
+    cpu = _exact_json(
+        cpu_gate, label="Stage-C protocol-v4 CPU gate",
+        fields={"schema_name", "schema_version", "source_git_head", "source_remote_ref", "source_remote_head", "slurm_job_id", "compileall", "ruff_version", "pytest_version", "complete_repository_test_glob", "development_only", "confirmation_manifest_opened", "test_data_accessed", "passed", "recovery_audit_identity", "config_audit_identity", "incident_archive_sha256", "decision_policy_sha256", "recovery_manifest_sha256", "memory_config_sha256", "matched_off_config_sha256", "historical_clone_metadata_checked_in_cpu_gate", "historical_clone_local_git_metadata_timeout_seconds", "historical_remote_ref_timeout_seconds"},
+    )
+    exact = {
+        "schema_name": "signtrajfield_stage_c_cpu_gate", "schema_version": 2,
+        "source_git_head": source_git_head.lower(), "source_remote_ref": source_remote_ref,
+        "source_remote_head": source_remote_head.lower(), "slurm_job_id": cpu.get("slurm_job_id"),
+        "compileall": True, "ruff_version": "0.12.0", "pytest_version": "8.4.2",
+        "complete_repository_test_glob": "tests/test_*.py", "development_only": True,
+        "confirmation_manifest_opened": False, "test_data_accessed": False, "passed": True,
+        "recovery_audit_identity": recovery["audit_identity"],
+        "config_audit_identity": configs["audit_identity"],
+        "incident_archive_sha256": recovery["incident_archive_sha256"],
+        "decision_policy_sha256": recovery["decision_policy_sha256"],
+        "recovery_manifest_sha256": recovery["recovery_manifest_sha256"],
+        "memory_config_sha256": configs["memory_config_sha256"],
+        "matched_off_config_sha256": configs["matched_off_config_sha256"],
+        "historical_clone_metadata_checked_in_cpu_gate": True,
+        "historical_clone_local_git_metadata_timeout_seconds": 600,
+        "historical_remote_ref_timeout_seconds": 120,
+    }
+    if cpu != exact or not str(cpu["slurm_job_id"]).isdigit():
+        raise PrerequisiteError("Stage-C protocol-v4 CPU gate content is not exact")
+    return cpu
+
+
 def validate_foundation(
     *,
     recovery_policy: Path,
@@ -2777,6 +3246,30 @@ def validate_foundation(
                 "adaptation_matched_off_protocol_v3_run_r4.yaml"
             ),
         )
+    elif recovery_policy.name == PROTOCOL_V4_RUN_R5_POLICY_NAME:
+        recovery_audit = validate_protocol_v4_run_r5_runtime_bindings(
+            policy_path=recovery_policy,
+            recovery_manifest=recovery_manifest,
+            source_root=source_root,
+            evidence_root=recovery_evidence_root,
+        )
+        validate_protocol_v4_run_r5_cpu_gate(
+            cpu_gate=cpu_gate,
+            source_git_head=head,
+            source_remote_ref=source_remote_ref,
+            source_remote_head=remote_head,
+            policy_path=recovery_policy,
+            recovery_manifest=recovery_manifest,
+            source_root=source_root,
+            evidence_root=recovery_evidence_root,
+            memory_config=stage_c_config,
+            matched_off_config=(
+                source_root
+                / "NIAF/continuous_trajectory_field/configs/"
+                "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+                "adaptation_matched_off_protocol_v4_run_r5.yaml"
+            ),
+        )
     else:
         recovery_audit = validate_recovery_evidence(
             policy_path=recovery_policy,
@@ -2792,7 +3285,10 @@ def validate_foundation(
         expected_sha256=SOURCE_TERMINAL_DECISION_SHA256,
         expected_identity=SOURCE_TERMINAL_DECISION_IDENTITY,
     )
-    if recovery_policy.name != PROTOCOL_V3_RUN_R4_POLICY_NAME:
+    if recovery_policy.name not in (
+        PROTOCOL_V3_RUN_R4_POLICY_NAME,
+        PROTOCOL_V4_RUN_R5_POLICY_NAME,
+    ):
         validate_cpu_gate(
             cpu_gate=cpu_gate,
             source_git_head=head,
@@ -3616,6 +4112,19 @@ def parse_args() -> argparse.Namespace:
     v3_cpu.add_argument("--evidence_root", type=Path, required=True)
     v3_cpu.add_argument("--memory_config", type=Path, required=True)
     v3_cpu.add_argument("--matched_off_config", type=Path, required=True)
+    v4_configs = commands.add_parser("validate-protocol-v4-configs")
+    v4_runtime = commands.add_parser("validate-protocol-v4-runtime")
+    v4_cpu = commands.add_parser("validate-protocol-v4-cpu")
+    for command in (v4_configs, v4_runtime, v4_cpu):
+        command.add_argument("--policy_path", type=Path, required=True)
+        command.add_argument("--recovery_manifest", type=Path, required=True)
+        command.add_argument("--source_root", type=Path, required=True)
+        command.add_argument("--evidence_root", type=Path, required=True)
+    for command in (v4_configs, v4_cpu):
+        command.add_argument("--memory_config", type=Path, required=True)
+        command.add_argument("--matched_off_config", type=Path, required=True)
+    for argument in ("--cpu_gate", "--source_git_head", "--source_remote_ref", "--source_remote_head"):
+        v4_cpu.add_argument(argument, type=Path if argument == "--cpu_gate" else str, required=True)
     foundation = commands.add_parser("validate-foundation")
     foundation.add_argument("--recovery_policy", type=Path, required=True)
     foundation.add_argument("--recovery_manifest", type=Path, required=True)
@@ -3656,6 +4165,12 @@ def main() -> None:
         value = validate_protocol_v3_run_r4_runtime_bindings(**kwargs)
     elif command == "validate-protocol-v3-cpu":
         value = validate_protocol_v3_run_r4_cpu_gate(**kwargs)
+    elif command == "validate-protocol-v4-configs":
+        value = validate_protocol_v4_run_r5_configs(**kwargs)
+    elif command == "validate-protocol-v4-runtime":
+        value = validate_protocol_v4_run_r5_runtime_bindings(**kwargs)
+    elif command == "validate-protocol-v4-cpu":
+        value = validate_protocol_v4_run_r5_cpu_gate(**kwargs)
     elif command == "validate-foundation":
         value = validate_foundation(**kwargs)
     elif command == "validate-smoke":

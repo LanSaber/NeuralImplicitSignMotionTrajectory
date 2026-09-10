@@ -30,8 +30,16 @@ PROTOCOL_V3_RUN_R4_POLICY_NAME = (
     "csl_daily_stage_c_generator_adaptation_protocol_v3_run_r4_"
     "decision_policy_v1.json"
 )
+PROTOCOL_V4_RUN_R5_POLICY_NAME = (
+    "csl_daily_stage_c_generator_adaptation_protocol_v4_run_r5_"
+    "decision_policy_v1.json"
+)
 SMOKE_PREREQUISITE_POLICY_NAMES = frozenset(
-    {PROTOCOL_V2_RUN_R3_POLICY_NAME, PROTOCOL_V3_RUN_R4_POLICY_NAME}
+    {
+        PROTOCOL_V2_RUN_R3_POLICY_NAME,
+        PROTOCOL_V3_RUN_R4_POLICY_NAME,
+        PROTOCOL_V4_RUN_R5_POLICY_NAME,
+    }
 )
 INVARIANT_KEYS = (
     "selection_joint_tuple_prediction_max_abs",
@@ -188,6 +196,16 @@ def _validate_source_binding_generation(
             "recovery_evidence_v1.json"
         ),
     }
+    protocol_v4_exclusive_markers = {
+        (
+            "csl_daily_stage_c_generator_adaptation_protocol_v4_run_r5_"
+            "decision_policy_v1.json"
+        ),
+        (
+            "csl_daily_stage_c_generator_adaptation_protocol_v4_run_r5_"
+            "recovery_evidence_v1.json"
+        ),
+    }
     protocol_v2_required_markers = protocol_v2_exclusive_markers | {
         (
             "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
@@ -295,12 +313,68 @@ def _validate_source_binding_generation(
                 "smoke source binding must not contain a self-prerequisite"
             )
         return expected_count
+    protocol_v4_required_markers = protocol_v4_exclusive_markers | {
+        (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_memory_protocol_v2_run_r3.yaml"
+        ),
+        (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_matched_off_protocol_v2_run_r3.yaml"
+        ),
+        (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_memory_protocol_v4_run_r5.yaml"
+        ),
+        (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_matched_off_protocol_v4_run_r5.yaml"
+        ),
+        "run_csl_daily_stage_c_generator_adaptation_protocol_v4_run_r5.sh",
+        (
+            "calibrate_csl_daily_stage_c_generator_adaptation_"
+            "protocol_v4_run_r5_sbatch.sh"
+        ),
+        "ARCHIVE.json",
+    }
+    if policy_name == PROTOCOL_V4_RUN_R5_POLICY_NAME:
+        if mode not in EXPECTED_STEPS:
+            raise StageCDecisionError(
+                "protocol-v4 source binding execution mode is not exact"
+            )
+        expected_count = 31 if mode == "pilot" else 30
+        if (
+            len(bound_files) != expected_count
+            or not protocol_v4_required_markers.issubset(names)
+        ):
+            raise StageCDecisionError("protocol-v4 source binding file set is not exact")
+        if mode == "pilot":
+            if not isinstance(prior_one_update_smoke, dict):
+                raise StageCDecisionError(
+                    "pilot source binding lacks the one-update smoke prerequisite"
+                )
+            ready_path = str(
+                Path(str(prior_one_update_smoke.get("ready_path", ""))).resolve()
+            )
+            if normalized_files.get(ready_path) != prior_one_update_smoke.get(
+                "ready_sha256"
+            ):
+                raise StageCDecisionError(
+                    "pilot source binding does not hash-bind smoke READY"
+                )
+        elif prior_one_update_smoke is not None:
+            raise StageCDecisionError(
+                "smoke source binding must not contain a self-prerequisite"
+            )
+        return expected_count
     if policy_name in {
         "csl_daily_stage_c_generator_adaptation_decision_policy_v1.json",
         "csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json",
     }:
         if len(bound_files) != 27 or names.intersection(
-            protocol_v2_exclusive_markers | protocol_v3_exclusive_markers
+            protocol_v2_exclusive_markers
+            | protocol_v3_exclusive_markers
+            | protocol_v4_exclusive_markers
         ):
             raise StageCDecisionError("protocol-v1 source binding file set is not exact")
         return 27
@@ -334,11 +408,11 @@ def _validate_pilot_smoke_prerequisite(
             "pilot decision-policy path cannot identify the source root"
         ) from error
     head = str(complete.get("source_git_head", ""))
-    protocol_root = (
-        "protocol_v2_run_r3"
-        if policy_path.name == PROTOCOL_V2_RUN_R3_POLICY_NAME
-        else "protocol_v3_run_r4"
-    )
+    protocol_root = {
+        PROTOCOL_V2_RUN_R3_POLICY_NAME: "protocol_v2_run_r3",
+        PROTOCOL_V3_RUN_R4_POLICY_NAME: "protocol_v3_run_r4",
+        PROTOCOL_V4_RUN_R5_POLICY_NAME: "protocol_v4_run_r5",
+    }[policy_path.name]
     expected_smoke_root = project_root / (
         "experiments/NIAF/continuous_trajectory_field/"
         "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
@@ -902,6 +976,51 @@ def validate_policy(path: Path) -> dict[str, Any]:
                 "same_protocol_retry_authorized": False,
                 "supersedes_protocol": "protocol_v2",
                 "supersedes_run_generation": "run_r3",
+                "zero_science_archive_required": True,
+            }
+            expected_retry_policy = {
+                "malformed_completion": "stop_no_replace",
+                "partial_scientific_output": "stop_no_retry",
+                "unique_complete_execution": "reuse_only_for_publication_recovery",
+                "zero_scientific_output": "stop_no_retry_within_protocol_generation",
+            }
+        elif path.name == PROTOCOL_V4_RUN_R5_POLICY_NAME:
+            expected_recovery_contract = {
+                "allowed_operational_change": (
+                    "correct_only_the_standalone_clone_cpu_test_fixture_evidence_root_binding"
+                ),
+                "downstream_proof_delegation": (
+                    "validation_preserving_execution_safety: CPU READY authenticates "
+                    "the one-time historical proof; downstream reopens only bound "
+                    "hashes and current source/config identities."
+                ),
+                "evidence_manifest": {
+                    "path": (
+                        "NIAF/continuous_trajectory_field/configs/"
+                        "csl_daily_stage_c_generator_adaptation_protocol_v4_run_r5_"
+                        "recovery_evidence_v1.json"
+                    ),
+                    "sha256": "c6ab0d7626622c8163ac1917906ba606b2cc582d09cc8b44fe592008ee727d24",
+                },
+                "incident_archive": {
+                    "path": (
+                        "experiments/NIAF/continuous_trajectory_field/"
+                        "csl_daily_stage_c_generator_adaptation_protocol_v3_run_r4_"
+                        "cpu.invalid_attempts/"
+                        "source_740400412386d60a8d6f56b0f871bc16dee755b0_"
+                        "cpu143593_dependents143594_143596/ARCHIVE.json"
+                    ),
+                    "sha256": "a23682b584bcc05ccee67ccec7526d33efc924104a0ea34209740bb4131e5f71",
+                },
+                "new_protocol_generation_authorized": True,
+                "prior_execution_lease_created": False,
+                "prior_scientific_output_observed": False,
+                "protocol_generation": "protocol_v4",
+                "resume_authorized": False,
+                "run_generation": "run_r5",
+                "same_protocol_retry_authorized": False,
+                "supersedes_protocol": "protocol_v3",
+                "supersedes_run_generation": "run_r4",
                 "zero_science_archive_required": True,
             }
             expected_retry_policy = {

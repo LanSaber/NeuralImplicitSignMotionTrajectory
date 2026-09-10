@@ -34,8 +34,16 @@ PROTOCOL_V3_RUN_R4_POLICY_NAME = (
     "csl_daily_stage_c_generator_adaptation_protocol_v3_run_r4_"
     "decision_policy_v1.json"
 )
+PROTOCOL_V4_RUN_R5_POLICY_NAME = (
+    "csl_daily_stage_c_generator_adaptation_protocol_v4_run_r5_"
+    "decision_policy_v1.json"
+)
 SMOKE_PREREQUISITE_POLICY_NAMES = frozenset(
-    {PROTOCOL_V2_RUN_R3_POLICY_NAME, PROTOCOL_V3_RUN_R4_POLICY_NAME}
+    {
+        PROTOCOL_V2_RUN_R3_POLICY_NAME,
+        PROTOCOL_V3_RUN_R4_POLICY_NAME,
+        PROTOCOL_V4_RUN_R5_POLICY_NAME,
+    }
 )
 PAIR_RE = re.compile(r"pair(0[1-9]|1[0-5])")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")

@@ -5,7 +5,7 @@ runs. Read it before answering an unqualified question such as "What is the
 current training progress?" The scheduler and logs remain the source of truth
 for live state; this registry determines **which run** the question refers to.
 
-Last observed: **2026-09-10 05:37 Asia/Dubai (UTC+04:00)**
+Last observed: **2026-09-10 08:43 Asia/Dubai (UTC+04:00)**
 
 ## Default run resolution
 
@@ -19,7 +19,7 @@ has the highest Slurm job ID or is already in the `RUNNING` state.
 Dataset-qualified requests override that default: "the How2Sign training"
 refers to `how2sign-signtrajfield-v2-full-20260807`, and "the CSL-Daily
 training" refers to
-`csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-protocol-v3-run-r4-20260910`.
+`csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-protocol-v4-run-r5-20260910`.
 
 ## Active prerequisite artifact jobs (not training)
 
@@ -84,20 +84,30 @@ logs/sbatch/csl_rag_neighbors_142745.out
 logs/sbatch/csl_rag_neighbors_142745.err
 ```
 
-## Preregistered CSL-Daily: Stage-C protocol-v3/run-r4 generator-adaptation pilot
+## Preregistered CSL-Daily: Stage-C protocol-v4/run-r5 generator-adaptation pilot
 
-State: fresh development-only/non-authorizing preregistration; no r4 job has
-been submitted. The intended branch is codex/csl-daily-centered-generator-stage-c-v3-run-r4
-and the standalone clone is /media/cvpr/haomian/SignTrajField_centered_stage_c_v3_run_source_r4.
-The terminal zero-science r3 archive is
-experiments/NIAF/continuous_trajectory_field/csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_cpu.invalid_attempts/source_90cad3d3a7a09279b4a882e8c28a13b2a320ec1a_cpu143574_dependents143575_143577/ARCHIVE.json
-(SHA256 66368adf6a2310732a4a2bcca87625d45c8dd51c0c4912b16ceba9b4c12b8dc2,
-11,442 bytes). CPU READY schema v2 binds the one-time 600-second historical
-local-Git proof, separately bounded 120-second remote proof, recovery/config
-audits, archive/policy/manifest, and r4 config hashes. Downstream gates
-reopen those hashes and current source/config bindings only. Frozen science is
-identical to r3. See
-docs/NIAF/continuous_trajectory_field/stage_c_generator_adaptation_protocol_v3_run_r4.md.
+State: implemented and independently audited, development-only/non-authorizing
+preregistration; no r5 job is submitted from this snapshot. The
+dataset-qualified CSL-Daily alias is
+`csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-protocol-v4-run-r5-20260910`.
+R5 is a fresh protocol generation, not a retry: it may correct only the
+standalone-clone CPU-test fixture to use the recovery manifest's canonical
+evidence root. Frozen science, the two-GPU paired-RoCE contract, all runtime
+behavior, data boundaries, and terminal no-retry rules remain unchanged. See
+docs/NIAF/continuous_trajectory_field/stage_c_generator_adaptation_protocol_v4_run_r5.md.
+
+## Terminal CSL-Daily Stage-C protocol-v3/run-r4 zero-science CPU-test failure
+
+| Field | Value |
+|---|---|
+| Alias | `csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-protocol-v3-run-r4-20260910` |
+| State | **Terminal zero-science CPU-test failure.** CPU job 143593 failed after compileall, Ruff, and the repository test suite reported one fixture-only failure; it published no CPU READY. Calibration 143594 and two-GPU smoke/pilot 143595--143596 were dependency-cancelled with zero runtime/allocation |
+| Exact source | Standalone clone `/media/cvpr/haomian/SignTrajField_centered_stage_c_v3_run_source_r4`, clean commit/remote `740400412386d60a8d6f56b0f871bc16dee755b0`, tree `23613b49d5ac9d9ac1c9ec0ef17320b6e80d5249` |
+| Failure | `test_protocol_v3_archived_clone_timeout_is_split_and_runtime_skips_it` supplied the standalone clone as `evidence_root`; the manifest correctly requires the canonical shared evidence root. This does not implicate the runtime scripts, which pass the canonical root |
+| Scientific/access boundary | No calibration, data/neighbor-table open, lease, GPU allocation, optimizer update, validation batch, trainer, output, confirmation/test access, or W&B activity. The source checkpoint and all scientific settings were not executed |
+| Incident archive | `...csl_daily_stage_c_generator_adaptation_protocol_v3_run_r4_cpu.invalid_attempts/source_740400412386d60a8d6f56b0f871bc16dee755b0_cpu143593_dependents143594_143596/ARCHIVE.json`, SHA256 `a23682b584bcc05ccee67ccec7526d33efc924104a0ea34209740bb4131e5f71`, 11,168 bytes |
+| Authorization | None. R4 cannot resume, retry, or seed an execution. Only a separately preregistered protocol-v4/run-r5 source can repair the CPU-test fixture, preserving the frozen science |
+| Runbook | `docs/NIAF/continuous_trajectory_field/stage_c_generator_adaptation_protocol_v3_run_r4.md` |
 
 ## Terminal CSL-Daily Stage-C protocol-v2/run-r3 zero-science preflight failure
 

@@ -45,6 +45,12 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _canonical_evidence_root() -> Path:
+    return Path(
+        json.loads(RECOVERY.read_text(encoding="utf-8"))["canonical_evidence_root"]
+    )
+
+
 def _normalized(config: dict) -> dict:
     value = copy.deepcopy(config)
     value.pop("experiment_name")
@@ -163,7 +169,7 @@ def test_protocol_v3_archived_clone_timeout_is_split_and_runtime_skips_it(
         policy_path=POLICY,
         recovery_manifest=RECOVERY,
         source_root=ROOT,
-        evidence_root=ROOT,
+        evidence_root=_canonical_evidence_root(),
     )
     assert runtime_audit["historical_clone_metadata_checked_in_cpu_gate"] is False
     assert runtime_audit["audit_identity"]
