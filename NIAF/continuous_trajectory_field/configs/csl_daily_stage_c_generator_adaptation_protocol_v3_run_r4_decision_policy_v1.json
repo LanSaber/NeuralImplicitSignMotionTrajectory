@@ -78,7 +78,7 @@
     "downstream_proof_delegation": "validation_preserving_execution_safety: CPU READY authenticates the one-time historical proof; downstream reopens only bound hashes and current source/config identities.",
     "evidence_manifest": {
       "path": "NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_protocol_v3_run_r4_recovery_evidence_v1.json",
-      "sha256": "6bed45c22b0be8fa4234db0ad5677d9ed75d4724343f70938daea0c7e1af4922"
+      "sha256": "90383a1a5be787e946a4a1fba3e31e9673e07edc76ec77a1a7573e2800e5913c"
     },
     "incident_archive": {
       "path": "experiments/NIAF/continuous_trajectory_field/csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_cpu.invalid_attempts/source_90cad3d3a7a09279b4a882e8c28a13b2a320ec1a_cpu143574_dependents143575_143577/ARCHIVE.json",

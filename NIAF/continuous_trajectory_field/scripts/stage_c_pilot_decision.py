@@ -878,7 +878,7 @@ def validate_policy(path: Path) -> dict[str, Any]:
                         "recovery_evidence_v1.json"
                     ),
                     "sha256": (
-                        "6bed45c22b0be8fa4234db0ad5677d9ed75d4724343f70938daea0c7e1af4922"
+                        "90383a1a5be787e946a4a1fba3e31e9673e07edc76ec77a1a7573e2800e5913c"
                     ),
                 },
                 "incident_archive": {
