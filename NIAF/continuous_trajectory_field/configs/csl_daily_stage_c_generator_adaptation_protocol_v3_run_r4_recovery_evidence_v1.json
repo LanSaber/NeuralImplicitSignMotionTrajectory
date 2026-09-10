@@ -1,0 +1,104 @@
+{
+  "authorization": {
+    "confirmation_manifest_opened": false,
+    "development_only": true,
+    "longer_run_authorized": false,
+    "non_authorizing": true,
+    "promotion_eligible": false,
+    "test_data_accessed": false
+  },
+  "canonical_evidence_root": "/media/cvpr/haomian/NeuralImplicitSignMotionTrajectory",
+  "incident_archive": {
+    "path": "experiments/NIAF/continuous_trajectory_field/csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_cpu.invalid_attempts/source_90cad3d3a7a09279b4a882e8c28a13b2a320ec1a_cpu143574_dependents143575_143577/ARCHIVE.json",
+    "sha256": "66368adf6a2310732a4a2bcca87625d45c8dd51c0c4912b16ceba9b4c12b8dc2",
+    "bytes": 11442,
+    "schema_name": "signtrajfield_stage_c_generator_adaptation_terminal_incident_archive",
+    "schema_version": 3,
+    "required_absent_path_count": 13
+  },
+  "new_protocol": {
+    "allowed_operational_change": "increase_only_the_bounded_archived_clone_local_git_metadata_timeout",
+    "calibration_source_file_profile": "stage_c_generator_adaptation_protocol_v3_run_r4",
+    "downstream_proof_delegation": "validation_preserving_execution_safety: CPU READY authenticates the one-time historical proof; downstream reopens only bound hashes and current source/config identities.",
+    "historical_archived_clone_local_git_metadata_timeout_seconds": 600,
+    "historical_remote_ref_timeout_seconds": 120,
+    "protocol_generation": "protocol_v3",
+    "run_generation": "run_r4",
+    "same_protocol_resume_authorized": false,
+    "same_protocol_retry_authorized": false,
+    "scientific_settings_must_equal_protocol_v2_run_r3": true,
+    "source_branch": "codex/csl-daily-centered-generator-stage-c-v3-run-r4",
+    "source_clone": "/media/cvpr/haomian/SignTrajField_centered_stage_c_v3_run_source_r4"
+  },
+  "predecessor_chain": {
+    "run_r1": {
+      "decision_policy_path": "NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_decision_policy_v1.json",
+      "decision_policy_sha256": "728813f4a504b9673eac8f35fc77ed4b19e3e862467bf26cdff8427c9ef0a896",
+      "run_generation": "run_r1",
+      "source_git_head": "a883baf4a0a95b4ebb2007564837c4d9b4f817cc",
+      "source_remote_ref": "origin/codex/csl-daily-centered-generator-stage-c-v1-run-r1"
+    },
+    "run_r2": {
+      "decision_policy_path": "NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json",
+      "decision_policy_sha256": "8eacff17c161127573ad784a77542a089ebc7eca468b7f6bc4ac9263c6a66edc",
+      "recovery_evidence_path": "NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_retry2_recovery_evidence_v1.json",
+      "recovery_evidence_sha256": "ccf47b72390c4be28775b207c67f7372d3cbc599fcddb3545df8295acc88b39b",
+      "run_generation": "run_r2",
+      "source_git_head": "f12b993b5de361423df3b8cbfb4e873f4a95ad1e",
+      "source_remote_ref": "origin/codex/csl-daily-centered-generator-stage-c-v1-run-r2"
+    },
+    "run_r3": {
+      "decision_policy_path": "NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_decision_policy_v1.json",
+      "decision_policy_sha256": "7cc5a9443d0b7b65280b192c7ec64475103590bf2ae7da32dccc3eea667052fe",
+      "recovery_evidence_path": "NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_recovery_evidence_v1.json",
+      "recovery_evidence_sha256": "f955dbc7ce03f5f6a400d8ae2fa21c7ca5a280fec7f7a37da674d35a027e9209",
+      "run_generation": "run_r3",
+      "source_git_head": "90cad3d3a7a09279b4a882e8c28a13b2a320ec1a",
+      "source_remote_ref": "origin/codex/csl-daily-centered-generator-stage-c-v2-run-r3"
+    }
+  },
+  "source_checkpoint": {
+    "epoch": 5,
+    "global_step": 360,
+    "path": "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1/checkpoints/best_infeasible.pt",
+    "selection_status": "best_infeasible",
+    "sha256": "b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202"
+  },
+  "zero_science_boundary": {
+    "calibration_started": false,
+    "compileall_started": false,
+    "cpu_gate_ready_published": false,
+    "data_or_neighbor_table_opened": false,
+    "execution_lease_created": false,
+    "gpu_allocated": false,
+    "optimizer_updates": 0,
+    "pytest_started": false,
+    "ruff_started": false,
+    "scientific_output_observed": false,
+    "trainer_started": false,
+    "validation_batches": 0
+  },
+  "zero_science_runtime_absences": {
+    "arm_roots": [
+      "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_protocol_v2_run_r3",
+      "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_matched_off_protocol_v2_run_r3"
+    ],
+    "prerequisite_calibration_smoke_pilot_roots": [
+      "experiments/NIAF/continuous_trajectory_field/csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_prerequisites/source_90cad3d3a7a09279b4a882e8c28a13b2a320ec1a",
+      "experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_protocol_v2_run_r3",
+      "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_protocol_v2_run_r3_smoke",
+      "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_protocol_v2_run_r3_pilot"
+    ],
+    "six_runtime_logs": [
+      "logs/sbatch/csl_stage_c_protocol_v2_run_r3_calibration_143575.out",
+      "logs/sbatch/csl_stage_c_protocol_v2_run_r3_calibration_143575.err",
+      "logs/sbatch/csl_stage_c_protocol_v2_run_r3_smoke_143576.out",
+      "logs/sbatch/csl_stage_c_protocol_v2_run_r3_smoke_143576.err",
+      "logs/sbatch/csl_stage_c_protocol_v2_run_r3_pilot_143577.out",
+      "logs/sbatch/csl_stage_c_protocol_v2_run_r3_pilot_143577.err"
+    ],
+    "confirmation_holdout_spend_marker": "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_factorized_ordered_v1_control/confirmation_holdout_spent.json"
+  },
+  "schema_name": "signtrajfield_stage_c_protocol_v3_run_r4_recovery_evidence",
+  "schema_version": 1
+}

@@ -19,7 +19,7 @@ has the highest Slurm job ID or is already in the `RUNNING` state.
 Dataset-qualified requests override that default: "the How2Sign training"
 refers to `how2sign-signtrajfield-v2-full-20260807`, and "the CSL-Daily
 training" refers to
-`csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-protocol-v2-run-r3-20260910`.
+`csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-protocol-v3-run-r4-20260910`.
 
 ## Active prerequisite artifact jobs (not training)
 
@@ -84,12 +84,27 @@ logs/sbatch/csl_rag_neighbors_142745.out
 logs/sbatch/csl_rag_neighbors_142745.err
 ```
 
-## Preregistered CSL-Daily: Stage-C protocol-v2/run-r3 generator-adaptation pilot
+## Preregistered CSL-Daily: Stage-C protocol-v3/run-r4 generator-adaptation pilot
+
+State: fresh development-only/non-authorizing preregistration; no r4 job has
+been submitted. The intended branch is codex/csl-daily-centered-generator-stage-c-v3-run-r4
+and the standalone clone is /media/cvpr/haomian/SignTrajField_centered_stage_c_v3_run_source_r4.
+The terminal zero-science r3 archive is
+experiments/NIAF/continuous_trajectory_field/csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_cpu.invalid_attempts/source_90cad3d3a7a09279b4a882e8c28a13b2a320ec1a_cpu143574_dependents143575_143577/ARCHIVE.json
+(SHA256 66368adf6a2310732a4a2bcca87625d45c8dd51c0c4912b16ceba9b4c12b8dc2,
+11,442 bytes). CPU READY schema v2 binds the one-time 600-second historical
+local-Git proof, separately bounded 120-second remote proof, recovery/config
+audits, archive/policy/manifest, and r4 config hashes. Downstream gates
+reopen those hashes and current source/config bindings only. Frozen science is
+identical to r3. See
+docs/NIAF/continuous_trajectory_field/stage_c_generator_adaptation_protocol_v3_run_r4.md.
+
+## Terminal CSL-Daily Stage-C protocol-v2/run-r3 zero-science preflight failure
 
 | Field | Value |
 |---|---|
 | Alias | `csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-protocol-v2-run-r3-20260910` |
-| State | **Fresh protocol generation preregistered; no protocol-v2/run-r3 job submitted and no result observed at this registry timestamp.** This is development-only and non-authorizing; it does not amend Stage B or make a checkpoint deployable |
+| State | **Terminal zero-science CPU preflight failure.** CPU job 143574 timed out in archived-clone local Git-status validation before compile, Ruff, pytest, data access, calibration, allocation, or science; dependents 143575--143577 were cancelled with zero runtime/allocation. It cannot resume or retry |
 | Why a new generation | Run-r2 produced one optimizer update and began validation before its evaluator-dispatch failure. Its v1 contract therefore makes that attempt terminal and forbids a retry. Protocol v2 is a wholly fresh generation defined from the operational failure class, without a pilot decision or validation outcome and without changing scientific choices |
 | Exact source | Both arms independently reload the Stage-B epoch-5/global-step-360 `best_infeasible.pt`, SHA256 `b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202`; terminal decision SHA256 `8993f4d7ae61d2ecd2bc41d523c45ab55073c63a061ce24629a564627724f8c5`, identity `7022e30cccac9c597a864dc2884bb35d7ae54894084fe2f24717092c56f03c69`, status `valid_infeasible` |
 | Matched arms | Sequential `memory` (`dropout`, probability `0.25`) and `matched_off` (`off`, probability `1.0`) arms in one allocation; each resets optimizer, epoch/global-step, selection, and RNG state. Paired-corruption training remains disabled |

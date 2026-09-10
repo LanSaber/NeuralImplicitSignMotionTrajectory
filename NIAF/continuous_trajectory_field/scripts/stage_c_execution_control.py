@@ -30,6 +30,13 @@ PROTOCOL_V2_RUN_R3_POLICY_NAME = (
     "csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_"
     "decision_policy_v1.json"
 )
+PROTOCOL_V3_RUN_R4_POLICY_NAME = (
+    "csl_daily_stage_c_generator_adaptation_protocol_v3_run_r4_"
+    "decision_policy_v1.json"
+)
+SMOKE_PREREQUISITE_POLICY_NAMES = frozenset(
+    {PROTOCOL_V2_RUN_R3_POLICY_NAME, PROTOCOL_V3_RUN_R4_POLICY_NAME}
+)
 PAIR_RE = re.compile(r"pair(0[1-9]|1[0-5])")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 BINDING_FIELDS = {
@@ -785,7 +792,7 @@ def _validate_publication(
     decision_path = Path(str(completion.get("decision_path", "")))
     policy_path = Path(str(completion.get("decision_policy_path", "")))
     execution_path = Path(str(completion.get("execution_complete_path", "")))
-    protocol_v2 = policy_path.name == PROTOCOL_V2_RUN_R3_POLICY_NAME
+    protocol_v2 = policy_path.name in SMOKE_PREREQUISITE_POLICY_NAMES
     requires_smoke_prerequisite = protocol_v2 and mode == "pilot"
     if requires_smoke_prerequisite:
         completion_fields.add("prior_one_update_smoke")

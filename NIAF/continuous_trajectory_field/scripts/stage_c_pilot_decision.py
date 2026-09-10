@@ -26,6 +26,13 @@ PROTOCOL_V2_RUN_R3_POLICY_NAME = (
     "csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_"
     "decision_policy_v1.json"
 )
+PROTOCOL_V3_RUN_R4_POLICY_NAME = (
+    "csl_daily_stage_c_generator_adaptation_protocol_v3_run_r4_"
+    "decision_policy_v1.json"
+)
+SMOKE_PREREQUISITE_POLICY_NAMES = frozenset(
+    {PROTOCOL_V2_RUN_R3_POLICY_NAME, PROTOCOL_V3_RUN_R4_POLICY_NAME}
+)
 INVARIANT_KEYS = (
     "selection_joint_tuple_prediction_max_abs",
     "selection_joint_tuple_duration_max_abs",
@@ -171,6 +178,16 @@ def _validate_source_binding_generation(
             "recovery_evidence_v1.json"
         ),
     }
+    protocol_v3_exclusive_markers = {
+        (
+            "csl_daily_stage_c_generator_adaptation_protocol_v3_run_r4_"
+            "decision_policy_v1.json"
+        ),
+        (
+            "csl_daily_stage_c_generator_adaptation_protocol_v3_run_r4_"
+            "recovery_evidence_v1.json"
+        ),
+    }
     protocol_v2_required_markers = protocol_v2_exclusive_markers | {
         (
             "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
@@ -224,11 +241,67 @@ def _validate_source_binding_generation(
                 "smoke source binding must not contain a self-prerequisite"
             )
         return expected_count
+    protocol_v3_required_markers = protocol_v3_exclusive_markers | {
+        (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_memory_protocol_v2_run_r3.yaml"
+        ),
+        (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_matched_off_protocol_v2_run_r3.yaml"
+        ),
+        (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_memory_protocol_v3_run_r4.yaml"
+        ),
+        (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_matched_off_protocol_v3_run_r4.yaml"
+        ),
+        "run_csl_daily_stage_c_generator_adaptation_protocol_v3_run_r4.sh",
+        (
+            "calibrate_csl_daily_stage_c_generator_adaptation_"
+            "protocol_v3_run_r4_sbatch.sh"
+        ),
+        "ARCHIVE.json",
+    }
+    if policy_name == PROTOCOL_V3_RUN_R4_POLICY_NAME:
+        if mode not in EXPECTED_STEPS:
+            raise StageCDecisionError(
+                "protocol-v3 source binding execution mode is not exact"
+            )
+        expected_count = 31 if mode == "pilot" else 30
+        if (
+            len(bound_files) != expected_count
+            or not protocol_v3_required_markers.issubset(names)
+        ):
+            raise StageCDecisionError("protocol-v3 source binding file set is not exact")
+        if mode == "pilot":
+            if not isinstance(prior_one_update_smoke, dict):
+                raise StageCDecisionError(
+                    "pilot source binding lacks the one-update smoke prerequisite"
+                )
+            ready_path = str(
+                Path(str(prior_one_update_smoke.get("ready_path", ""))).resolve()
+            )
+            if normalized_files.get(ready_path) != prior_one_update_smoke.get(
+                "ready_sha256"
+            ):
+                raise StageCDecisionError(
+                    "pilot source binding does not hash-bind smoke READY"
+                )
+        elif prior_one_update_smoke is not None:
+            raise StageCDecisionError(
+                "smoke source binding must not contain a self-prerequisite"
+            )
+        return expected_count
     if policy_name in {
         "csl_daily_stage_c_generator_adaptation_decision_policy_v1.json",
         "csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json",
     }:
-        if len(bound_files) != 27 or names.intersection(protocol_v2_exclusive_markers):
+        if len(bound_files) != 27 or names.intersection(
+            protocol_v2_exclusive_markers | protocol_v3_exclusive_markers
+        ):
             raise StageCDecisionError("protocol-v1 source binding file set is not exact")
         return 27
     raise StageCDecisionError("source binding decision policy is not registered")
@@ -250,9 +323,9 @@ def _validate_pilot_smoke_prerequisite(
     if not isinstance(policy_binding, dict):
         raise StageCDecisionError("pilot decision-policy binding is malformed")
     policy_path = Path(str(policy_binding.get("path", ""))).resolve()
-    if policy_path.name != PROTOCOL_V2_RUN_R3_POLICY_NAME:
+    if policy_path.name not in SMOKE_PREREQUISITE_POLICY_NAMES:
         raise StageCDecisionError(
-            "one-update smoke prerequisite is restricted to protocol-v2/run-r3"
+            "one-update smoke prerequisite is restricted to registered protocols"
         )
     try:
         project_root = policy_path.parents[3]
@@ -261,14 +334,19 @@ def _validate_pilot_smoke_prerequisite(
             "pilot decision-policy path cannot identify the source root"
         ) from error
     head = str(complete.get("source_git_head", ""))
+    protocol_root = (
+        "protocol_v2_run_r3"
+        if policy_path.name == PROTOCOL_V2_RUN_R3_POLICY_NAME
+        else "protocol_v3_run_r4"
+    )
     expected_smoke_root = project_root / (
         "experiments/NIAF/continuous_trajectory_field/"
         "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
-        "adaptation_protocol_v2_run_r3_smoke"
+        f"adaptation_{protocol_root}_smoke"
     )
     expected_ready = project_root / (
         "experiments/NIAF/continuous_trajectory_field/"
-        "csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_"
+        f"csl_daily_stage_c_generator_adaptation_{protocol_root}_"
         f"prerequisites/source_{head}/smoke/PUBLICATION/READY"
     )
     if (
@@ -424,7 +502,7 @@ def _validate_network_evidence(
     decision_policy_path = Path(
         str((complete.get("decision_policy") or {}).get("path", ""))
     )
-    protocol_v2 = decision_policy_path.name == PROTOCOL_V2_RUN_R3_POLICY_NAME
+    protocol_v2 = decision_policy_path.name in SMOKE_PREREQUISITE_POLICY_NAMES
     if protocol_v2:
         source_binding_fields.add("execution_mode")
         if mode == "pilot":
@@ -783,6 +861,55 @@ def validate_policy(path: Path) -> dict[str, Any]:
                 "unique_complete_execution": "reuse_only_for_publication_recovery",
                 "zero_scientific_output": "stop_no_retry_within_protocol_generation",
             }
+        elif path.name == PROTOCOL_V3_RUN_R4_POLICY_NAME:
+            expected_recovery_contract = {
+                "allowed_operational_change": (
+                    "increase_only_the_bounded_archived_clone_local_git_metadata_timeout"
+                ),
+                "downstream_proof_delegation": (
+                    "validation_preserving_execution_safety: CPU READY authenticates "
+                    "the one-time historical proof; downstream reopens only bound "
+                    "hashes and current source/config identities."
+                ),
+                "evidence_manifest": {
+                    "path": (
+                        "NIAF/continuous_trajectory_field/configs/"
+                        "csl_daily_stage_c_generator_adaptation_protocol_v3_run_r4_"
+                        "recovery_evidence_v1.json"
+                    ),
+                    "sha256": (
+                        "6bed45c22b0be8fa4234db0ad5677d9ed75d4724343f70938daea0c7e1af4922"
+                    ),
+                },
+                "incident_archive": {
+                    "path": (
+                        "experiments/NIAF/continuous_trajectory_field/"
+                        "csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_"
+                        "cpu.invalid_attempts/"
+                        "source_90cad3d3a7a09279b4a882e8c28a13b2a320ec1a_"
+                        "cpu143574_dependents143575_143577/ARCHIVE.json"
+                    ),
+                    "sha256": (
+                        "66368adf6a2310732a4a2bcca87625d45c8dd51c0c4912b16ceba9b4c12b8dc2"
+                    ),
+                },
+                "new_protocol_generation_authorized": True,
+                "prior_execution_lease_created": False,
+                "prior_scientific_output_observed": False,
+                "protocol_generation": "protocol_v3",
+                "resume_authorized": False,
+                "run_generation": "run_r4",
+                "same_protocol_retry_authorized": False,
+                "supersedes_protocol": "protocol_v2",
+                "supersedes_run_generation": "run_r3",
+                "zero_science_archive_required": True,
+            }
+            expected_retry_policy = {
+                "malformed_completion": "stop_no_replace",
+                "partial_scientific_output": "stop_no_retry",
+                "unique_complete_execution": "reuse_only_for_publication_recovery",
+                "zero_scientific_output": "stop_no_retry_within_protocol_generation",
+            }
         else:
             raise StageCDecisionError("Stage-C recovery policy path changed")
         if recovery_contract != expected_recovery_contract:
@@ -821,10 +948,7 @@ def validate_policy(path: Path) -> dict[str, Any]:
         "smoke_train_max_batches": 2,
         "world_size": 2,
     }
-    if path.name == (
-        "csl_daily_stage_c_generator_adaptation_protocol_v2_run_r3_"
-        "decision_policy_v1.json"
-    ):
+    if path.name in SMOKE_PREREQUISITE_POLICY_NAMES:
         expected_execution.update(
             {
                 "pilot_requires_prior_one_update_smoke_ready": True,
@@ -1239,7 +1363,7 @@ def _validate_current_execution_scope(
     policy_path = Path(
         str((complete.get("decision_policy") or {}).get("path", ""))
     )
-    if policy_path.name == PROTOCOL_V2_RUN_R3_POLICY_NAME:
+    if policy_path.name in SMOKE_PREREQUISITE_POLICY_NAMES:
         mode = complete.get("execution_mode")
         if mode == "pilot":
             prior_smoke = complete.get("prior_one_update_smoke")
@@ -1521,7 +1645,7 @@ def make_decision(
         "confirmation_manifest_opened": False,
         "test_data_accessed": False,
     }
-    if policy_path.name == PROTOCOL_V2_RUN_R3_POLICY_NAME and mode == "pilot":
+    if policy_path.name in SMOKE_PREREQUISITE_POLICY_NAMES and mode == "pilot":
         payload["prior_one_update_smoke"] = complete["prior_one_update_smoke"]
     return {**payload, "decision_identity": digest_json(payload)}
 
