@@ -31,6 +31,7 @@ SOURCE_FILE_PROFILES = {
     "stage_c_generator_adaptation_protocol_v2_run_r3",
     "stage_c_generator_adaptation_protocol_v3_run_r4",
     "stage_c_generator_adaptation_protocol_v4_run_r5",
+    "stage_c_generator_adaptation_protocol_v5_run_r6",
 }
 TERMINAL_STATES = {
     "BOOT_FAIL",

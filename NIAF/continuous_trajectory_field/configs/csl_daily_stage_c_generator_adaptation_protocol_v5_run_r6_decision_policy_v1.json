@@ -1,0 +1,132 @@
+{
+  "authorization": {
+    "authorized_purpose": null,
+    "confirmation_manifest_opened": false,
+    "development_only": true,
+    "non_authorizing": true,
+    "promotion_eligible": false,
+    "test_data_accessed": false
+  },
+  "execution": {
+    "arms": [
+      "memory",
+      "matched_off"
+    ],
+    "accumulation_steps": 2,
+    "batch_per_rank": 64,
+    "effective_global_batch": 256,
+    "expected_epoch": 1,
+    "expected_global_step": {
+      "pilot": 72,
+      "smoke": 1
+    },
+    "full_pilot_data_limit_train": 0,
+    "full_pilot_data_limit_val": 0,
+    "full_pilot_drop_last": false,
+    "full_pilot_eval_max_batches": 0,
+    "full_pilot_length_bucketed_batches": true,
+    "full_pilot_train_max_batches": 0,
+    "pilot_requires_prior_one_update_smoke_ready": true,
+    "smoke_eval_max_batches": 1,
+    "smoke_requires_prior_one_update_smoke_ready": false,
+    "smoke_train_max_batches": 2,
+    "world_size": 2
+  },
+  "invariant_metric_keys": [
+    "selection_joint_tuple_prediction_max_abs",
+    "selection_joint_tuple_duration_max_abs",
+    "selection_uniform_final_vs_off_prediction_max_abs",
+    "selection_uniform_final_vs_off_duration_max_abs",
+    "selection_broadcast_complete_vs_off_prediction_max_abs",
+    "selection_broadcast_complete_vs_off_duration_max_abs",
+    "selection_all_null_vs_off_prediction_max_abs",
+    "selection_all_null_vs_off_duration_max_abs",
+    "selection_all_null_gate_max_abs",
+    "selection_all_null_candidate_mass_max_abs",
+    "selection_all_null_one_minus_null_mass_max_abs"
+  ],
+  "metric_keys": {
+    "correct_score": "selection_correct_score",
+    "correct_vs_off_relative_gain": "selection_relative_gain_over_off",
+    "lhand_negative_degradation_vs_off": "selection_lhand_negative_degradation_vs_off",
+    "live_off_allowed_score": "selection_stage_c_text_only_guard_allowed_text_only_score",
+    "live_off_guard_max_relative_degradation": "selection_stage_c_text_only_guard_max_relative_degradation",
+    "live_off_guard_passed": "selection_stage_c_text_only_guard_passed",
+    "live_off_score": "selection_stage_c_text_only_guard_live_text_only_score",
+    "live_off_teacher_score": "selection_stage_c_text_only_guard_teacher_score",
+    "off_score": "selection_off_score",
+    "rpair": "selection_Rpair",
+    "rpair_n0": "selection_Rpair_n0",
+    "rpair_n1": "selection_Rpair_n1",
+    "rpair_n2": "selection_Rpair_n2",
+    "rhand_negative_degradation_vs_off": "selection_rhand_negative_degradation_vs_off",
+    "selection_score": "selection_score"
+  },
+  "pilot_thresholds": {
+    "correct_score_minimum_relative_improvement_over_matched_off": 0.001,
+    "correct_score_minimum_relative_improvement_over_source": 0.001,
+    "correct_vs_off_minimum_relative_gain": 0.001,
+    "invariant_exact_value": 0,
+    "lhand_negative_degradation_vs_off_minimum": -0.02,
+    "live_off_maximum_relative_degradation_over_source": 0.005,
+    "rpair_minimum": 0.1,
+    "rpair_nonce_minimum": 0.05,
+    "rhand_negative_degradation_vs_off_minimum": -0.02
+  },
+  "recovery_contract": {
+    "allowed_operational_change": "normalize_only_resolved_source_provenance.declared_contract.arm_and_its_derived_digest_in_the_general_arm_config_equivalence_check",
+    "downstream_proof_delegation": "validation_preserving_execution_safety: CPU READY authenticates the one-time historical proof; downstream reopens only bound hashes and current source/config identities.",
+    "evidence_manifest": {
+      "path": "NIAF/continuous_trajectory_field/configs/csl_daily_stage_c_generator_adaptation_protocol_v5_run_r6_recovery_evidence_v1.json",
+      "sha256": "c35a337592a00d6eab24ed57ae03c095d8ccd1cacbed035bc02a621a7476d8d7"
+    },
+    "incident_archive": {
+      "path": "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_protocol_v4_run_r5_smoke.invalid_attempts/source_36d121dd361df2c08616031bd7c2076d85da78d0_smoke143609_pilot143610/ARCHIVE.json",
+      "sha256": "9c4e2213ca51941b41281f0b869fc66aa4e440df846ff57dee2731fca5f1c41a"
+    },
+    "new_protocol_generation_authorized": true,
+    "prior_execution_lease_created": true,
+    "prior_optimizer_updates_per_arm": {
+      "memory": 1,
+      "matched_off": 1
+    },
+    "prior_scientific_output_observed": true,
+    "prior_smoke_decision_published": false,
+    "protocol_generation": "protocol_v5",
+    "r5_artifact_reuse_authorized": false,
+    "resume_authorized": false,
+    "run_generation": "run_r6",
+    "same_protocol_retry_authorized": false,
+    "supersedes_protocol": "protocol_v4",
+    "supersedes_run_generation": "run_r5",
+    "terminal_partial_science_archive_required": true
+  },
+  "retry_policy": {
+    "malformed_completion": "stop_no_replace",
+    "partial_scientific_output": "stop_no_retry",
+    "unique_complete_execution": "reuse_only_for_publication_recovery",
+    "zero_scientific_output": "stop_no_retry_within_protocol_generation"
+  },
+  "schema_name": "signtrajfield_stage_c_generator_adaptation_decision_policy",
+  "schema_version": 1,
+  "source_checkpoint": {
+    "epoch": 5,
+    "global_step": 360,
+    "selection_status": "best_infeasible",
+    "sha256": "b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202"
+  },
+  "status_values": {
+    "failure": {
+      "next_permitted_action": "none",
+      "status": "stop"
+    },
+    "pilot_success": {
+      "next_permitted_action": "none_requires_fresh_preregistration_without_pilot_outcome_access",
+      "status": "pilot_complete_development_signal"
+    },
+    "smoke_success": {
+      "next_permitted_action": "run_one_epoch_development_pilot",
+      "status": "smoke_ready"
+    }
+  }
+}

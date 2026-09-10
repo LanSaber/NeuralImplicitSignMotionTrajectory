@@ -1,0 +1,111 @@
+{
+  "authorization": {
+    "confirmation_manifest_opened": false,
+    "development_only": true,
+    "longer_run_authorized": false,
+    "non_authorizing": true,
+    "promotion_eligible": false,
+    "test_data_accessed": false
+  },
+  "canonical_evidence_root": "/media/cvpr/haomian/NeuralImplicitSignMotionTrajectory",
+  "fresh_namespace_roots": {
+    "calibration": "experiments/NIAF/continuous_trajectory_field/csl_daily_sentence_memory_relevance_calibration_stage_c_generator_adaptation_protocol_v5_run_r6",
+    "matched_off_arm": "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_matched_off_protocol_v5_run_r6",
+    "memory_arm": "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_memory_protocol_v5_run_r6",
+    "pilot": "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_protocol_v5_run_r6_pilot",
+    "prerequisites": "experiments/NIAF/continuous_trajectory_field/csl_daily_stage_c_generator_adaptation_protocol_v5_run_r6_prerequisites",
+    "smoke": "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_protocol_v5_run_r6_smoke"
+  },
+  "historical_evidence_contract": {
+    "artifact_trees": {
+      "calibration_artifact": {
+        "file_count": 3,
+        "total_bytes": 6581079,
+        "tree_sha256": "bf610d4111575305cf280611b3aadaf0dd5f683fdc614f311954256fe8cc618b"
+      },
+      "run_prerequisites": {
+        "file_count": 11,
+        "total_bytes": 14925,
+        "tree_sha256": "57783a9cbba3956072ed293c4c1cc2a8f1a2df31f9bd81c266f2ee341bc0d9a3"
+      },
+      "smoke_attempt": {
+        "file_count": 47,
+        "total_bytes": 162694967,
+        "tree_sha256": "b3bcbe35bc38d6d43567eb885ca49a10e50ad95531e67342f82c06dd4ca4ff5e"
+      }
+    },
+    "full_rehash_required_in_cpu_gate": true,
+    "incident_log_count": 6,
+    "required_absent_path_count": 10,
+    "source_file_count": 13
+  },
+  "incident_archive": {
+    "artifact_tree_count": 3,
+    "bytes": 39609,
+    "path": "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_protocol_v4_run_r5_smoke.invalid_attempts/source_36d121dd361df2c08616031bd7c2076d85da78d0_smoke143609_pilot143610/ARCHIVE.json",
+    "required_absent_path_count": 10,
+    "schema_name": "signtrajfield_stage_c_generator_adaptation_terminal_incident_archive",
+    "schema_version": 4,
+    "sha256": "9c4e2213ca51941b41281f0b869fc66aa4e440df846ff57dee2731fca5f1c41a"
+  },
+  "new_protocol": {
+    "allowed_operational_change": "normalize_only_resolved_source_provenance.declared_contract.arm_and_its_derived_digest_in_the_general_arm_config_equivalence_check",
+    "calibration_source_file_profile": "stage_c_generator_adaptation_protocol_v5_run_r6",
+    "downstream_proof_delegation": "validation_preserving_execution_safety: CPU READY authenticates the one-time historical proof; downstream reopens only bound hashes and current source/config identities.",
+    "fresh_calibration_required": true,
+    "historical_archived_clone_local_git_metadata_timeout_seconds": 600,
+    "historical_remote_ref_timeout_seconds": 120,
+    "protocol_generation": "protocol_v5",
+    "r5_calibration_or_checkpoint_reuse_authorized": false,
+    "run_generation": "run_r6",
+    "same_protocol_resume_authorized": false,
+    "same_protocol_retry_authorized": false,
+    "scientific_settings_must_equal_protocol_v4_run_r5": true,
+    "source_branch": "codex/csl-daily-centered-generator-stage-c-v5-run-r6",
+    "source_clone": "/media/cvpr/haomian/SignTrajField_centered_stage_c_v5_run_source_r6"
+  },
+  "predecessor_chain": {
+    "run_r3": {
+      "run_generation": "run_r3",
+      "source_git_head": "90cad3d3a7a09279b4a882e8c28a13b2a320ec1a",
+      "source_remote_ref": "origin/codex/csl-daily-centered-generator-stage-c-v2-run-r3"
+    },
+    "run_r4": {
+      "incident_archive_path": "experiments/NIAF/continuous_trajectory_field/csl_daily_stage_c_generator_adaptation_protocol_v3_run_r4_cpu.invalid_attempts/source_740400412386d60a8d6f56b0f871bc16dee755b0_cpu143593_dependents143594_143596/ARCHIVE.json",
+      "incident_archive_sha256": "a23682b584bcc05ccee67ccec7526d33efc924104a0ea34209740bb4131e5f71",
+      "run_generation": "run_r4",
+      "source_git_head": "740400412386d60a8d6f56b0f871bc16dee755b0",
+      "source_remote_ref": "origin/codex/csl-daily-centered-generator-stage-c-v3-run-r4"
+    },
+    "run_r5": {
+      "incident_archive_path": "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_adaptation_protocol_v4_run_r5_smoke.invalid_attempts/source_36d121dd361df2c08616031bd7c2076d85da78d0_smoke143609_pilot143610/ARCHIVE.json",
+      "incident_archive_sha256": "9c4e2213ca51941b41281f0b869fc66aa4e440df846ff57dee2731fca5f1c41a",
+      "run_generation": "run_r5",
+      "source_git_head": "36d121dd361df2c08616031bd7c2076d85da78d0",
+      "source_remote_ref": "origin/codex/csl-daily-centered-generator-stage-c-v4-run-r5",
+      "status": "terminal_post_arm_smoke_decision_validation_failure"
+    }
+  },
+  "prior_scientific_boundary": {
+    "both_smoke_arms_completed": true,
+    "matched_off_optimizer_updates_observed": 1,
+    "memory_optimizer_updates_observed": 1,
+    "pilot_allocated": false,
+    "pilot_started": false,
+    "prior_execution_lease_created": true,
+    "prior_scientific_output_observed": true,
+    "smoke_complete_artifact_published": true,
+    "smoke_decision_completed": false,
+    "smoke_publication_ready_published": false,
+    "validation_modes_per_arm": 11
+  },
+  "source_checkpoint": {
+    "epoch": 5,
+    "global_step": 360,
+    "path": "experiments/NIAF/continuous_trajectory_field/csl_daily_signtrajfield_v3_sentence_memory_phase_a_centered_absolute_binding_motion_contrast_v1/checkpoints/best_infeasible.pt",
+    "selection_status": "best_infeasible",
+    "sha256": "b37f000ccaaa4d952c3afc5faf7d5f776c18fae21c7addd753c1f7d83bb2b202"
+  },
+  "schema_name": "signtrajfield_stage_c_protocol_v5_run_r6_recovery_evidence",
+  "schema_version": 1
+}

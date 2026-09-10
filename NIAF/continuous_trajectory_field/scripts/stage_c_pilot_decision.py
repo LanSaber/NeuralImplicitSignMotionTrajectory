@@ -34,11 +34,16 @@ PROTOCOL_V4_RUN_R5_POLICY_NAME = (
     "csl_daily_stage_c_generator_adaptation_protocol_v4_run_r5_"
     "decision_policy_v1.json"
 )
+PROTOCOL_V5_RUN_R6_POLICY_NAME = (
+    "csl_daily_stage_c_generator_adaptation_protocol_v5_run_r6_"
+    "decision_policy_v1.json"
+)
 SMOKE_PREREQUISITE_POLICY_NAMES = frozenset(
     {
         PROTOCOL_V2_RUN_R3_POLICY_NAME,
         PROTOCOL_V3_RUN_R4_POLICY_NAME,
         PROTOCOL_V4_RUN_R5_POLICY_NAME,
+        PROTOCOL_V5_RUN_R6_POLICY_NAME,
     }
 )
 INVARIANT_KEYS = (
@@ -206,6 +211,16 @@ def _validate_source_binding_generation(
             "recovery_evidence_v1.json"
         ),
     }
+    protocol_v5_exclusive_markers = {
+        (
+            "csl_daily_stage_c_generator_adaptation_protocol_v5_run_r6_"
+            "decision_policy_v1.json"
+        ),
+        (
+            "csl_daily_stage_c_generator_adaptation_protocol_v5_run_r6_"
+            "recovery_evidence_v1.json"
+        ),
+    }
     protocol_v2_required_markers = protocol_v2_exclusive_markers | {
         (
             "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
@@ -367,6 +382,60 @@ def _validate_source_binding_generation(
                 "smoke source binding must not contain a self-prerequisite"
             )
         return expected_count
+    protocol_v5_required_markers = protocol_v5_exclusive_markers | {
+        (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_memory_protocol_v2_run_r3.yaml"
+        ),
+        (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_matched_off_protocol_v2_run_r3.yaml"
+        ),
+        (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_memory_protocol_v5_run_r6.yaml"
+        ),
+        (
+            "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+            "adaptation_matched_off_protocol_v5_run_r6.yaml"
+        ),
+        "run_csl_daily_stage_c_generator_adaptation_protocol_v5_run_r6.sh",
+        (
+            "calibrate_csl_daily_stage_c_generator_adaptation_"
+            "protocol_v5_run_r6_sbatch.sh"
+        ),
+        "ARCHIVE.json",
+    }
+    if policy_name == PROTOCOL_V5_RUN_R6_POLICY_NAME:
+        if mode not in EXPECTED_STEPS:
+            raise StageCDecisionError(
+                "protocol-v5 source binding execution mode is not exact"
+            )
+        expected_count = 31 if mode == "pilot" else 30
+        if (
+            len(bound_files) != expected_count
+            or not protocol_v5_required_markers.issubset(names)
+        ):
+            raise StageCDecisionError("protocol-v5 source binding file set is not exact")
+        if mode == "pilot":
+            if not isinstance(prior_one_update_smoke, dict):
+                raise StageCDecisionError(
+                    "pilot source binding lacks the one-update smoke prerequisite"
+                )
+            ready_path = str(
+                Path(str(prior_one_update_smoke.get("ready_path", ""))).resolve()
+            )
+            if normalized_files.get(ready_path) != prior_one_update_smoke.get(
+                "ready_sha256"
+            ):
+                raise StageCDecisionError(
+                    "pilot source binding does not hash-bind smoke READY"
+                )
+        elif prior_one_update_smoke is not None:
+            raise StageCDecisionError(
+                "smoke source binding must not contain a self-prerequisite"
+            )
+        return expected_count
     if policy_name in {
         "csl_daily_stage_c_generator_adaptation_decision_policy_v1.json",
         "csl_daily_stage_c_generator_adaptation_decision_policy_retry2_v1.json",
@@ -375,6 +444,7 @@ def _validate_source_binding_generation(
             protocol_v2_exclusive_markers
             | protocol_v3_exclusive_markers
             | protocol_v4_exclusive_markers
+            | protocol_v5_exclusive_markers
         ):
             raise StageCDecisionError("protocol-v1 source binding file set is not exact")
         return 27
@@ -412,6 +482,7 @@ def _validate_pilot_smoke_prerequisite(
         PROTOCOL_V2_RUN_R3_POLICY_NAME: "protocol_v2_run_r3",
         PROTOCOL_V3_RUN_R4_POLICY_NAME: "protocol_v3_run_r4",
         PROTOCOL_V4_RUN_R5_POLICY_NAME: "protocol_v4_run_r5",
+        PROTOCOL_V5_RUN_R6_POLICY_NAME: "protocol_v5_run_r6",
     }[policy_path.name]
     expected_smoke_root = project_root / (
         "experiments/NIAF/continuous_trajectory_field/"
@@ -1029,6 +1100,64 @@ def validate_policy(path: Path) -> dict[str, Any]:
                 "unique_complete_execution": "reuse_only_for_publication_recovery",
                 "zero_scientific_output": "stop_no_retry_within_protocol_generation",
             }
+        elif path.name == PROTOCOL_V5_RUN_R6_POLICY_NAME:
+            expected_recovery_contract = {
+                "allowed_operational_change": (
+                    "normalize_only_resolved_source_provenance.declared_contract.arm_"
+                    "and_its_derived_digest_in_the_general_arm_config_equivalence_check"
+                ),
+                "downstream_proof_delegation": (
+                    "validation_preserving_execution_safety: CPU READY authenticates "
+                    "the one-time historical proof; downstream reopens only bound "
+                    "hashes and current source/config identities."
+                ),
+                "evidence_manifest": {
+                    "path": (
+                        "NIAF/continuous_trajectory_field/configs/"
+                        "csl_daily_stage_c_generator_adaptation_protocol_v5_run_r6_"
+                        "recovery_evidence_v1.json"
+                    ),
+                    "sha256": (
+                        "c35a337592a00d6eab24ed57ae03c095d8ccd1cacbed035b"
+                        "c02a621a7476d8d7"
+                    ),
+                },
+                "incident_archive": {
+                    "path": (
+                        "experiments/NIAF/continuous_trajectory_field/"
+                        "csl_daily_signtrajfield_v3_sentence_memory_stage_c_generator_"
+                        "adaptation_protocol_v4_run_r5_smoke.invalid_attempts/"
+                        "source_36d121dd361df2c08616031bd7c2076d85da78d0_"
+                        "smoke143609_pilot143610/ARCHIVE.json"
+                    ),
+                    "sha256": (
+                        "9c4e2213ca51941b41281f0b869fc66aa4e440df846ff57d"
+                        "ee2731fca5f1c41a"
+                    ),
+                },
+                "new_protocol_generation_authorized": True,
+                "prior_execution_lease_created": True,
+                "prior_optimizer_updates_per_arm": {
+                    "memory": 1,
+                    "matched_off": 1,
+                },
+                "prior_scientific_output_observed": True,
+                "prior_smoke_decision_published": False,
+                "protocol_generation": "protocol_v5",
+                "r5_artifact_reuse_authorized": False,
+                "resume_authorized": False,
+                "run_generation": "run_r6",
+                "same_protocol_retry_authorized": False,
+                "supersedes_protocol": "protocol_v4",
+                "supersedes_run_generation": "run_r5",
+                "terminal_partial_science_archive_required": True,
+            }
+            expected_retry_policy = {
+                "malformed_completion": "stop_no_replace",
+                "partial_scientific_output": "stop_no_retry",
+                "unique_complete_execution": "reuse_only_for_publication_recovery",
+                "zero_scientific_output": "stop_no_retry_within_protocol_generation",
+            }
         else:
             raise StageCDecisionError("Stage-C recovery policy path changed")
         if recovery_contract != expected_recovery_contract:
@@ -1118,13 +1247,60 @@ def _named_identity(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
-def _normalize_config(value: dict[str, Any]) -> dict[str, Any]:
+def _normalize_config(
+    value: dict[str, Any],
+    *,
+    arm: str,
+    checkpoint_provenance: dict[str, Any],
+) -> dict[str, Any]:
+    if arm not in ARMS:
+        raise StageCDecisionError(f"unknown Stage-C arm for normalization: {arm}")
+    stage_c = value.get("sentence_memory_safety", {}).get("stage_c")
+    if not isinstance(stage_c, dict) or stage_c.get("arm") != arm:
+        raise StageCDecisionError(
+            f"{arm} embedded config has the wrong Stage-C arm"
+        )
+    embedded_provenance = _named_identity(
+        stage_c.get("resolved_source_provenance"),
+        f"{arm}.config.resolved_source_provenance",
+    )
+    authenticated_provenance = _named_identity(
+        checkpoint_provenance,
+        f"{arm}.stage_c_provenance",
+    )
+    for label, provenance in (
+        ("embedded config", embedded_provenance),
+        ("checkpoint", authenticated_provenance),
+    ):
+        declared_contract = provenance.get("declared_contract")
+        if (
+            not isinstance(declared_contract, dict)
+            or declared_contract.get("arm") != arm
+        ):
+            raise StageCDecisionError(
+                f"{arm} {label} provenance declares the wrong arm"
+            )
+    if embedded_provenance != authenticated_provenance:
+        raise StageCDecisionError(
+            f"{arm} embedded provenance differs from checkpoint provenance"
+        )
+
     result = copy.deepcopy(value)
     result.pop("experiment_name", None)
     result.get("output", {}).pop("out_dir", None)
     result.get("conditioning", {}).pop("sentence_memory_train_mode", None)
     result.get("conditioning", {}).pop("sentence_memory_dropout_probability", None)
-    result.get("sentence_memory_safety", {}).get("stage_c", {}).pop("arm", None)
+    stage_c = result.get("sentence_memory_safety", {}).get("stage_c", {})
+    stage_c.pop("arm", None)
+    resolved_provenance = stage_c["resolved_source_provenance"]
+    resolved_provenance["declared_contract"].pop("arm")
+    resolved_provenance["digest"] = digest_json(
+        {
+            key: copy.deepcopy(item)
+            for key, item in resolved_provenance.items()
+            if key != "digest"
+        }
+    )
     return result
 
 
@@ -1212,6 +1388,14 @@ def _audit_arm_checkpoint(
             "optimizer_mapping": "stage_c_optimizer_parameter_mapping",
         }.items()
     }
+    provenance_contract = identities["provenance"].get("declared_contract")
+    if (
+        not isinstance(provenance_contract, dict)
+        or provenance_contract.get("arm") != arm
+    ):
+        raise StageCDecisionError(
+            f"{arm} checkpoint provenance declares the wrong arm"
+        )
     objective = identities["objective"]
     if (
         objective.get("arm") != arm
@@ -1586,8 +1770,14 @@ def make_decision(
         metrics[arm], identities[arm] = _audit_arm_checkpoint(
             checkpoints[arm], arm=arm, mode=mode
         )
-    if _normalize_config(identities["memory"]["config"]) != _normalize_config(
-        identities["matched_off"]["config"]
+    if _normalize_config(
+        identities["memory"]["config"],
+        arm="memory",
+        checkpoint_provenance=identities["memory"]["provenance"],
+    ) != _normalize_config(
+        identities["matched_off"]["config"],
+        arm="matched_off",
+        checkpoint_provenance=identities["matched_off"]["provenance"],
     ):
         raise StageCDecisionError("Stage-C arm configs differ beyond the approved switch")
     for name in (

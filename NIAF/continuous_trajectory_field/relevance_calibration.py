@@ -53,6 +53,9 @@ STAGE_C_PROTOCOL_V3_RUN_R4_SOURCE_FILE_PROFILE = (
 STAGE_C_PROTOCOL_V4_RUN_R5_SOURCE_FILE_PROFILE = (
     "stage_c_generator_adaptation_protocol_v4_run_r5"
 )
+STAGE_C_PROTOCOL_V5_RUN_R6_SOURCE_FILE_PROFILE = (
+    "stage_c_generator_adaptation_protocol_v5_run_r6"
+)
 STAGE_C_REQUIRED_SOURCE_FILES = frozenset(
     {
         "NIAF/continuous_trajectory_field/relevance_calibration.py",
@@ -98,6 +101,18 @@ STAGE_C_PROTOCOL_V4_RUN_R5_REQUIRED_SOURCE_FILES = frozenset(
         "scripts/NIAF/stage_sentence_memory_train_val_only_node.sh",
     }
 )
+STAGE_C_PROTOCOL_V5_RUN_R6_REQUIRED_SOURCE_FILES = frozenset(
+    {
+        "NIAF/continuous_trajectory_field/relevance_calibration.py",
+        "NIAF/continuous_trajectory_field/scripts/calibrate_sentence_memory_relevance.py",
+        "NIAF/continuous_trajectory_field/scripts/decide_centered_memory_stage.py",
+        (
+            "scripts/NIAF/calibrate_csl_daily_stage_c_generator_adaptation_"
+            "protocol_v5_run_r6_sbatch.sh"
+        ),
+        "scripts/NIAF/stage_sentence_memory_train_val_only_node.sh",
+    }
+)
 SOURCE_FILE_PROFILES = {
     LEGACY_SOURCE_FILE_PROFILE: REQUIRED_SOURCE_FILES,
     STAGE_C_SOURCE_FILE_PROFILE: STAGE_C_REQUIRED_SOURCE_FILES,
@@ -110,6 +125,9 @@ SOURCE_FILE_PROFILES = {
     ),
     STAGE_C_PROTOCOL_V4_RUN_R5_SOURCE_FILE_PROFILE: (
         STAGE_C_PROTOCOL_V4_RUN_R5_REQUIRED_SOURCE_FILES
+    ),
+    STAGE_C_PROTOCOL_V5_RUN_R6_SOURCE_FILE_PROFILE: (
+        STAGE_C_PROTOCOL_V5_RUN_R6_REQUIRED_SOURCE_FILES
     ),
 }
 

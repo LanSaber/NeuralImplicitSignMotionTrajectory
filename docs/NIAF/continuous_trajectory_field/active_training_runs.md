@@ -5,7 +5,7 @@ runs. Read it before answering an unqualified question such as "What is the
 current training progress?" The scheduler and logs remain the source of truth
 for live state; this registry determines **which run** the question refers to.
 
-Last observed: **2026-09-10 08:43 Asia/Dubai (UTC+04:00)**
+Last observed: **2026-09-10 10:38 Asia/Dubai (UTC+04:00)**
 
 ## Default run resolution
 
@@ -19,7 +19,7 @@ has the highest Slurm job ID or is already in the `RUNNING` state.
 Dataset-qualified requests override that default: "the How2Sign training"
 refers to `how2sign-signtrajfield-v2-full-20260807`, and "the CSL-Daily
 training" refers to
-`csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-protocol-v4-run-r5-20260910`.
+`csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-protocol-v5-run-r6-20260910`.
 
 ## Active prerequisite artifact jobs (not training)
 
@@ -84,17 +84,38 @@ logs/sbatch/csl_rag_neighbors_142745.out
 logs/sbatch/csl_rag_neighbors_142745.err
 ```
 
-## Preregistered CSL-Daily: Stage-C protocol-v4/run-r5 generator-adaptation pilot
+## Preregistered CSL-Daily: Stage-C protocol-v5/run-r6 generator-adaptation pilot
 
-State: implemented and independently audited, development-only/non-authorizing
-preregistration; no r5 job is submitted from this snapshot. The
+State: implemented under independent audit, development-only/non-authorizing
+preregistration; no r6 job is submitted from this snapshot. The
 dataset-qualified CSL-Daily alias is
-`csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-protocol-v4-run-r5-20260910`.
-R5 is a fresh protocol generation, not a retry: it may correct only the
-standalone-clone CPU-test fixture to use the recovery manifest's canonical
-evidence root. Frozen science, the two-GPU paired-RoCE contract, all runtime
-behavior, data boundaries, and terminal no-retry rules remain unchanged. See
-docs/NIAF/continuous_trajectory_field/stage_c_generator_adaptation_protocol_v4_run_r5.md.
+`csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-protocol-v5-run-r6-20260910`.
+R6 is a fresh protocol generation, not a retry or resume. Its only
+implementation correction removes the nested declared provenance arm and its
+derived digest from the general matched-arm config-equivalence comparison;
+every other mismatch remains rejected. It starts both arms independently from
+the exact Stage-B best-infeasible source, requires a fresh CPU gate and
+train-only calibration, and preserves the complete r5 scientific, two-GPU
+paired-RoCE, data-access, duration, decision, and terminal no-retry contracts.
+See
+docs/NIAF/continuous_trajectory_field/stage_c_generator_adaptation_protocol_v5_run_r6.md.
+
+## Terminal CSL-Daily Stage-C protocol-v4/run-r5 post-arm smoke failure
+
+| Field | Value |
+|---|---|
+| Alias | `csl-daily-signtrajfield-rag-v3-stage-c-generator-adaptation-protocol-v4-run-r5-20260910` |
+| State | **Terminal post-arm smoke decision-validation failure.** CPU 143607 and fresh train-only calibration 143608 completed. Paired smoke 143609 failed after both arms completed; pilot 143610 was dependency-unsatisfied and cancelled with zero runtime/allocation. R5 cannot resume or retry |
+| Exact source | Clean pushed commit/remote `36d121dd361df2c08616031bd7c2076d85da78d0`, branch `origin/codex/csl-daily-centered-generator-stage-c-v4-run-r5`, standalone clone `/media/cvpr/haomian/SignTrajField_centered_stage_c_v4_run_source_r5` |
+| Scientific boundary | `memory` then `matched_off` each completed two logical batches, exactly one optimizer update/global step 1, and one batch in every centered 11-mode development validation. The attempt COMPLETE and per-arm invalid-attempt checkpoints exist, but no decision, smoke READY, canonical best checkpoint, or pilot output exists |
+| Trainability | Audit passed: exactly 20 generator tensors/1,109,395 parameters changed with finite optimizer moments; all 62 sentence-memory tensors and all other 213 model tensors remained bitwise frozen |
+| Allocation/network | Exactly two `pair02` nodes/GPUs and one rank/node. Both 200-Gb/s ConnectX-7 RoCE rails passed MTU 9000, GID 5, connectivity/counter and NCCL `NET/IB`/no-Socket checks; the gradient benchmark selected single-primary `rocep1s0f1:1` |
+| Failure | The full-config normalizer omitted only `sentence_memory_safety.stage_c.resolved_source_provenance.declared_contract.arm` and its derived provenance digest, even though the later dedicated provenance comparison already normalizes both. It raised `StageCDecisionError` before publication; this is an implementation-validation defect, not a scientific-config, checkpoint-audit, data, or network failure |
+| Data/W&B boundary | Only train/validation tables were staged. No test or confirmation access occurred, the global spend marker remains absent, W&B was disabled, and the retained smoke outputs are non-authorizing invalid-attempt evidence |
+| Incident archive | No-replace `...generator_adaptation_protocol_v4_run_r5_smoke.invalid_attempts/source_36d121dd361df2c08616031bd7c2076d85da78d0_smoke143609_pilot143610/ARCHIVE.json`, schema v4, 39,609 bytes, SHA256 `9c4e2213ca51941b41281f0b869fc66aa4e440df846ff57dee2731fca5f1c41a` |
+| Authorization | None. R5 checkpoints, calibration, controls, and source may not be reused for execution. Only separately preregistered protocol-v5/run-r6 may apply the two-field normalizer correction with fresh source/config/gate/calibration/output/control namespaces |
+| Runbook | `docs/NIAF/continuous_trajectory_field/stage_c_generator_adaptation_protocol_v4_run_r5.md` |
+| Historical alias | Preserved, but no longer the dataset-qualified CSL-Daily resolution |
 
 ## Terminal CSL-Daily Stage-C protocol-v3/run-r4 zero-science CPU-test failure
 
